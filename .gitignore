@@ -1,0 +1,73 @@
+# Dependencies
+/node_modules/
+frontend/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+.env.*
+.env.local
+service-account*.json
+firebase-service-account*.json
+credentials*.json
+client_secret*.json
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+.npmrc
+.yarnrc
+
+# Frontend build artifacts
+frontend/dist/
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Bundled sidecar binaries (downloaded at setup time, see scripts/fetch-sidecars.sh)
+src-tauri/binaries/
+
+# ONNX model weights (downloaded from Hugging Face on first use)
+/models/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+*.mlx
+*.npz
+*.ckpt
+
+# Agent/tool local state
+entities.json
+mempalace.yaml
+openmemory.md
+.claude/
+.cursor/
+.playwright-mcp/
+
+# Misc
+deno-announcement*.md
+firebase-debug.log
+
+# Ignore internal markdown (handoffs, AI docs); keep README
+*.md
+!README.md
+
+# Screenshots / demo recordings — not part of source
+screenshots/

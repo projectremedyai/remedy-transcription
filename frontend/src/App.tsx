@@ -1,0 +1,32 @@
+import { AudioManager } from "./components/AudioManager";
+import Transcript from "./components/Transcript";
+import { useTranscriber } from "./hooks/useTranscriber";
+
+function App() {
+    const transcriber = useTranscriber();
+
+    return (
+        <div className='flex justify-center items-center min-h-screen'>
+            <div className='container flex flex-col justify-center items-center'>
+                <img
+                    src='/robot.png'
+                    alt='Remedy Transcription'
+                    className='w-64 mb-2'
+                />
+                <h1 className='max-w-full break-words text-4xl font-extrabold tracking-tight text-slate-900 sm:text-6xl md:text-7xl text-center'>
+                    Remedy Transcription
+                </h1>
+                <h2 className='mt-3 mb-5 px-4 text-center text-1xl font-semibold tracking-tight text-slate-900 sm:text-2xl'>
+                    Video & Audio Transcription
+                </h2>
+                <AudioManager transcriber={transcriber} />
+                <Transcript
+                    transcribedData={transcriber.output}
+                    jobId={transcriber.jobId}
+                />
+            </div>
+        </div>
+    );
+}
+
+export default App;

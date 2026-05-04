@@ -24,7 +24,9 @@ export function generateSrt(segments: TranscriptionSegment[]): string {
     consolidated.forEach((segment, index) => {
         lines.push(String(index + 1));
         lines.push(
-            `${formatTimestamp(segment.start)} --> ${formatTimestamp(segment.end)}`,
+            `${formatTimestamp(segment.start)} --> ${formatTimestamp(
+                segment.end,
+            )}`,
         );
         lines.push(segment.text);
         lines.push("");

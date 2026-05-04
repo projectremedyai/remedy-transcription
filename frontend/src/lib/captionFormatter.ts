@@ -42,7 +42,11 @@ function splitWords(text: string): string[] {
 function overlapPrefixSize(previous: string[], current: string[]): number {
     const prevNorm = previous.map(normalizeWord).filter((w) => w.length > 0);
     const currNorm = current.map(normalizeWord).filter((w) => w.length > 0);
-    const maxOverlap = Math.min(MAX_OVERLAP_WORDS, prevNorm.length, currNorm.length);
+    const maxOverlap = Math.min(
+        MAX_OVERLAP_WORDS,
+        prevNorm.length,
+        currNorm.length,
+    );
 
     for (let size = maxOverlap; size > 2; size--) {
         const prevTail = prevNorm.slice(prevNorm.length - size);
@@ -86,11 +90,9 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
 
         for (const word of words) {
             const weight = Math.max(word.length, 1) / totalWeight;
-            const wordStart =
-                start + elapsed * duration * (remaining / denom);
+            const wordStart = start + elapsed * duration * (remaining / denom);
             elapsed += weight;
-            const wordEnd =
-                start + elapsed * duration * (remaining / denom);
+            const wordEnd = start + elapsed * duration * (remaining / denom);
             tokens.push({ text: word, start: wordStart, end: wordEnd });
         }
 
@@ -191,12 +193,19 @@ function mergeShortCaptions(
     const merged: TranscriptionSegment[] = [];
 
     for (const caption of captions) {
-        const words = caption.text.replace(/\n/g, " ").split(/\s+/).filter(Boolean);
+        const words = caption.text
+            .replace(/\n/g, " ")
+            .split(/\s+/)
+            .filter(Boolean);
         const isShort =
             words.length < MIN_CAPTION_WORDS ||
             caption.end - caption.start < MIN_CAPTION_DURATION;
 
-        if (isShort && merged.length > 0 && canMerge(merged[merged.length - 1], caption)) {
+        if (
+            isShort &&
+            merged.length > 0 &&
+            canMerge(merged[merged.length - 1], caption)
+        ) {
             const previous = merged.pop()!;
             merged.push({
                 start: previous.start,
@@ -221,9 +230,7 @@ function capitalizeFirstAlpha(text: string): string {
     }
     const index = match.index;
     return (
-        text.slice(0, index) +
-        text[index].toUpperCase() +
-        text.slice(index + 1)
+        text.slice(0, index) + text[index].toUpperCase() + text.slice(index + 1)
     );
 }
 
@@ -247,7 +254,9 @@ function normalizeCaptionStarts(
 
     if (
         normalized.length > 0 &&
-        !endsSentence(normalized[normalized.length - 1].text.replace(/\n/g, " "))
+        !endsSentence(
+            normalized[normalized.length - 1].text.replace(/\n/g, " "),
+        )
     ) {
         const final = normalized.pop()!;
         normalized.push({
@@ -340,8 +349,10 @@ export function formatPlainText(segments: TranscriptionSegment[]): string {
         return "";
     }
 
-    text = text.replace(/(^|[.!?]\s+)([a-z])/g, (_, prefix: string, letter: string) =>
-        `${prefix}${letter.toUpperCase()}`,
+    text = text.replace(
+        /(^|[.!?]\s+)([a-z])/g,
+        (_, prefix: string, letter: string) =>
+            `${prefix}${letter.toUpperCase()}`,
     );
 
     if (!endsSentence(text)) {

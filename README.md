@@ -23,25 +23,43 @@ Why "local-first": YouTube blocks data-center IPs, so a self-hosted (VPS) versio
 ## Run from source
 
 ```bash
-# 1. Fetch yt-dlp / ffmpeg / ffprobe sidecars into src-tauri/binaries/
+# 1. Fetch yt-dlp / ffmpeg / ffprobe sidecars into src-tauri/binaries/.
 ./scripts/fetch-sidecars.sh
 
-# 2. Install JS deps (also installs the Tauri CLI)
-cd frontend
-npm install
+# 2. Install root and frontend JS deps from lockfiles.
+npm ci
+npm --prefix frontend ci
 
-# 3. Run the dev build (Vite + Tauri, hot reload)
-npm run tauri:dev
+# 3. Run the dev build (Vite + Tauri, hot reload).
+npm run dev
 ```
 
 ## Build an installer
 
 ```bash
-cd frontend
-npm run tauri:build
+./scripts/fetch-sidecars.sh
+npm ci
+npm --prefix frontend ci
+npm run build
 ```
 
 Output: `src-tauri/target/release/bundle/` — `.dmg` on macOS, `.msi` / `.exe` on Windows. The installer is fully standalone; end users don't need Node, Rust, or Python on their machine.
+
+## CI and build checks
+
+GitHub Actions runs the checked build path on macOS:
+
+```bash
+npm ci
+npm --prefix frontend ci
+npm run frontend:build
+npm --prefix frontend run lint
+./scripts/fetch-sidecars.sh
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+`scripts/fetch-sidecars.sh` runs in CI, not only during release packaging, because Tauri validates the configured `externalBin` sidecars during `cargo check` and `cargo test`. Release jobs should still run it for the target being packaged before `npm run build`; Windows ffmpeg/ffprobe setup remains manual as noted by the script.
 
 ## Where your data lives
 

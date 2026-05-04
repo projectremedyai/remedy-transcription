@@ -1,7 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { convertFileSrc } from "@tauri-apps/api/core";
 
 import { generateJson, generateSrt, generateTxt } from "../lib/srtGenerator";
 import {
@@ -137,8 +136,8 @@ class TauriApiClient {
             format === "srt"
                 ? generateSrt(segments)
                 : format === "txt"
-                    ? generateTxt(segments)
-                    : generateJson(segments);
+                ? generateTxt(segments)
+                : generateJson(segments);
 
         await invoke("export_transcript", {
             request: {

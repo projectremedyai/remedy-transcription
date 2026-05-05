@@ -3,6 +3,7 @@ name = "remedy-transcription"
 version = "1.0.0"
 description = "Local-first video/audio transcription desktop app"
 authors = ["Remedy"]
+license = "MIT"
 edition = "2021"
 rust-version = "1.77"
 

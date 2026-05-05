@@ -93,4 +93,4 @@ React webview ←─Tauri IPC─→ Rust core ──spawn──> yt-dlp + ffmpeg
 
 ## License
 
-Private project.
+MIT. See `LICENSE`.

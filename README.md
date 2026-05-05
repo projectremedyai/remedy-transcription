@@ -71,6 +71,14 @@ Everything stays on the local machine:
 
 Nothing is uploaded. The only outbound traffic is to YouTube (via yt-dlp) and to Hugging Face (model downloads, first run only).
 
+## YouTube Usage Disclaimer
+
+Remedy Transcription can use third-party tooling to access and download media from YouTube for local transcription. YouTube's Terms of Service restrict downloading, reproducing, or otherwise using YouTube content except where expressly authorized by YouTube or with permission from YouTube and the applicable rights holders.
+
+You are solely responsible for how you use this feature. Only use it with videos you own, videos you have permission to download and transcribe, or content you are otherwise legally authorized to use. The maintainers of this project are not responsible for violations of YouTube's Terms of Service, copyright law, account restrictions, takedowns, suspensions, or any other consequences resulting from your use of this software.
+
+This software is provided for lawful, authorized transcription workflows only.
+
 ## Architecture
 
 See [CLAUDE.md](./CLAUDE.md) for the full breakdown.

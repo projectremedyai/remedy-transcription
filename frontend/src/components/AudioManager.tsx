@@ -330,6 +330,13 @@ function YouTubeModal(props: {
                         onChange={(event) => setUrl(event.target.value)}
                         value={url}
                     />
+                    <div className='mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800'>
+                        Only download or transcribe YouTube videos you own or
+                        are authorized to use. Downloading YouTube content may
+                        violate YouTube&apos;s Terms of Service and could result
+                        in account or content restrictions. You are responsible
+                        for your use.
+                    </div>
                     {url && !isValidYouTubeUrl(url) && (
                         <div className='text-red-500 text-sm mt-1'>
                             Please enter a valid YouTube URL

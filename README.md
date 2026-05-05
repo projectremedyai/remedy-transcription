@@ -71,13 +71,13 @@ Everything stays on the local machine:
 
 Nothing is uploaded. The only outbound traffic is to YouTube (via yt-dlp) and to Hugging Face (model downloads, first run only).
 
-## YouTube Usage Disclaimer
+## Accessibility, Education, and Fair Use
 
-Remedy Transcription can use third-party tooling to access and download media from YouTube for local transcription. YouTube's Terms of Service restrict downloading, reproducing, or otherwise using YouTube content except where expressly authorized by YouTube or with permission from YouTube and the applicable rights holders.
+Remedy Transcription is intended to support lawful accessibility workflows, including creating transcripts and captions for educational course materials, ADA/Section 504 accommodation, and equal-access needs.
 
-You are solely responsible for how you use this feature. Only use it with videos you own, videos you have permission to download and transcribe, or content you are otherwise legally authorized to use. The maintainers of this project are not responsible for violations of YouTube's Terms of Service, copyright law, account restrictions, takedowns, suspensions, or any other consequences resulting from your use of this software.
+In the United States, fair use may permit certain unlicensed uses for teaching, scholarship, research, accessibility, and other public-interest purposes. Fair use is a fact-specific legal analysis, and an educational or ADA-related purpose does not automatically authorize downloading, copying, redistributing, or publishing YouTube content.
 
-This software is provided for lawful, authorized transcription workflows only.
+Users and institutions are responsible for determining whether each use is authorized by ownership, license, permission, Creative Commons/public-domain status, fair use, ADA/Section 504 obligations, or another legal basis. Prefer content you own, are licensed to use, or are specifically authorized to download and transcribe. Do not redistribute downloaded media, generated transcripts, or captions unless you have the right to do so.
 
 ## Architecture
 

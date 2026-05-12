@@ -1,12 +1,12 @@
 import { TranscriptionSegment } from "../services/types";
 import { consolidateSegments, formatPlainText } from "./captionFormatter";
 
-function formatTimestamp(seconds: number): string {
+function formatTimestamp(seconds: number, separator: "," | "." = ","): string {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     const secs = Math.floor(seconds % 60);
     const millis = Math.floor((seconds % 1) * 1000);
-    return `${pad2(hours)}:${pad2(minutes)}:${pad2(secs)},${pad3(millis)}`;
+    return `${pad2(hours)}:${pad2(minutes)}:${pad2(secs)}${separator}${pad3(millis)}`;
 }
 
 function pad2(value: number): string {
@@ -26,6 +26,25 @@ export function generateSrt(segments: TranscriptionSegment[]): string {
         lines.push(
             `${formatTimestamp(segment.start)} --> ${formatTimestamp(
                 segment.end,
+            )}`,
+        );
+        lines.push(segment.text);
+        lines.push("");
+    });
+
+    return lines.join("\n");
+}
+
+export function generateVtt(segments: TranscriptionSegment[]): string {
+    const consolidated = consolidateSegments(segments);
+    const lines: string[] = ["WEBVTT", ""];
+
+    consolidated.forEach((segment, index) => {
+        lines.push(String(index + 1));
+        lines.push(
+            `${formatTimestamp(segment.start, ".")} --> ${formatTimestamp(
+                segment.end,
+                ".",
             )}`,
         );
         lines.push(segment.text);

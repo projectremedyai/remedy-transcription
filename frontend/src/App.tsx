@@ -8,11 +8,6 @@ function App() {
     return (
         <div className='flex justify-center items-center min-h-screen'>
             <div className='container flex flex-col justify-center items-center'>
-                <img
-                    src='/robot.png'
-                    alt='Remedy Transcription'
-                    className='w-64 mb-2'
-                />
                 <h1 className='max-w-full break-words text-4xl font-extrabold tracking-tight text-slate-900 sm:text-6xl md:text-7xl text-center'>
                     Remedy Transcription
                 </h1>

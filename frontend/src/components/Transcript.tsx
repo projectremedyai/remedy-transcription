@@ -31,7 +31,7 @@ export default function Transcript({ transcribedData, jobId }: Props) {
         return name.replace(/\.[^/.]+$/, "");
     };
 
-    const runExport = async (format: "srt" | "txt" | "json") => {
+    const runExport = async (format: "srt" | "vtt" | "txt" | "json") => {
         const segments = chunksToSegments(transcribedData?.chunks);
         if (segments.length === 0) return;
         try {
@@ -85,6 +85,12 @@ export default function Transcript({ transcribedData, jobId }: Props) {
                         className='text-white bg-indigo-500 hover:bg-indigo-600 focus:ring-4 focus:ring-indigo-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 inline-flex items-center'
                     >
                         Export SRT
+                    </button>
+                    <button
+                        onClick={() => runExport("vtt")}
+                        className='text-white bg-indigo-500 hover:bg-indigo-600 focus:ring-4 focus:ring-indigo-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 inline-flex items-center'
+                    >
+                        Export VTT
                     </button>
                     <button
                         onClick={() => runExport("txt")}

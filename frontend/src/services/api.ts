@@ -2,7 +2,12 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 
-import { generateJson, generateSrt, generateTxt } from "../lib/srtGenerator";
+import {
+    generateJson,
+    generateSrt,
+    generateTxt,
+    generateVtt,
+} from "../lib/srtGenerator";
 import {
     FileJobRequest,
     HealthResponse,
@@ -114,12 +119,13 @@ class TauriApiClient {
 
     async exportTranscript(
         jobId: string,
-        format: "srt" | "txt" | "json",
+        format: "srt" | "vtt" | "txt" | "json",
         segments: import("./types").TranscriptionSegment[],
         suggestedName: string,
     ): Promise<string | null> {
         const filters = {
             srt: { name: "SubRip Subtitle", extensions: ["srt"] },
+            vtt: { name: "WebVTT", extensions: ["vtt"] },
             txt: { name: "Plain Text", extensions: ["txt"] },
             json: { name: "JSON", extensions: ["json"] },
         }[format];
@@ -132,12 +138,13 @@ class TauriApiClient {
             return null;
         }
 
-        const content =
-            format === "srt"
-                ? generateSrt(segments)
-                : format === "txt"
-                ? generateTxt(segments)
-                : generateJson(segments);
+        const generators = {
+            srt: generateSrt,
+            vtt: generateVtt,
+            txt: generateTxt,
+            json: generateJson,
+        };
+        const content = generators[format](segments);
 
         await invoke("export_transcript", {
             request: {

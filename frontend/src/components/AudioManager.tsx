@@ -95,36 +95,15 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 </div>
                 {!props.transcriber.modelsStatusLoaded && (
                     <div className='w-full px-4 pb-4 text-sm text-slate-500'>
-                        Checking browser model availability...
+                        Initializing...
                     </div>
                 )}
-                {props.transcriber.modelsStatusLoaded &&
-                    props.transcriber.modelsStatusError && (
-                        <div className='w-full px-4 pb-4 text-sm text-red-600'>
-                            Could not reach the backend model status endpoint.
-                            Check that the backend server is running and that
-                            the frontend proxy is using the correct backend
-                            port.
-                        </div>
-                    )}
-                {props.transcriber.modelsStatusLoaded &&
-                    !props.transcriber.modelsStatusError &&
-                    !props.transcriber.modelsReady && (
-                        <div className='w-full px-4 pb-4 text-sm text-amber-700'>
-                            Browser models are missing on the server. Run{" "}
-                            <code>python3 scripts/bootstrap-models.py</code>{" "}
-                            before transcribing.
-                        </div>
-                    )}
-                {props.transcriber.modelsStatusLoaded &&
-                    props.transcriber.modelsReady &&
-                    !props.transcriber.selectedModelAvailable &&
-                    props.transcriber.selectedModelId && (
-                        <div className='w-full px-4 pb-4 text-sm text-amber-700'>
-                            The selected model is not installed on the server:{" "}
-                            <code>{props.transcriber.selectedModelId}</code>
-                        </div>
-                    )}
+                {props.transcriber.modelsStatusError && (
+                    <div className='w-full px-4 pb-4 text-sm text-red-600'>
+                        Could not initialize the transcription engine:{" "}
+                        {props.transcriber.modelsStatusError}
+                    </div>
+                )}
                 <div className='w-full px-4 pb-4 text-xs text-slate-500 flex justify-between'>
                     <span>{props.transcriber.capabilityLabel}</span>
                     {props.transcriber.effectivePresetLabel && (
@@ -187,7 +166,7 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                         disabled={!props.transcriber.selectedModelAvailable}
                         className='bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-medium py-2 px-6 rounded-lg transition-colors duration-200'
                     >
-                        Transcribe in Browser
+                        Transcribe
                     </button>
                 </div>
             )}
@@ -342,12 +321,6 @@ function YouTubeModal(props: {
                             Please enter a valid YouTube URL
                         </div>
                     )}
-                    {!props.enabled && (
-                        <div className='text-amber-600 text-sm mt-1'>
-                            Install the selected model on the server before
-                            preparing audio.
-                        </div>
-                    )}
                 </>
             }
             onClose={props.onClose}
@@ -375,12 +348,28 @@ function FileTile(props: {
                 input.type = "file";
                 input.accept =
                     "video/*,audio/*,.mp4,.mkv,.avi,.mov,.webm,.mp3,.wav,.m4a,.aac,.ogg,.flac";
-                input.onchange = (event) => {
-                    const files = (event.target as HTMLInputElement).files;
-                    if (files?.[0]) {
-                        props.onFileSelect(files[0]);
+                input.style.display = "none";
+                document.body.appendChild(input);
+
+                const cleanup = () => {
+                    if (input.parentNode) {
+                        input.parentNode.removeChild(input);
                     }
                 };
+
+                input.addEventListener(
+                    "change",
+                    (event) => {
+                        const files = (event.target as HTMLInputElement).files;
+                        if (files?.[0]) {
+                            props.onFileSelect(files[0]);
+                        }
+                        cleanup();
+                    },
+                    { once: true },
+                );
+                input.addEventListener("cancel", cleanup, { once: true });
+
                 input.click();
             }}
         />

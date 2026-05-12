@@ -50,7 +50,9 @@
       "binaries/ffprobe"
     ],
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "Developer ID Application: Quang Phung (7XU3QW326W)",
+      "entitlements": "entitlements.plist"
     },
     "windows": {
       "wix": {

@@ -1,5 +1,7 @@
 # Remedy Transcription
 
+![Remedy Transcription](docs/screenshot.png)
+
 A standalone native desktop app for macOS and Windows that transcribes video and audio locally. Paste a YouTube URL or drop a file; it transcribes on your machine and exports SRT / TXT / JSON.
 
 No server, no cloud, no Python runtime. The whole pipeline — yt-dlp download, ffmpeg extraction, ONNX Whisper inference — runs in-process inside the installed app.

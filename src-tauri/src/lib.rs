@@ -63,6 +63,8 @@ pub fn run() {
             commands::export_transcript,
             commands::diarize_job,
             commands::cancel_diarization,
+            commands::set_speaker_name,
+            commands::get_speaker_names,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

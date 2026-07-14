@@ -2,11 +2,14 @@ import { TranscriptionSegment } from "../services/types";
 import {
     ConsolidatedSegment,
     WordToken,
+    assignSpeakersToSegments,
+    assignSpeakersToTokens,
     consolidateSegments,
     countCaptionWords,
     joinCaptionTexts,
     normalizeWordTokens,
 } from "./captionFormatter";
+import type { SpeakerTurn } from "./speakerAlignment";
 
 /** A raw chunk as the transformers.js worker emits it. */
 export interface WorkerChunk {
@@ -82,21 +85,81 @@ export function segmentsFromWorkerChunks(
  * words' own times unchanged. Rows written before this existed still hold
  * sentence chunks and are still fabricated on read — that is the only path left
  * that invents a word time, and it is the reason `tokensFromSegments` survives.
+ *
+ * ## Speakers
+ *
+ * `turns` is diarization's answer, and passing it here is what makes speaker
+ * labels SURVIVE. They did not, and it is worth saying exactly how they died,
+ * because "the row is an opaque JSON blob, so the field rides along for free" is
+ * the intuition that killed them and it is false in both directions:
+ *
+ *   - here, the row was built by hand as `{start, end, text}` — so the label was
+ *     dropped on the way OUT of the formatter's tokens, before it ever reached
+ *     the wire;
+ *   - and in Rust, `store::TranscriptionSegment` had no `speaker` field, so serde
+ *     (which ignores unknown fields by default) dropped it AGAIN on the way in.
+ *
+ * Two independent drops, neither of which failed anything. Both are now closed,
+ * and the round trip is pinned end to end — see "a DIARIZED transcript read back
+ * from the database renders EXACTLY as it did live" in `workerTranscript.test.ts`
+ * and `a_diarized_transcript_survives_the_round_trip_through_the_database` in
+ * `store.rs`.
+ *
+ * The labelling itself is not done here: it is delegated to the very functions
+ * the display path uses (`assignSpeakersToTokens`, `assignSpeakersToSegments`),
+ * at the granularity that path would choose — WORDS when the model gave real word
+ * times, SEGMENTS when it did not. A second labelling implementation would be a
+ * second thing to drift, and a drifted one would put different speakers in the
+ * database than on the screen.
+ *
+ * Omitting `turns` (or passing an empty array — a real, successful answer for
+ * silence) writes rows with NO `speaker` key at all: byte-for-byte what an
+ * undiarized transcript has always written.
  */
 export function segmentsForPersistence(
     workerTranscript: WorkerTranscript,
     audioDuration: number | null,
+    turns?: readonly SpeakerTurn[],
 ): TranscriptionSegment[] {
+    const speakerTurns = turns && turns.length > 0 ? turns : null;
     const words = workerTranscript.words;
+
     if (words && words.length > 0) {
-        return normalizeWordTokens(words).map((word) => ({
-            start: word.start,
-            end: word.end,
-            text: word.text,
-        }));
+        const tokens = normalizeWordTokens(words);
+        const labelled = speakerTurns
+            ? assignSpeakersToTokens(tokens, speakerTurns)
+            : tokens;
+        return labelled.map(rowFromToken);
     }
 
-    return segmentsFromWorkerChunks(workerTranscript.chunks, audioDuration);
+    const chunks = segmentsFromWorkerChunks(
+        workerTranscript.chunks,
+        audioDuration,
+    );
+    return speakerTurns
+        ? assignSpeakersToSegments(chunks, speakerTurns)
+        : chunks;
+}
+
+/**
+ * One word token -> one database row, keeping `speaker` ABSENT rather than
+ * `undefined` when there is none.
+ *
+ * `{start, end, text, speaker: undefined}` is not the same row:
+ * `JSON.stringify` of it is identical, but `"speaker" in row` is true, `toEqual`
+ * tells them apart, and Rust — which now runs `deny_unknown_fields` — is one
+ * `JSON.stringify` policy change away from seeing a `"speaker": null` it would
+ * reject. An undiarized transcript must persist exactly as it always has.
+ */
+function rowFromToken(word: WordToken): TranscriptionSegment {
+    return word.speaker === undefined
+        ? { start: word.start, end: word.end, text: word.text }
+        : {
+              start: word.start,
+              end: word.end,
+              text: word.text,
+              speaker: word.speaker,
+          };
 }
 
 /**

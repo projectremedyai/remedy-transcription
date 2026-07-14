@@ -17,6 +17,7 @@ import {
     ModelStatusResponse,
     PersistTranscriptRequest,
     QueueStatus,
+    SpeakerNames,
     YouTubeJobRequest,
 } from "./types";
 
@@ -29,6 +30,7 @@ export type {
     ModelStatusResponse,
     PersistTranscriptRequest,
     QueueStatus,
+    SpeakerNames,
     TranscriptionSegment,
     YouTubeJobRequest,
 } from "./types";
@@ -160,6 +162,39 @@ class TauriApiClient {
      */
     async cancelDiarization(jobId: string): Promise<boolean> {
         return invoke<boolean>("cancel_diarization", { jobId });
+    }
+
+    /**
+     * Name a speaker: `SPEAKER_00` -> `"Alice"`.
+     *
+     * **A METADATA WRITE. It does not re-transcribe and does not re-diarize.**
+     * The segments keep their opaque `SPEAKER_00` keys; the name is a row in
+     * `transcript_speakers` that the renderer joins on. So renaming is instant,
+     * reversible, and works long after the audio has been cleaned up.
+     *
+     * Keyed by JOB id, but stored against the TRANSCRIPT the job resolves to —
+     * so the name survives to every future job for the same recording, including
+     * the cache hit the user gets when they drop the same file in next week.
+     *
+     * Renaming the same speaker twice overwrites; it does not accumulate.
+     *
+     * Rejects a blank name, and a job that has no transcript yet.
+     */
+    async setSpeakerName(
+        jobId: string,
+        speakerKey: string,
+        displayName: string,
+    ): Promise<void> {
+        await invoke("set_speaker_name", { jobId, speakerKey, displayName });
+    }
+
+    /**
+     * Every name given to this job's speakers, keyed by the label the segments
+     * carry. `{}` when nobody has renamed anyone — the normal case, and not an
+     * error. A speaker with no entry renders as its own key.
+     */
+    async getSpeakerNames(jobId: string): Promise<SpeakerNames> {
+        return invoke<SpeakerNames>("get_speaker_names", { jobId });
     }
 
     /**

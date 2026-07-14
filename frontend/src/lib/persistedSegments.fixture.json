@@ -1,0 +1,16 @@
+[
+    { "start": 0.0, "end": 0.42, "text": "Hello", "speaker": "SPEAKER_00" },
+    { "start": 0.42, "end": 0.9, "text": "there", "speaker": "SPEAKER_00" },
+    { "start": 0.9, "end": 1.1, "text": "and", "speaker": "SPEAKER_00" },
+    { "start": 1.1, "end": 1.94, "text": "welcome.", "speaker": "SPEAKER_00" },
+    {
+        "start": 3.2,
+        "end": 3.86,
+        "text": "Word-level",
+        "speaker": "SPEAKER_01"
+    },
+    { "start": 3.86, "end": 4.4, "text": "timing", "speaker": "SPEAKER_01" },
+    { "start": 4.4, "end": 4.6, "text": "is", "speaker": "SPEAKER_01" },
+    { "start": 4.6, "end": 5.28, "text": "real", "speaker": "SPEAKER_01" },
+    { "start": 5.28, "end": 5.9, "text": "now.", "speaker": "SPEAKER_01" }
+]

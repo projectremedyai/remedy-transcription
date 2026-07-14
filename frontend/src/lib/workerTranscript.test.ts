@@ -7,7 +7,9 @@ import {
     segmentsFromWorkerChunks,
 } from "./workerTranscript";
 import { consolidateSegments } from "./captionFormatter";
+import type { SpeakerTurn } from "./speakerAlignment";
 import type { TranscriptionSegment } from "../services/types";
+import PERSISTED_ROWS_FIXTURE from "./persistedSegments.fixture.json";
 
 /**
  * Whisper leaves the final chunk's end timestamp NULL. Rendering or persisting
@@ -335,6 +337,126 @@ describe("segmentsForPersistence: the database keeps the REAL word times", () =>
         expect(
             segmentsForPersistence({ text: "Hello there.", chunks }, 10),
         ).toEqual(segmentsFromWorkerChunks(chunks, 10));
+    });
+});
+
+/**
+ * **The speaker label used to die on the way to the database — TWICE.**
+ *
+ * `segmentsForPersistence` rebuilt each row by hand as `{start, end, text}`, so
+ * the label never reached the wire; and Rust's `store::TranscriptionSegment` had
+ * no `speaker` field, so serde (which ignores unknown fields by default) dropped
+ * it again if it ever had. Neither drop failed anything: diarize a file, reopen
+ * it, and the speakers were simply gone, with no error anywhere. "It's an opaque
+ * JSON blob, the field rides along free" is the reasoning that produced that, and
+ * it is false at both ends.
+ *
+ * These tests are the frontend half of the proof. The Rust half —
+ * `a_diarized_transcript_survives_the_round_trip_through_the_database` in
+ * `store.rs` — reads the SAME fixture this file pins, so the two halves cannot
+ * drift into disagreeing about the row shape without one of them going red.
+ */
+describe("segmentsForPersistence: a DIARIZED transcript keeps its speakers", () => {
+    // Two speakers, with the turn boundary in the 1.26s pause between the two
+    // sentences — where a real one usually is.
+    const TURNS: SpeakerTurn[] = [
+        { start: 0.0, end: 2.0, speaker: 0 },
+        { start: 3.0, end: 6.0, speaker: 1 },
+    ];
+
+    /** Exactly what crosses the IPC wire on its way into `segments_json`. */
+    const persist = () => segmentsForPersistence(WORD_TRANSCRIPT, 6.0, TURNS);
+
+    it("writes the speaker onto the rows — and writes the shape Rust reads", () => {
+        const rows = persist();
+
+        expect(rows[0]).toEqual({
+            start: 0.0,
+            end: 0.42,
+            text: "Hello",
+            speaker: "SPEAKER_00",
+        });
+        expect(rows[8]).toEqual({
+            start: 5.28,
+            end: 5.9,
+            text: "now.",
+            speaker: "SPEAKER_01",
+        });
+
+        // THE CROSS-LANGUAGE PIN. `store.rs` deserializes this very file into
+        // `Vec<TranscriptionSegment>` under `deny_unknown_fields`. Add a field
+        // here and forget to teach Rust about it and `cargo test` goes red —
+        // which is the alarm that did not exist when `speaker` was dropped.
+        expect(rows).toEqual(PERSISTED_ROWS_FIXTURE);
+    });
+
+    it("a DIARIZED transcript read back from the database renders EXACTLY as it did live", () => {
+        // Live: raw chunks + the model's real word times + diarization's turns.
+        const live = consolidateSegments(
+            segmentsFromWorkerChunks(WORD_CHUNKS, 6.0),
+            WORD_TRANSCRIPT.words,
+            TURNS,
+        );
+
+        // Reloaded: what `find_transcript` hands back — the persisted rows, with
+        // no `words` and no `turns` anywhere, because neither is stored. Through
+        // `JSON.parse(JSON.stringify(...))` because that is what the row does on
+        // its way to SQLite and back, and it is what would silently delete an
+        // `undefined`-valued key.
+        const reloaded = consolidateSegments(
+            JSON.parse(JSON.stringify(persist())),
+        );
+
+        expect(reloaded).toEqual(live);
+
+        // Toothy: the assertion above would also pass if BOTH sides had lost
+        // their speakers. They did not.
+        expect(reloaded.map((cue) => cue.speaker)).toEqual([
+            "SPEAKER_00",
+            "SPEAKER_01",
+        ]);
+    });
+
+    it("an UNDIARIZED transcript persists exactly as it always has: no speaker key at all", () => {
+        const rows = segmentsForPersistence(WORD_TRANSCRIPT, 6.0);
+
+        // ABSENT, not `undefined` — `"speaker" in row` must be false. A row with
+        // the key present would serialize a `null` into `segments_json` that
+        // Rust's `deny_unknown_fields`-strict struct is one policy change away
+        // from rejecting, and that the formatter would compare against.
+        expect(rows.every((row) => !("speaker" in row))).toBe(true);
+
+        // An EMPTY turn list is diarization SUCCEEDING on silence (or on one
+        // person), not failing. It must persist the same way.
+        expect(segmentsForPersistence(WORD_TRANSCRIPT, 6.0, [])).toEqual(rows);
+    });
+
+    it("labels a LEGACY sentence-granular transcript at segment granularity", () => {
+        // No word times, so the rows persisted are the sentence chunks — and the
+        // speaker is assigned from each chunk's own MEASURED span, never from the
+        // word times `tokensFromSegments` would fabricate inside it (up to 1.3s
+        // adrift, which is longer than many turns).
+        const chunks: WorkerChunk[] = [
+            { text: " Hello there and welcome.", timestamp: [0, 1.94] },
+            { text: " Word-level timing is real now.", timestamp: [3.2, 5.9] },
+        ];
+
+        expect(
+            segmentsForPersistence({ text: "", chunks }, 6.0, TURNS),
+        ).toEqual([
+            {
+                start: 0,
+                end: 1.94,
+                text: " Hello there and welcome.",
+                speaker: "SPEAKER_00",
+            },
+            {
+                start: 3.2,
+                end: 5.9,
+                text: " Word-level timing is real now.",
+                speaker: "SPEAKER_01",
+            },
+        ]);
     });
 });
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -87,11 +88,47 @@ impl JobStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One persisted row of a transcript — and the ONLY shape `segments_json` ever
+/// holds, in both `transcripts` and `jobs`.
+///
+/// **`speaker` did not ride along for free.** The frontend's word rows carried a
+/// `speaker` label and this struct did not, so `#[derive(Deserialize)]` — which
+/// ignores unknown fields by default — DISCARDED it on the way in, silently, and
+/// the labels died at the database. It was dropped a second time on the frontend
+/// side, in `segmentsForPersistence`. A field on an "opaque JSON blob" is only
+/// opaque until something deserializes it into a struct; this struct is that
+/// something.
+///
+/// Hence `deny_unknown_fields`. Every writer of `segments_json` is this very
+/// struct's `Serialize`, so no row — legacy or current — can legitimately carry a
+/// key it does not know, and the one place a stranger key CAN arrive is the IPC
+/// boundary (`PersistTranscriptRequest.segments`, which deserializes into this
+/// type). That is exactly where the silent drop happened. Now a field the
+/// frontend starts sending and Rust has not learned fails `persist_transcript`
+/// loudly, on the first run, instead of vanishing.
+///
+/// `speaker` is `Option` + `default`, which is a DIFFERENT mechanism and the one
+/// that keeps legacy rows readable: a row written before diarization existed has
+/// no `speaker` key at all and deserializes to `None`. `skip_serializing_if`
+/// keeps the trip back out symmetric — an undiarized row serializes to
+/// `{"start":…,"end":…,"text":…}`, byte-for-byte what it was before this field
+/// existed, so nothing downstream (the webview included) sees a new `null` key.
+/// Both are pinned by tests in this file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TranscriptionSegment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// Who said it — an OPAQUE label, e.g. `"SPEAKER_00"`, exactly as the
+    /// frontend's `speakerLabel` produced it. Never parsed, never indexed by,
+    /// never assumed dense or small: it is a string key, and the only thing that
+    /// interprets it is `transcript_speakers.speaker_key`.
+    ///
+    /// `None` — the key ABSENT, not empty — whenever diarization did not run,
+    /// was cancelled, degraded, or found no turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +199,27 @@ impl Store {
     pub fn open(database_path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(database_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // SQLite ignores every `FOREIGN KEY` clause in `SCHEMA_SQL` unless this is
+        // on — it is OFF by default, per connection, for backwards compatibility.
+        // The schema has always DECLARED foreign keys and never enforced one.
+        //
+        // What turning it on actually buys, stated narrowly because the rest would
+        // be a claim with no test behind it: a `transcript_speakers` row can no
+        // longer be written against a `transcript_id` that does not exist. A name
+        // orphaned that way would be silently INHERITED by whatever transcript
+        // next took that rowid — someone else's recording, wearing your speaker
+        // names. `naming_a_speaker_of_a_transcript_that_does_not_exist_is_refused`
+        // pins it, and it fails without this line.
+        //
+        // The `ON DELETE CASCADE` in the same clause is correct and costs nothing,
+        // but it is NOT exercised today: nothing in this app deletes a transcript
+        // or a source (`cleanup_expired_audio` only NULLs `audio_path`). It is
+        // there for the delete path that does not exist yet, not for one that does.
+        //
+        // Safe for the existing tables for the same reason: enforcement applies to
+        // statements run from here on, not to rows already stored, and no INSERT in
+        // this file can violate the two pre-existing clauses.
+        conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -309,25 +367,102 @@ impl Store {
         language: &str,
     ) -> anyhow::Result<Option<CachedTranscript>> {
         let conn = self.conn.lock().unwrap();
-        // Falls back to `model_id` itself when there is no alias, which makes the
-        // `IN (?2, ?3)` an exact match — the pre-rename behaviour.
-        let alias = model_id_alias(model_id).unwrap_or_else(|| model_id.to_string());
+        let row = lookup_transcript(&conn, source_id, model_id, task, language)?;
 
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT full_text, segments_json FROM transcripts
-                 WHERE source_id = ?1 AND model_id IN (?2, ?3) AND task = ?4 AND language = ?5
-                 ORDER BY (model_id = ?2) DESC
-                 LIMIT 1",
-                params![source_id, model_id, alias, task.as_str(), language],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-
-        Ok(row.map(|(full_text, segments_json)| CachedTranscript {
+        Ok(row.map(|(_, full_text, segments_json)| CachedTranscript {
             full_text,
             segments: parse_segments(&segments_json),
         }))
+    }
+
+    /// The `transcripts` row a job's transcript actually lives in — the key that
+    /// [`Store::set_speaker_name`] and [`Store::get_speaker_names`] hang off.
+    ///
+    /// The frontend only ever holds a JOB id, and a job is not a transcript: many
+    /// jobs (one per run, plus one per cache hit) point at the same row, which is
+    /// the point — a speaker renamed on Monday is still renamed when the same
+    /// file is dropped in again on Friday and comes back as a cache hit.
+    ///
+    /// It resolves through the SAME `lookup_transcript` the cache reads with,
+    /// alias and ordering included, and that sharing is load-bearing rather than
+    /// tidy: if this resolved a different row than `find_transcript` serves, a
+    /// user could rename the speakers of a legacy transcript and have the names
+    /// attach to a row the app never reads again. Pinned by
+    /// `speaker_names_attach_to_the_very_row_the_cache_serves`.
+    ///
+    /// `None` means the job has no transcript yet (still transcribing, or it
+    /// failed) — not an error.
+    pub fn transcript_id_for_job(&self, job_id: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+
+        let recipe: Option<(Option<i64>, String, String, String)> = conn
+            .query_row(
+                "SELECT source_id, model_id, task, language FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        // A job whose source was deleted has `source_id = NULL` (ON DELETE SET
+        // NULL), and a NULL source can own no transcript.
+        let Some((Some(source_id), model_id, task, language)) = recipe else {
+            return Ok(None);
+        };
+        let task = TaskType::parse(&task)?;
+
+        Ok(lookup_transcript(&conn, source_id, &model_id, task, &language)?.map(|(id, _, _)| id))
+    }
+
+    /// Name a speaker: `SPEAKER_00` -> `"Alice"`.
+    ///
+    /// **A METADATA WRITE, and nothing else.** It touches one row of one table;
+    /// it does not re-transcribe, does not re-diarize, and does not rewrite
+    /// `segments_json`. The segments keep their opaque `SPEAKER_00` keys forever
+    /// and the name is joined on at render time, which is what makes renaming
+    /// free, reversible, and safe to do while the audio is long gone.
+    ///
+    /// An UPSERT on `(transcript_id, speaker_key)`: renaming the same speaker
+    /// twice overwrites, it does not accumulate a second row that a
+    /// `get_speaker_names` would then pick between arbitrarily.
+    pub fn set_speaker_name(
+        &self,
+        transcript_id: i64,
+        speaker_key: &str,
+        display_name: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transcript_speakers (transcript_id, speaker_key, display_name)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(transcript_id, speaker_key)
+             DO UPDATE SET display_name = excluded.display_name",
+            params![transcript_id, speaker_key, display_name],
+        )?;
+        Ok(())
+    }
+
+    /// Every name the user has given this transcript's speakers, keyed by the
+    /// opaque label the segments carry.
+    ///
+    /// A map, and NOT a list indexed by speaker number: the keys are strings
+    /// straight from the segments (`SPEAKER_00`), and nothing here may assume they
+    /// are dense, sorted, small, or even numeric. Speakers with no name simply
+    /// have no entry — the caller falls back to the key itself.
+    pub fn get_speaker_names(&self, transcript_id: i64) -> anyhow::Result<HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT speaker_key, display_name FROM transcript_speakers WHERE transcript_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![transcript_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut names = HashMap::new();
+        for row in rows {
+            let (key, name) = row?;
+            names.insert(key, name);
+        }
+        Ok(names)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -696,8 +831,61 @@ fn hydrate_job(row: &Row) -> rusqlite::Result<Job> {
     })
 }
 
+/// The ONE query that decides which `transcripts` row answers for a recipe:
+/// `(id, full_text, segments_json)`, or `None`.
+///
+/// Shared by `find_transcript` (which reads the transcript) and
+/// `transcript_id_for_job` (which hangs speaker NAMES off it) so the two cannot
+/// drift into disagreeing about which row that is — see the doc comment on
+/// `transcript_id_for_job` for what disagreeing would cost.
+///
+/// `model_id IN (?2, ?3)` + `ORDER BY (model_id = ?2) DESC` is the legacy-alias
+/// lookup described at length on `find_transcript`: an exact match outranks a
+/// pre-rename one.
+fn lookup_transcript(
+    conn: &Connection,
+    source_id: i64,
+    model_id: &str,
+    task: TaskType,
+    language: &str,
+) -> anyhow::Result<Option<(i64, String, String)>> {
+    // Falls back to `model_id` itself when there is no alias, which makes the
+    // `IN (?2, ?3)` an exact match — the pre-rename behaviour.
+    let alias = model_id_alias(model_id).unwrap_or_else(|| model_id.to_string());
+
+    let row = conn
+        .query_row(
+            "SELECT id, full_text, segments_json FROM transcripts
+             WHERE source_id = ?1 AND model_id IN (?2, ?3) AND task = ?4 AND language = ?5
+             ORDER BY (model_id = ?2) DESC
+             LIMIT 1",
+            params![source_id, model_id, alias, task.as_str(), language],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// A stored `segments_json` back into rows.
+///
+/// A parse failure yields an EMPTY transcript, which is a bad answer — so it is
+/// no longer a silent one. Nothing can produce it today: every writer of
+/// `segments_json` is `TranscriptionSegment`'s own `Serialize` (see
+/// `deny_unknown_fields` there), and a row missing `speaker` is not a failure but
+/// the ordinary legacy case. If this ever prints, the on-disk shape and the
+/// struct have parted company and the transcript is being served as nothing at
+/// all.
 fn parse_segments(raw: &str) -> Vec<TranscriptionSegment> {
-    serde_json::from_str(raw).unwrap_or_default()
+    match serde_json::from_str(raw) {
+        Ok(segments) => segments,
+        Err(e) => {
+            eprintln!(
+                "a stored transcript's segments could not be parsed and are being \
+                 served as EMPTY — the row's shape does not match TranscriptionSegment: {e}"
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn utc_now() -> String {
@@ -759,8 +947,27 @@ CREATE TABLE IF NOT EXISTS jobs (
     FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE SET NULL
 );
 
+-- What the user CALLS each speaker. The segments themselves keep the opaque
+-- `SPEAKER_00` keys forever; this table is the join, so a rename is a metadata
+-- write and never a re-transcribe.
+--
+-- `CREATE TABLE IF NOT EXISTS` is purely additive, which is the whole migration
+-- story here: there is no migration framework, and an existing database picks
+-- this up on its next open with every other table untouched.
+CREATE TABLE IF NOT EXISTS transcript_speakers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transcript_id INTEGER NOT NULL,
+    speaker_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    UNIQUE(transcript_id, speaker_key),
+    FOREIGN KEY(transcript_id) REFERENCES transcripts(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_transcripts_lookup
 ON transcripts(source_id, model_id, task, language);
+
+CREATE INDEX IF NOT EXISTS idx_transcript_speakers_lookup
+ON transcript_speakers(transcript_id);
 
 CREATE INDEX IF NOT EXISTS idx_jobs_source
 ON jobs(source_id);
@@ -810,8 +1017,37 @@ mod tests {
     }
 
     /// Write a transcript the way the app does: a job, then `persist_transcript`
-    /// against that job's own recipe.
-    fn write_transcript(store: &Store, source_id: i64, model_id: &str, full_text: &str) {
+    /// against that job's own recipe. Returns the JOB id — which is the only
+    /// handle the frontend ever has, and therefore the handle the speaker-name
+    /// commands take.
+    fn write_transcript(
+        store: &Store,
+        source_id: i64,
+        model_id: &str,
+        full_text: &str,
+    ) -> String {
+        write_segments(
+            store,
+            source_id,
+            model_id,
+            full_text,
+            &[TranscriptionSegment {
+                start: 0.0,
+                end: 2.5,
+                text: " Hello there.".to_string(),
+                speaker: None,
+            }],
+        )
+    }
+
+    /// The same, for a caller that cares what the segments actually are.
+    fn write_segments(
+        store: &Store,
+        source_id: i64,
+        model_id: &str,
+        full_text: &str,
+        segments: &[TranscriptionSegment],
+    ) -> String {
         let job = store
             .create_pending_job(
                 source_id,
@@ -833,13 +1069,11 @@ mod tests {
                 TaskType::Transcribe,
                 "english",
                 full_text,
-                &[TranscriptionSegment {
-                    start: 0.0,
-                    end: 2.5,
-                    text: " Hello there.".to_string(),
-                }],
+                segments,
             )
             .expect("persist transcript");
+
+        job.id
     }
 
     /// The rename to the `_timestamped` exports changed the cache key, which made
@@ -1057,5 +1291,405 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&audio_dir);
+    }
+
+    // -- speakers ------------------------------------------------------------
+
+    /// The EXACT rows the frontend writes for a diarized transcript, as
+    /// `segmentsForPersistence` produces them.
+    ///
+    /// Not retyped here — `include_str!`'d from the frontend, and pinned on that
+    /// side by "writes the speaker onto the rows — and writes the shape Rust
+    /// reads" in `workerTranscript.test.ts`. That is deliberate, and it is the
+    /// alarm that was missing when `speaker` was silently dropped by BOTH ends of
+    /// this wire: a field added to the frontend's row and not to
+    /// `TranscriptionSegment` now fails HERE, loudly, because `deny_unknown_fields`
+    /// refuses to parse it — instead of vanishing into a blob nobody diffs.
+    ///
+    /// The precedent is `commands.rs`'s `include_str!` of the frontend's model
+    /// config, and the reason is the same one: a second, hand-maintained copy of a
+    /// shape the other language owns is a thing that drifts, and this shape has
+    /// already drifted once.
+    const FRONTEND_PERSISTED_ROWS: &str =
+        include_str!("../../frontend/src/lib/persistedSegments.fixture.json");
+
+    fn diarized_rows() -> Vec<TranscriptionSegment> {
+        serde_json::from_str(FRONTEND_PERSISTED_ROWS)
+            .expect("the frontend's persisted row shape must deserialize into TranscriptionSegment")
+    }
+
+    /// **The whole point of the task.**
+    ///
+    /// Diarize a transcript, persist it, reload it: the speaker labels must still
+    /// be there. They were not, and nothing failed — `segmentsForPersistence` built
+    /// each row by hand as `{start, end, text}` and `TranscriptionSegment` had no
+    /// `speaker` field, so the label was dropped twice over, silently, and a
+    /// reopened transcript came back unlabelled.
+    ///
+    /// This goes through the real store: `persist_transcript` serializes to
+    /// `segments_json`, `find_transcript` reads that column back and deserializes
+    /// it. Handing pre-labelled segments straight to a formatter would prove
+    /// nothing about any of it.
+    #[test]
+    fn a_diarized_transcript_survives_the_round_trip_through_the_database() {
+        let (temp, source_id) = store_with_source();
+        let rows = diarized_rows();
+
+        // The premise: these rows really are diarized, and by more than one person.
+        assert_eq!(rows[0].speaker.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(rows[8].speaker.as_deref(), Some("SPEAKER_01"));
+
+        write_segments(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base_timestamped",
+            "Hello there and welcome. Word-level timing is real now.",
+            &rows,
+        );
+
+        let found = temp
+            .store
+            .find_transcript(
+                source_id,
+                "onnx-community/whisper-base_timestamped",
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("query")
+            .expect("the transcript just written");
+
+        assert_eq!(
+            found.segments, rows,
+            "the reloaded segments must be the persisted ones, speakers and all"
+        );
+    }
+
+    /// A job carries its segments too (`jobs.segments_json`, the column the
+    /// frontend actually renders from after a cache hit), and it is a SECOND
+    /// serialization of the same struct through a different column. The label has
+    /// to survive that one as well, or a cache hit renders unlabelled.
+    #[test]
+    fn a_cache_hit_hands_the_frontend_back_its_speakers() {
+        let (temp, source_id) = store_with_source();
+        let rows = diarized_rows();
+
+        write_segments(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base_timestamped",
+            "full text",
+            &rows,
+        );
+
+        let cached = temp
+            .store
+            .find_transcript(
+                source_id,
+                "onnx-community/whisper-base_timestamped",
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("query")
+            .expect("row");
+
+        // Exactly what `create_file_job` does on a cache hit.
+        let job = temp
+            .store
+            .create_job_from_cache(
+                source_id,
+                SourceType::File,
+                "sha256",
+                Some("lecture.mp3"),
+                Some("audio/wav"),
+                "onnx-community/whisper-base_timestamped",
+                TaskType::Transcribe,
+                "english",
+                &cached.full_text,
+                &cached.segments,
+            )
+            .expect("create job from cache");
+
+        assert_eq!(
+            job.segments, rows,
+            "the job the frontend renders must carry the speakers too"
+        );
+    }
+
+    /// **The legacy row must not break.** A transcript written before speakers
+    /// existed has NO `speaker` key at all, and those rows persist indefinitely
+    /// (see `find_transcript`: nothing supersedes one once it exists). Missing is
+    /// `None`, not a parse error — `#[serde(default)]`, which is a different
+    /// mechanism from `deny_unknown_fields` and the reason both can coexist.
+    #[test]
+    fn a_row_written_before_speakers_existed_still_reads() {
+        let legacy = r#"[{"start":0.0,"end":2.5,"text":" Hello there."}]"#;
+
+        let segments = parse_segments(legacy);
+        assert_eq!(
+            segments,
+            vec![TranscriptionSegment {
+                start: 0.0,
+                end: 2.5,
+                text: " Hello there.".to_string(),
+                speaker: None,
+            }],
+            "a pre-diarization row must still parse, with no speaker"
+        );
+    }
+
+    /// And an undiarized transcript must still be written EXACTLY as it always
+    /// was: `speaker` absent, not `null`. The webview reads these rows, and
+    /// `"speaker" in row` is the difference between "nobody said this" and a
+    /// `null` the formatter would have to defend against.
+    #[test]
+    fn an_undiarized_segment_serializes_without_a_speaker_key_at_all() {
+        let json = serde_json::to_string(&TranscriptionSegment {
+            start: 0.0,
+            end: 2.5,
+            text: " Hello there.".to_string(),
+            speaker: None,
+        })
+        .expect("serialize");
+
+        assert_eq!(json, r#"{"start":0.0,"end":2.5,"text":" Hello there."}"#);
+    }
+
+    /// **A field this struct does not know about now FAILS instead of vanishing.**
+    ///
+    /// This is the guard that did not exist. `speaker` was sent from the frontend
+    /// and thrown away here without a whisper, because serde ignores unknown fields
+    /// by default. `deny_unknown_fields` turns the next such drop into an error at
+    /// the first `persist_transcript` — in dev, on the first run — rather than a
+    /// missing feature discovered by a user months later.
+    #[test]
+    fn a_field_rust_does_not_know_about_fails_loudly_instead_of_vanishing() {
+        let with_a_stranger =
+            r#"{"start":0.0,"end":2.5,"text":"Hello","speaker":"SPEAKER_00","confidence":0.91}"#;
+
+        let parsed = serde_json::from_str::<TranscriptionSegment>(with_a_stranger);
+
+        assert!(
+            parsed.is_err(),
+            "an unknown field must be REFUSED, not silently dropped — that silent \
+             drop is exactly how speaker labels died"
+        );
+    }
+
+    /// The brief's test: renaming twice must overwrite, not accumulate a second
+    /// row that a later read would pick between arbitrarily.
+    #[test]
+    fn renaming_a_speaker_is_idempotent_and_survives_reread() {
+        let (temp, source_id) = store_with_source();
+        let job_id = write_transcript(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base_timestamped",
+            "hello",
+        );
+        let transcript_id = temp
+            .store
+            .transcript_id_for_job(&job_id)
+            .expect("query")
+            .expect("the job has a transcript");
+
+        temp.store
+            .set_speaker_name(transcript_id, "SPEAKER_00", "Alice")
+            .expect("name a speaker");
+        temp.store
+            .set_speaker_name(transcript_id, "SPEAKER_00", "Alice B.")
+            .expect("rename her");
+
+        let names = temp
+            .store
+            .get_speaker_names(transcript_id)
+            .expect("read the names");
+
+        assert_eq!(names.get("SPEAKER_00"), Some(&"Alice B.".to_string()));
+        assert_eq!(names.len(), 1, "the rename must UPSERT, not accumulate");
+    }
+
+    /// **Renaming is a metadata update, and re-persisting the transcript is not a
+    /// re-transcribe.** Diarization can land AFTER the transcript has been saved
+    /// (it runs in a different process on different hardware), so the segments get
+    /// written a second time with their labels — and the names the user has already
+    /// given those speakers must survive that write. They do because
+    /// `persist_transcript` UPSERTs on the recipe, so the transcript's ROWID — the
+    /// key the names hang off — does not change.
+    #[test]
+    fn naming_survives_the_transcript_being_persisted_again() {
+        let (temp, source_id) = store_with_source();
+        const MODEL: &str = "onnx-community/whisper-base_timestamped";
+
+        let job_id = write_transcript(&temp.store, source_id, MODEL, "hello");
+        let transcript_id = temp
+            .store
+            .transcript_id_for_job(&job_id)
+            .expect("query")
+            .expect("transcript");
+
+        temp.store
+            .set_speaker_name(transcript_id, "SPEAKER_01", "Bob")
+            .expect("name a speaker");
+
+        // Diarization finished late: the same recipe is persisted again, this time
+        // with speaker-labelled segments.
+        let rows = diarized_rows();
+        temp.store
+            .persist_transcript(
+                &job_id,
+                MODEL,
+                TaskType::Transcribe,
+                "english",
+                "hello",
+                &rows,
+            )
+            .expect("re-persist with speakers");
+
+        let after = temp
+            .store
+            .transcript_id_for_job(&job_id)
+            .expect("query")
+            .expect("transcript");
+
+        assert_eq!(
+            after, transcript_id,
+            "an UPSERT on the recipe must keep the transcript's identity — a new \
+             row would strand every name the user has given"
+        );
+        assert_eq!(
+            temp.store
+                .get_speaker_names(transcript_id)
+                .expect("names")
+                .get("SPEAKER_01"),
+            Some(&"Bob".to_string()),
+            "renaming is metadata: re-writing the segments must not erase it"
+        );
+
+        let found = temp
+            .store
+            .find_transcript(source_id, MODEL, TaskType::Transcribe, "english")
+            .expect("query")
+            .expect("row");
+        assert_eq!(found.segments, rows, "and the new segments did land");
+    }
+
+    /// **The names must attach to the row the CACHE actually serves.**
+    ///
+    /// A legacy transcript is reachable under the renamed model id
+    /// (`find_transcript`'s alias), and dropping the same file in again produces a
+    /// NEW job that hits it. If `transcript_id_for_job` resolved that job to
+    /// anything other than the row `find_transcript` returns, a user could rename
+    /// the speakers of a transcript and have the names land on a row the app never
+    /// reads — the rename would appear to work and then quietly not exist.
+    ///
+    /// Sharing `lookup_transcript` between the two is what makes this hold; this
+    /// test is what would notice if someone stopped sharing it.
+    #[test]
+    fn speaker_names_attach_to_the_very_row_the_cache_serves() {
+        let (temp, source_id) = store_with_source();
+        const LEGACY: &str = "onnx-community/whisper-base";
+        const RENAMED: &str = "onnx-community/whisper-base_timestamped";
+
+        // The transcript was made before the model rename.
+        let old_job = write_transcript(&temp.store, source_id, LEGACY, "legacy transcript");
+        let transcript_id = temp
+            .store
+            .transcript_id_for_job(&old_job)
+            .expect("query")
+            .expect("the legacy job's transcript");
+
+        temp.store
+            .set_speaker_name(transcript_id, "SPEAKER_00", "Alice")
+            .expect("name a speaker");
+
+        // The user drops the same file in again, months later, under the renamed
+        // model. `create_file_job` finds the legacy row through the alias and
+        // creates a job straight from the cache.
+        let cached = temp
+            .store
+            .find_transcript(source_id, RENAMED, TaskType::Transcribe, "english")
+            .expect("query")
+            .expect("the alias must still find the legacy row");
+        let new_job = temp
+            .store
+            .create_job_from_cache(
+                source_id,
+                SourceType::File,
+                "sha256",
+                Some("lecture.mp3"),
+                Some("audio/wav"),
+                RENAMED,
+                TaskType::Transcribe,
+                "english",
+                &cached.full_text,
+                &cached.segments,
+            )
+            .expect("cache hit");
+
+        assert_eq!(
+            temp.store
+                .transcript_id_for_job(&new_job.id)
+                .expect("query"),
+            Some(transcript_id),
+            "a cache-hit job must resolve to the SAME transcript row the cache served it"
+        );
+        assert_eq!(
+            temp.store
+                .get_speaker_names(transcript_id)
+                .expect("names")
+                .get("SPEAKER_00"),
+            Some(&"Alice".to_string()),
+            "and the names the user gave it are still there, under a brand new job id"
+        );
+    }
+
+    /// A job that has not been transcribed yet has no transcript to hang names off.
+    /// That is `None`, not an error — the command turns it into an empty map on
+    /// read and a refusal on write.
+    #[test]
+    fn a_job_with_no_transcript_yet_resolves_to_no_transcript() {
+        let (temp, source_id) = store_with_source();
+
+        let job = temp
+            .store
+            .create_pending_job(
+                source_id,
+                SourceType::File,
+                "sha256",
+                JobStatus::Extracting,
+                Some("lecture.mp3"),
+                None,
+                "onnx-community/whisper-base_timestamped",
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("create job");
+
+        assert_eq!(
+            temp.store.transcript_id_for_job(&job.id).expect("query"),
+            None
+        );
+        assert_eq!(
+            temp.store.transcript_id_for_job("no-such-job").expect("query"),
+            None
+        );
+    }
+
+    /// A name may not be written against a transcript that does not exist.
+    ///
+    /// Without `PRAGMA foreign_keys = ON` (see `Store::open`) SQLite accepts the
+    /// orphan happily, and the next transcript to be handed that rowid inherits it:
+    /// someone else's recording, wearing your speaker names. This test fails
+    /// without that pragma — the FK clause alone is decoration.
+    #[test]
+    fn naming_a_speaker_of_a_transcript_that_does_not_exist_is_refused() {
+        let temp = temp_store();
+
+        assert!(
+            temp.store
+                .set_speaker_name(9999, "SPEAKER_00", "Nobody")
+                .is_err(),
+            "an orphaned speaker name must be refused by the foreign key"
+        );
     }
 }

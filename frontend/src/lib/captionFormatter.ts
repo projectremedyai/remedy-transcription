@@ -993,8 +993,14 @@ function tokensWithSpeakers(
  * They pass `assignSpeakers` a bare `{text,start,end}` rather than the token or
  * segment itself, deliberately: `SpeakerTagged<T>` sets `speaker: number | null`,
  * which would collide with the `speaker?: string` these types already carry.
+ *
+ * EXPORTED so that `segmentsForPersistence` labels the rows it writes with the
+ * same two functions the screen labels its cues with. That sharing is the reason
+ * a transcript reloaded from the database renders identically to the one that was
+ * on screen when it was saved: two independent labelling paths would be two
+ * things to drift, and the drift would be invisible until a user reopened a file.
  */
-function assignSpeakersToTokens(
+export function assignSpeakersToTokens(
     tokens: WordToken[],
     turns: readonly SpeakerTurn[],
 ): WordToken[] {
@@ -1004,7 +1010,7 @@ function assignSpeakersToTokens(
     );
 }
 
-function assignSpeakersToSegments(
+export function assignSpeakersToSegments(
     segments: RawSegment[],
     turns: readonly SpeakerTurn[],
 ): RawSegment[] {

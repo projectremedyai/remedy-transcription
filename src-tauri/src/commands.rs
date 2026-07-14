@@ -1598,6 +1598,102 @@ pub async fn persist_transcript(
     Ok(updated)
 }
 
+// ---------------------------------------------------------------------------
+// Speaker display names.
+//
+// The segments keep their opaque `SPEAKER_00` keys FOREVER. A name is a row in
+// `transcript_speakers`, joined on at render time. So renaming is a metadata
+// write -- it never re-transcribes, never re-diarizes, and never rewrites a
+// single segment. That is not an optimization; it is the only design in which
+// renaming a speaker is possible at all once the audio has been cleaned up (see
+// `PREPARED_AUDIO_TTL_HOURS`), which for any transcript older than a day it has.
+//
+// Both commands take a JOB id, because a job id is the only handle the frontend
+// has. `transcript_id_for_job` resolves it to the transcript row the cache
+// itself serves -- so a name given to a speaker today is still attached when the
+// same file is dropped in next week and comes back as a cache hit under a new
+// job id.
+// ---------------------------------------------------------------------------
+
+/// A name, trimmed, or a REFUSAL.
+///
+/// A blank name is rejected rather than stored because it would render as an
+/// EMPTY speaker label -- `": Hello there."` in an SRT, a `<v >` in a WebVTT --
+/// which is indistinguishable from a cue with NO speaker at all. Producing a
+/// transcript in which "diarization found nobody here" and "the user pressed
+/// enter on an empty box" look the same is the exact class of silent lie the rest
+/// of this feature is built to avoid, so it is refused at the door.
+///
+/// Trimming, and not merely checking: a name of `"  "` is blank, and a name of
+/// `" Alice "` is Alice. Split out from the command so it can be tested without a
+/// Tauri `State`, which a unit test cannot construct.
+fn validated_speaker_name<'a>(
+    speaker_key: &'a str,
+    display_name: &'a str,
+) -> Result<(&'a str, &'a str), String> {
+    let speaker_key = speaker_key.trim();
+    let display_name = display_name.trim();
+
+    if speaker_key.is_empty() {
+        return Err("A speaker key is required".to_string());
+    }
+    if display_name.is_empty() {
+        return Err("A speaker name cannot be blank".to_string());
+    }
+    Ok((speaker_key, display_name))
+}
+
+/// Name a speaker: `SPEAKER_00` -> `"Alice"`. Renaming twice overwrites.
+///
+/// `Err` means the REQUEST was wrong: an unknown job, a job with no transcript
+/// yet (nothing to attach a name to), a blank key, or a blank name.
+#[tauri::command]
+pub async fn set_speaker_name(
+    job_id: String,
+    speaker_key: String,
+    display_name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (speaker_key, display_name) = validated_speaker_name(&speaker_key, &display_name)?;
+
+    let transcript_id = state
+        .store
+        .transcript_id_for_job(&job_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "This job has no transcript to name speakers in".to_string())?;
+
+    state
+        .store
+        .set_speaker_name(transcript_id, speaker_key, display_name)
+        .map_err(|e| e.to_string())
+}
+
+/// Every name the user has given this job's speakers, keyed by the opaque label
+/// the segments carry: `{"SPEAKER_00": "Alice"}`.
+///
+/// A job with no transcript, or with no names yet, answers with an EMPTY MAP
+/// rather than an error -- the UI asks this on every load, and "nobody has
+/// renamed anyone" is the normal answer, not a failure. Speakers with no name
+/// simply have no entry; the caller falls back to the key.
+#[tauri::command]
+pub async fn get_speaker_names(
+    job_id: String,
+    state: State<'_, AppState>,
+) -> Result<HashMap<String, String>, String> {
+    let Some(transcript_id) = state
+        .store
+        .transcript_id_for_job(&job_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(HashMap::new());
+    };
+
+    state
+        .store
+        .get_speaker_names(transcript_id)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn queue_status(state: State<'_, AppState>) -> Result<QueueStatusResponse, String> {
     let health = state.events.health();
@@ -2471,6 +2567,32 @@ mod tests {
             args.windows(canonical.len())
                 .any(|window| window == canonical.as_slice()),
             "the canonical argument list must survive intact"
+        );
+    }
+
+    // -- speaker names -------------------------------------------------------
+
+    /// A speaker may not be named the empty string.
+    ///
+    /// Stored, it would render as `": Hello there."` in an SRT and `<v >` in a
+    /// WebVTT -- a cue that LOOKS unattributed. "Diarization found nobody" and
+    /// "the user pressed enter on an empty box" must not produce the same
+    /// transcript.
+    #[test]
+    fn a_speaker_may_not_be_named_nothing() {
+        assert!(validated_speaker_name("SPEAKER_00", "").is_err());
+        assert!(validated_speaker_name("SPEAKER_00", "   ").is_err());
+        assert!(validated_speaker_name("SPEAKER_00", "\t\n").is_err());
+        assert!(validated_speaker_name("", "Alice").is_err());
+    }
+
+    /// And a real name is TRIMMED, not merely accepted: `" Alice "` is Alice, and
+    /// the whitespace does not reach the exports.
+    #[test]
+    fn a_speaker_name_is_trimmed() {
+        assert_eq!(
+            validated_speaker_name("  SPEAKER_00 ", "  Alice B.  "),
+            Ok(("SPEAKER_00", "Alice B."))
         );
     }
 }

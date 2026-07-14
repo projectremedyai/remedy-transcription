@@ -70,6 +70,19 @@ export interface PersistTranscriptRequest {
     segments: TranscriptionSegment[];
 }
 
+/**
+ * What the user CALLS each speaker, keyed by the opaque label the segments carry:
+ * `{ SPEAKER_00: "Alice" }`.
+ *
+ * A map, and NOT an array indexed by speaker number. The keys are the segments'
+ * own strings — do not parse them back into numbers, do not assume they are
+ * dense, sorted or small. A speaker nobody has renamed has NO ENTRY, and the
+ * caller renders the key itself; an entry is never blank (Rust rejects a blank
+ * name, which would render as a nameless speaker and be indistinguishable from a
+ * cue with no speaker at all).
+ */
+export type SpeakerNames = Record<string, string>;
+
 export interface QueueStatus {
     position: number;
     total_in_queue: number;

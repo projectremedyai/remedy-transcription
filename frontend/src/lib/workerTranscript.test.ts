@@ -89,6 +89,68 @@ describe("segmentsFromWorkerChunks: the null-end fallback chain", () => {
     });
 });
 
+/**
+ * The mid-stream preview. `return_timestamps: 'word'` turns timestamp TOKENS off,
+ * so the streamer has no per-sentence times to give and the worker opens one
+ * chunk per decoding WINDOW. What that chunk claims as its END is the whole
+ * contract between the worker and this module, and it is shown to the user
+ * (Transcript.tsx renders these times).
+ */
+describe("the open decoding window must carry a provisional end", () => {
+    const CHUNK_LENGTH = 29;
+
+    it("keeps preview times inside the window instead of crushing them into 2 seconds", () => {
+        // With `timestamp[1] = null` and no audioDuration (the `update` path
+        // passes null by design — the window is still open), the fallback chain
+        // bottoms out at `start + FALLBACK_CHUNK_DURATION`. A whole 29s window's
+        // worth of words then renders inside a 2s band: speech 25 seconds in
+        // displays as 0:00, and snaps when the window finalises.
+        const openWindow =
+            " a long decoding window of speech spoken over many seconds of audio.";
+
+        const broken = segmentsFromWorkerChunks(
+            [{ text: openWindow, timestamp: [0, null] }],
+            null,
+        );
+        expect(broken[0].end).toBe(FALLBACK_CHUNK_DURATION);
+
+        // What the worker now sends: the window runs to offset + chunk_length_s.
+        const fixed = segmentsFromWorkerChunks(
+            [{ text: openWindow, timestamp: [0, CHUNK_LENGTH] }],
+            null,
+        );
+        expect(fixed[0].end).toBe(CHUNK_LENGTH);
+
+        const cues = consolidateWorkerTranscript(
+            {
+                text: "",
+                chunks: [{ text: openWindow, timestamp: [0, CHUNK_LENGTH] }],
+            },
+            null,
+        ).chunks;
+        // The preview spreads the window's words across the window, not across 2s.
+        expect(cues.at(-1)!.end).toBeGreaterThan(5);
+        expect(cues.at(-1)!.end).toBeLessThanOrEqual(CHUNK_LENGTH);
+    });
+
+    it("times the SECOND window from its own stride offset, not from zero", () => {
+        const strideLength = 5;
+        const secondOffset = CHUNK_LENGTH - strideLength;
+        const segments = segmentsFromWorkerChunks(
+            [
+                { text: " first window", timestamp: [0, CHUNK_LENGTH] },
+                {
+                    text: " second window",
+                    timestamp: [secondOffset, secondOffset + CHUNK_LENGTH],
+                },
+            ],
+            null,
+        );
+        expect(segments[1].start).toBe(24);
+        expect(segments[1].end).toBe(53);
+    });
+});
+
 describe("consolidateWorkerTranscript", () => {
     it("consolidates raw worker chunks into cues and joins their text", () => {
         const { text, chunks } = consolidateWorkerTranscript(
@@ -240,6 +302,19 @@ describe("segmentsForPersistence: the database keeps the REAL word times", () =>
         const reloaded = consolidateSegments(persisted);
 
         expect(reloaded).toEqual(live.chunks);
+    });
+
+    it("does not ship the words twice: `chunks` is empty when `words` is populated", () => {
+        // The worker's "complete" message used to carry `output.chunks` AND
+        // `words` — with `return_timestamps: 'word'` those are the same array.
+        // Persistence and display must both work off `words` alone.
+        const wordsOnly = { ...WORD_TRANSCRIPT, chunks: [] };
+        expect(segmentsForPersistence(wordsOnly, 6.0)).toEqual(
+            segmentsForPersistence(WORD_TRANSCRIPT, 6.0),
+        );
+        expect(consolidateWorkerTranscript(wordsOnly, 6.0)).toEqual(
+            consolidateWorkerTranscript(WORD_TRANSCRIPT, 6.0),
+        );
     });
 
     it("falls back to chunk segments when the model gave no word times", () => {

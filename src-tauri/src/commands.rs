@@ -11,12 +11,33 @@ use crate::sidecar::spawn_sidecar;
 use crate::store::{Job, JobStatus, JobUpdate, SourceType, TaskType, TranscriptionSegment};
 use crate::AppState;
 
-const REQUIRED_MODEL_IDS: &[&str] = &[
-    "onnx-community/whisper-tiny",
-    "onnx-community/whisper-base",
-    "onnx-community/distil-small.en",
-    "onnx-community/whisper-large-v3-turbo",
-];
+/// The frontend's model config, embedded at COMPILE time.
+///
+/// The model IDs used to be typed out again here, and they drifted the moment
+/// the frontend renamed them: `list_models` kept answering for the old IDs, the
+/// frontend gates the Transcribe button on an EXACT id match against that
+/// answer, and every entry point to transcription went dead with no error. The
+/// backend has no independent knowledge of these models — they stream from
+/// huggingface.co on demand — so it has no business holding a second copy of the
+/// list. It reads the frontend's.
+///
+/// `include_str!` is a compile-time dependency that rustc records in its
+/// dep-info, so editing the TS config rebuilds this crate.
+const TRANSCRIPTION_CONFIG_TS: &str = include_str!("../../frontend/src/config/transcription.ts");
+
+static MODEL_ID_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"modelId:\s*"([^"]+)""#).expect("valid regex"));
+
+/// Every model the frontend can actually resolve, derived from the single source
+/// of truth above. `"__auto__"` is a sentinel the frontend resolves to one of the
+/// real presets, not a model.
+static REQUIRED_MODEL_IDS: Lazy<Vec<String>> = Lazy::new(|| {
+    MODEL_ID_RE
+        .captures_iter(TRANSCRIPTION_CONFIG_TS)
+        .map(|caps| caps[1].to_string())
+        .filter(|id| id != "__auto__")
+        .collect()
+});
 
 static YOUTUBE_ID_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[A-Za-z0-9_-]{11}$").expect("valid regex"));
@@ -689,7 +710,7 @@ pub async fn list_models(_app: AppHandle) -> Result<ModelStatusResponse, String>
     let items: Vec<ModelStatusItem> = REQUIRED_MODEL_IDS
         .iter()
         .map(|id| ModelStatusItem {
-            model_id: (*id).to_string(),
+            model_id: id.clone(),
             ready: true,
             path: String::new(),
         })
@@ -718,4 +739,92 @@ pub async fn export_transcript(request: ExportRequest) -> Result<(), String> {
     std::fs::write(&request.destination, request.content.as_bytes()).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    /// The body of the frontend's `MODEL_PRESETS` array, located WITHOUT the
+    /// regex the production code uses — so it can count the presets independently
+    /// of whether that regex still matches anything.
+    fn model_presets_block() -> &'static str {
+        let start = TRANSCRIPTION_CONFIG_TS
+            .find("export const MODEL_PRESETS")
+            .expect(
+                "frontend/src/config/transcription.ts no longer exports MODEL_PRESETS — \
+                 TRANSCRIPTION_CONFIG_TS is pointing at the wrong file",
+            );
+        let rest = &TRANSCRIPTION_CONFIG_TS[start..];
+        let end = rest
+            .find("\n];")
+            .expect("MODEL_PRESETS array is not terminated by `];`");
+        &rest[..end]
+    }
+
+    /// The guard on the bug that killed the whole app.
+    ///
+    /// `REQUIRED_MODEL_IDS` is now DERIVED from the frontend's config, so the two
+    /// cannot hold DIFFERENT lists — the class of bug that renamed four models on
+    /// one side only, left `list_models` answering for ids the frontend no longer
+    /// asks for, and disabled every entry point to transcription with no error
+    /// anywhere.
+    ///
+    /// What can still go wrong is the derivation itself: if `MODEL_ID_RE` stops
+    /// matching (the config reformatted, switched to single quotes, moved), it
+    /// silently yields a SHORT or EMPTY list and the button goes dead exactly as
+    /// before. So count the presets a second way — textually, without the regex —
+    /// and demand the parser found all of them.
+    #[test]
+    fn model_ids_are_parsed_from_the_frontend_config() {
+        let block = model_presets_block();
+        let declared = block.matches("modelId:").count();
+
+        assert!(
+            declared > 1,
+            "no model presets found in MODEL_PRESETS — the parser is looking at the wrong thing"
+        );
+        assert_eq!(
+            block.matches("__auto__").count(),
+            1,
+            "expected exactly one `__auto__` sentinel preset in MODEL_PRESETS"
+        );
+
+        // Every preset declares a `modelId`; exactly one is the `__auto__`
+        // sentinel, which the frontend resolves to one of the real presets.
+        assert_eq!(
+            REQUIRED_MODEL_IDS.len(),
+            declared - 1,
+            "the model-id parser missed a preset in frontend/src/config/transcription.ts. \
+             list_models must offer EXACTLY the ids the frontend can select — the frontend \
+             gates the Transcribe button on an exact id match against this answer — so fix \
+             MODEL_ID_RE. Do NOT retype the list here: that is how it drifted last time. \
+             parsed: {:?}",
+            *REQUIRED_MODEL_IDS
+        );
+
+        for id in REQUIRED_MODEL_IDS.iter() {
+            assert!(
+                id.contains('/') && !id.contains("__auto__"),
+                "{id:?} does not look like a HuggingFace repo id"
+            );
+            assert!(
+                block.contains(&format!("\"{id}\"")),
+                "{id:?} is not one of the frontend's presets"
+            );
+        }
+    }
+
+    /// The frontend asks for word timestamps (`return_timestamps: 'word'`), which
+    /// only the `_timestamped` exports can serve — they are the ones carrying the
+    /// `cross_attentions` outputs and `alignment_heads` that DTW needs. A plain
+    /// export throws "Model outputs must contain cross attentions to extract
+    /// timestamps" at transcribe time.
+    #[test]
+    fn every_model_is_a_timestamped_export() {
+        for id in REQUIRED_MODEL_IDS.iter() {
+            assert!(
+                id.ends_with("_timestamped"),
+                "{id:?} is not a _timestamped export — word timestamps will throw at runtime"
+            );
+        }
+    }
+}

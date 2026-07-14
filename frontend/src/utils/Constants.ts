@@ -26,7 +26,9 @@ export default {
     DEFAULT_AUDIO_URL: `https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/${
         isMobileOrTablet ? "jfk" : "ted_60_16k"
     }.wav`,
-    DEFAULT_MODEL: "Xenova/whisper-tiny",
+    // No DEFAULT_MODEL here. The model IDs live in config/transcription.ts, which
+    // src-tauri/src/commands.rs parses as the single source of truth; a fifth copy
+    // in this file was stale ("Xenova/whisper-tiny") and unused.
     DEFAULT_SUBTASK: "transcribe",
     DEFAULT_LANGUAGE: "english",
     DEFAULT_QUANTIZED: isMobileOrTablet,

@@ -3,6 +3,8 @@ import {
     ConsolidatedSegment,
     WordToken,
     consolidateSegments,
+    countCaptionWords,
+    joinCaptionTexts,
     normalizeWordTokens,
 } from "./captionFormatter";
 
@@ -56,10 +58,6 @@ export function segmentsFromWorkerChunks(
     }));
 }
 
-function wordCount(text: string): number {
-    return text.replace(/\n/g, " ").trim().split(/\s+/).filter(Boolean).length;
-}
-
 /**
  * What goes in the database as the transcript's source of truth.
  *
@@ -67,8 +65,17 @@ function wordCount(text: string): number {
  * The alternative, persisting the worker's `chunks`, is now the same data anyway
  * (`return_timestamps: 'word'` makes every entry of `output.chunks` a word), but
  * going through `normalizeWordTokens` first is what keeps a re-read equal to the
- * live render: it folds "-level" back onto "Word" so the reloaded text does not
- * come back as "Word -level".
+ * live render, and it is the ONLY thing that does. It is the single funnel both
+ * paths share, so all three of its guarantees hold on the way in as well as on
+ * screen:
+ *
+ *   - continuation fragments are folded ("-level" onto "Word"), so a reload
+ *     cannot resurrect one and print "Word -level";
+ *   - words are monotonic;
+ *   - every word has `end > start`. DTW does emit zero-duration words. Persisted
+ *     raw, `effectiveEnd` would inflate one on reload to the NEXT word's start —
+ *     swallowing a pause — or, for the final word, to `start + 1.2s`, possibly
+ *     past the end of the audio.
  *
  * A word-granular source of truth also means a transcript read back from disk is
  * NOT re-fabricated: `tokensFromSegments` over one-word segments returns those
@@ -108,13 +115,13 @@ export function consolidateWorkerTranscript(
     const displayChunks =
         options.hideTrailingShortCaption &&
         chunks.length > 0 &&
-        wordCount(chunks[chunks.length - 1].text) < 3
+        countCaptionWords(chunks[chunks.length - 1].text) < 3
             ? chunks.slice(0, -1)
             : chunks;
     const text =
         displayChunks
             .map((chunk) => chunk.text.replace(/\n/g, " "))
-            .join(" ")
+            .reduce(joinCaptionTexts, "")
             .trim() || workerTranscript.text;
 
     return { text, chunks: displayChunks };

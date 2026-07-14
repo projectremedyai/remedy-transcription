@@ -9,12 +9,58 @@ const MIN_CAPTION_WORDS = 3;
 const MAX_OVERLAP_WORDS = 16;
 const NOMINAL_WORD_DURATION = 0.35;
 
+/**
+ * The shortest span a single word is allowed to occupy.
+ *
+ * DTW quantises word times to 0.02s and DOES emit words whose end equals their
+ * start. Left alone, such a word is a zero-duration database row, and on reload
+ * `effectiveEnd` inflates it to the next word's start (swallowing a pause) or,
+ * for the final word, to `start + MIN_CAPTION_DURATION` — possibly past the end
+ * of the audio. Flooring it here, on the path BOTH the live render and the
+ * persisted rows go through, is what keeps a reload identical to the live cues.
+ */
+const MIN_WORD_DURATION = 0.01;
+
+/** Absorbs float noise in duration comparisons (a - b where b was a + eps). */
+const TIME_EPSILON = 1e-6;
+
 const WHITESPACE_RE = /\s+/g;
 const SPACE_BEFORE_PUNCT_RE = /\s+([,.;:!?])/g;
 const MISSING_SPACE_AFTER_PUNCT_RE = /([,.;:!?])(?=[^\s"'])/g;
 const WORD_NORMALIZE_RE = /[^a-z0-9']+/g;
-const SENTENCE_END_RE = /[.!?]["')\]]*$/;
-const CLAUSE_END_RE = /[,;:]["')\]]*$/;
+const SENTENCE_END_RE = /[.!?。！？…]["'”’)\]]*$/;
+const CLAUSE_END_RE = /[,;:，、；：]["'”’)\]]*$/;
+const DIGIT_RE = /\d/;
+const LETTER_RE = /[A-Za-z]/;
+
+/**
+ * Scripts that do not put spaces between words.
+ *
+ * This is not decoration — it is the same list transformers.js branches on.
+ * `combineTokensIntoWords` (tokenizers.js) sends chinese/japanese/thai/lao/
+ * myanmar through `splitTokensOnUnicode`, which NEVER emits a leading space, and
+ * everything else through `splitTokensOnSpaces`, which marks each word boundary
+ * with one. Code that reads "no leading space" as "this continues the previous
+ * word" is therefore correct for English and catastrophically wrong for Chinese:
+ * every word continues the previous one, and the entire transcript folds into a
+ * single token. Ranges: CJK punctuation, kana, CJK ideographs (incl. ext-A and
+ * compatibility), fullwidth/halfwidth forms, Thai, Lao, Myanmar. Hangul is
+ * deliberately absent — Korean is space-separated and takes the normal path.
+ */
+const NO_SPACE_SCRIPT_CHARS = [
+    "\\u0e00-\\u0e7f", // Thai
+    "\\u0e80-\\u0eff", // Lao
+    "\\u1000-\\u109f", // Myanmar
+    "\\u3000-\\u303f", // CJK symbols and punctuation
+    "\\u3040-\\u30ff", // Hiragana and Katakana
+    "\\u3400-\\u4dbf", // CJK unified ideographs extension A
+    "\\u4e00-\\u9fff", // CJK unified ideographs
+    "\\uf900-\\ufaff", // CJK compatibility ideographs
+    "\\uff00-\\uffef", // Halfwidth and fullwidth forms
+].join("");
+const STARTS_NO_SPACE_SCRIPT_RE = new RegExp(`^[${NO_SPACE_SCRIPT_CHARS}]`);
+const ENDS_NO_SPACE_SCRIPT_RE = new RegExp(`[${NO_SPACE_SCRIPT_CHARS}]$`);
+const NO_SPACE_SCRIPT_GLOBAL_RE = new RegExp(`[${NO_SPACE_SCRIPT_CHARS}]`, "g");
 
 /**
  * One word with its own start and end. When these come from the model
@@ -60,12 +106,95 @@ export type RawSegment = TranscriptionSegment & {
     readonly __consolidated?: never;
 };
 
+/**
+ * Whisper sometimes drops the space after a punctuation mark ("Hello,world"), so
+ * the formatter puts it back. But punctuation is not always a word boundary, and
+ * splitting where there is no boundary is not cosmetic: the database stores ONE
+ * WORD PER ROW, and a reload re-derives the word list by splitting each row's
+ * cleaned text on spaces. Insert a space inside a persisted word and the reload
+ * gets two tokens where the live render had one — "3.14" comes back as "3." and
+ * "14", "3." satisfies `endsSentence`, and a cue can break in the middle of a
+ * number on reload but not live.
+ *
+ * So: never split a number (3.14, 1,000, 3:30) or an abbreviation (U.S.A., e.g.).
+ */
+function needsSpaceAfterPunctuation(
+    text: string,
+    punctuation: string,
+    index: number,
+): boolean {
+    const before = text[index - 1] ?? "";
+    const after = text[index + 1] ?? "";
+
+    if (
+        ".,:".includes(punctuation) &&
+        DIGIT_RE.test(before) &&
+        DIGIT_RE.test(after)
+    ) {
+        return false;
+    }
+
+    // A dot whose left neighbour is a SINGLE letter, followed by another letter:
+    // U.S.A., e.g., i.e. A sentence end has a word before the dot, not a letter.
+    if (
+        punctuation === "." &&
+        LETTER_RE.test(before) &&
+        LETTER_RE.test(after) &&
+        !LETTER_RE.test(text[index - 2] ?? "")
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
 export function cleanCaptionText(text: string): string {
     let cleaned = text.trim().replace(WHITESPACE_RE, " ");
     cleaned = cleaned.replace(SPACE_BEFORE_PUNCT_RE, "$1");
-    cleaned = cleaned.replace(MISSING_SPACE_AFTER_PUNCT_RE, "$1 ");
+    cleaned = cleaned.replace(
+        MISSING_SPACE_AFTER_PUNCT_RE,
+        (_match, punctuation: string, index: number, whole: string) =>
+            needsSpaceAfterPunctuation(whole, punctuation, index)
+                ? `${punctuation} `
+                : punctuation,
+    );
     cleaned = cleaned.replace(/\bi\b/g, "I");
     return cleaned.trim();
+}
+
+/**
+ * Join two pieces of caption text, inserting a space only where the scripts
+ * involved actually use one. `"光合" + "作用"` is `"光合作用"`, not `"光合 作用"`.
+ */
+export function joinCaptionTexts(left: string, right: string): string {
+    if (left.length === 0) return right;
+    if (right.length === 0) return left;
+    const needsSpace =
+        !ENDS_NO_SPACE_SCRIPT_RE.test(left) &&
+        !STARTS_NO_SPACE_SCRIPT_RE.test(right);
+    return needsSpace ? `${left} ${right}` : `${left}${right}`;
+}
+
+/**
+ * How many "words" a caption holds, for the runt/length rules.
+ *
+ * Splitting on whitespace reports 1 for any Chinese or Japanese caption however
+ * long, which makes `mergeShortCaptions` treat every one of them as a runt and
+ * glue them together. Count each no-space-script character as its own word,
+ * which is exactly how the model tokenised them.
+ */
+export function countCaptionWords(text: string): number {
+    const normalized = text.replace(/\n/g, " ").trim();
+    if (normalized.length === 0) return 0;
+
+    const scriptChars =
+        normalized.match(NO_SPACE_SCRIPT_GLOBAL_RE)?.length ?? 0;
+    const spaced = normalized
+        .replace(NO_SPACE_SCRIPT_GLOBAL_RE, " ")
+        .split(/\s+/)
+        .filter(Boolean).length;
+
+    return scriptChars + spaced;
 }
 
 function normalizeWord(word: string): string {
@@ -149,37 +278,58 @@ function effectiveEnd(
 /**
  * Real word timings from the model, cleaned up for the cue splitter.
  *
- * Two things have to happen before Whisper's words are usable as tokens:
+ * Three things have to happen before Whisper's words are usable as tokens:
  *
- *   1. Whisper marks a word boundary with a LEADING SPACE (" quick"), and emits
- *      intra-word fragments without one: "Word-level" arrives as [" Word",
- *      "-level"] and "cross-attention" as [" cross", "-attention"]. Tokens are
- *      re-joined with a space downstream, so a fragment left on its own would
- *      print "Word -level". Fold every space-less fragment back into the word it
- *      belongs to, extending that word's end.
+ *   1. Fold continuation fragments. In a SPACE-SEPARATED language Whisper marks a
+ *      word boundary with a LEADING SPACE (" quick") and emits intra-word
+ *      fragments without one: "Word-level" arrives as [" Word", "-level"] and
+ *      "cross-attention" as [" cross", "-attention"]. A fragment left standing
+ *      prints "Word -level".
+ *
+ *      "No leading space" therefore does NOT mean "continues the previous word" —
+ *      it means that only in a script that uses spaces. In Chinese, Japanese,
+ *      Thai, Lao and Myanmar, transformers.js splits on unicode codepoints and
+ *      NEVER emits a leading space (tokenizers.js, `combineTokensIntoWords`), so
+ *      the naive rule folds EVERY word into the first one and the whole
+ *      transcript collapses to a single token — one cue spanning the entire
+ *      audio, one database row holding everything. Both languages are offered in
+ *      the UI and auto-detect reaches them. So a token that STARTS with a
+ *      no-space-script character opens a new word.
  *   2. Clamp monotonically. The model's words are already ordered and
  *      non-overlapping in practice, but a cue whose start ran backwards would
  *      produce invalid SRT, so do not take that on trust.
+ *   3. Floor each word's duration. DTW does emit `end === start`; see
+ *      MIN_WORD_DURATION.
  */
 export function normalizeWordTokens(words: readonly WordToken[]): WordToken[] {
     const tokens: WordToken[] = [];
 
     for (const word of words) {
-        const continuesPreviousWord = !/^\s/.test(word.text);
+        const continuesPreviousWord =
+            !/^\s/.test(word.text) &&
+            !STARTS_NO_SPACE_SCRIPT_RE.test(word.text);
         const text = word.text.trim();
         if (text.length === 0) continue;
 
         const previous = tokens[tokens.length - 1];
         if (continuesPreviousWord && previous) {
             previous.text += text;
-            previous.end = Math.max(previous.end, word.end);
+            previous.end = Math.max(
+                previous.end,
+                word.end,
+                previous.start + MIN_WORD_DURATION,
+            );
             continue;
         }
 
         const start = previous
             ? Math.max(word.start, previous.end)
             : word.start;
-        tokens.push({ text, start, end: Math.max(word.end, start) });
+        tokens.push({
+            text,
+            start,
+            end: Math.max(word.end, start + MIN_WORD_DURATION),
+        });
     }
 
     return tokens;
@@ -255,14 +405,24 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
         // of speech. Floor the SPAN instead: the words still have to be spoken,
         // so give them a nominal speaking rate's worth of time.
         //
-        // ONLY in that degenerate case. A `Math.max(segmentEnd, start + n *
-        // NOMINAL)` would also fire on any segment whose speaker is simply faster
-        // than 2.9 words/second, stretching it past its own real end — and since
-        // the next segment's start is then clamped forward to that invented end,
-        // the error compounds down the transcript. A segment that ends after it
-        // starts already knows how long it lasted; believe it.
+        // The test is on the resulting DURATION, not merely on `segmentEnd >
+        // start`. A clamp that lands `start` a millisecond before `segmentEnd`
+        // passes "ends after it starts" and still crushes the whole segment into a
+        // 1ms cue — the exact failure this floor exists to prevent. Demand enough
+        // span for the words to exist at all: MIN_WORD_DURATION each.
+        //
+        // But ONLY that. A `Math.max(segmentEnd, start + n * NOMINAL)` would also
+        // fire on any segment whose speaker is simply faster than 2.9 words/second,
+        // stretching it past its own real end — and since the next segment's start
+        // is then clamped forward to that invented end, the error compounds down
+        // the transcript. It would also break the word-granular reload: real words
+        // routinely last less than 0.35s, and `MIN_WORD_DURATION * 1` is precisely
+        // the floor those rows were persisted under, so a one-word row is always
+        // believed and comes back with its own measured time.
+        const minimumUsableSpan =
+            words.length * MIN_WORD_DURATION - TIME_EPSILON;
         const usableEnd =
-            segmentEnd > start
+            segmentEnd - start >= minimumUsableSpan
                 ? segmentEnd
                 : start + words.length * NOMINAL_WORD_DURATION;
         const survivingWeight = totalWeight - strippedWeight;
@@ -286,8 +446,15 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
     return tokens;
 }
 
+/**
+ * Re-join tokens into caption text. NOT `join(" ")`: that prints Chinese as
+ * "光 合 作 用". `joinCaptionTexts` inserts a space only between scripts that use
+ * one, so not folding CJK words (above) does not simply move the damage here.
+ */
 function joinWords(tokens: WordToken[]): string {
-    return cleanCaptionText(tokens.map((t) => t.text).join(" "));
+    return cleanCaptionText(
+        tokens.reduce((text, token) => joinCaptionTexts(text, token.text), ""),
+    );
 }
 
 export function endsSentence(text: string): boolean {
@@ -357,11 +524,18 @@ function round3(value: number): number {
     return Math.round(value * 1000) / 1000;
 }
 
+function mergeCaptionText(
+    left: TranscriptionSegment,
+    right: TranscriptionSegment,
+): string {
+    return cleanCaptionText(joinCaptionTexts(left.text, right.text));
+}
+
 function canMerge(
     left: TranscriptionSegment,
     right: TranscriptionSegment,
 ): boolean {
-    const mergedText = cleanCaptionText(`${left.text} ${right.text}`);
+    const mergedText = mergeCaptionText(left, right);
     return (
         mergedText.replace(/\n/g, " ").length <= MAX_CAPTION_CHARS &&
         right.end - left.start <= SHORT_MERGE_MAX_DURATION
@@ -374,12 +548,8 @@ function mergeShortCaptions(
     const merged: TranscriptionSegment[] = [];
 
     for (const caption of captions) {
-        const words = caption.text
-            .replace(/\n/g, " ")
-            .split(/\s+/)
-            .filter(Boolean);
         const isShort =
-            words.length < MIN_CAPTION_WORDS ||
+            countCaptionWords(caption.text) < MIN_CAPTION_WORDS ||
             caption.end - caption.start < MIN_CAPTION_DURATION;
 
         if (
@@ -391,9 +561,7 @@ function mergeShortCaptions(
             merged.push({
                 start: previous.start,
                 end: caption.end,
-                text: wrapCaptionText(
-                    cleanCaptionText(`${previous.text} ${caption.text}`),
-                ),
+                text: wrapCaptionText(mergeCaptionText(previous, caption)),
             });
             continue;
         }

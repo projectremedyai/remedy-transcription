@@ -243,6 +243,21 @@ impl Store {
         Ok(())
     }
 
+    /// The transcript cache is keyed on `model_id`, so RENAMING a model orphans
+    /// every transcript made under its old id. That happened when the four models
+    /// moved to their `_timestamped` exports, and it is a DELIBERATE choice, not
+    /// an oversight: the old rows hold sentence-granular segments whose word times
+    /// were fabricated by spreading a chunk's span across its words (measured: off
+    /// by up to 1.3s), while the new ids produce real DTW word times. Serving the
+    /// old rows under the new ids would hand back exactly the data this release
+    /// exists to replace, and — for Task 6 — would hand a diarizer word times
+    /// nobody measured.
+    ///
+    /// The orphaned rows are not corrupt: a transcript opened from one of the old
+    /// jobs still renders, via the formatter's no-words path. They are simply
+    /// never used as a cache HIT for a run under the new ids, so the first
+    /// transcription of an already-seen source re-runs the model once. That is the
+    /// price of the upgrade, paid once per source.
     pub fn find_transcript(
         &self,
         source_id: i64,

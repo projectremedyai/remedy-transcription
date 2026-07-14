@@ -2,8 +2,21 @@
 
 import { env, pipeline, WhisperTextStreamer } from "@huggingface/transformers";
 
+import { MODEL_PRESETS } from "../config/transcription";
+
 env.allowRemoteModels = true;
 env.allowLocalModels = false;
+
+/**
+ * The dtype override below is keyed on a model ID. Typing the ID out here made it
+ * a second copy of a fact owned by `config/transcription.ts`, and it drifted
+ * silently the first time the models were renamed — the override simply stopped
+ * applying and large-v3-turbo loaded an fp32 encoder on WebGPU. Read it from the
+ * config instead.
+ */
+const LARGE_TURBO_MODEL_ID = MODEL_PRESETS.find(
+    (preset) => preset.id === "quality",
+)?.modelId;
 
 type WorkerRequest = {
     type: "transcribe";
@@ -44,11 +57,7 @@ class PipelineFactory {
                 options.device = "webgpu";
             }
 
-            if (
-                modelId ===
-                    "onnx-community/whisper-large-v3-turbo_timestamped" &&
-                device === "webgpu"
-            ) {
+            if (modelId === LARGE_TURBO_MODEL_ID && device === "webgpu") {
                 options.dtype = {
                     encoder_model: "fp16",
                     decoder_model_merged: "q4",
@@ -98,8 +107,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
 
         const chunks: Array<{
             text: string;
-            timestamp: [number, number | null];
-            offset: number;
+            timestamp: [number, number];
         }> = [];
 
         let chunkCount = 0;
@@ -120,6 +128,13 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
          * which is the only timing information that exists mid-stream — good
          * enough for a preview, and the "complete" message replaces it wholesale
          * with the model's real per-word times.
+         *
+         * The window's end is provisional but it is NOT null. A null end reaches
+         * `segmentsFromWorkerChunks` on the `update` path with no audio duration
+         * to fall back on, so the whole open window — up to 29 seconds and dozens
+         * of words — collapses into the 2s nominal fallback: speech 25 seconds in
+         * previews as "0:00", then snaps when the window finalises. The window
+         * runs to `offset + chunkLength` by construction; say so.
          */
         const openWindowChunk = () => {
             if (chunks.length > chunkCount) {
@@ -128,8 +143,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             const chunkOffset = (chunkLength - strideLength) * chunkCount;
             chunks.push({
                 text: "",
-                timestamp: [chunkOffset, null],
-                offset: chunkOffset,
+                timestamp: [chunkOffset, chunkOffset + chunkLength],
             });
         };
 
@@ -159,10 +173,6 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
                 });
             },
             on_finalize: () => {
-                const current = chunks[chunks.length - 1];
-                if (current && current.timestamp[1] === null) {
-                    current.timestamp[1] = current.offset + chunkLength;
-                }
                 startedAt = null;
                 tokenCount = 0;
                 chunkCount += 1;
@@ -207,7 +217,11 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             status: "complete",
             data: {
                 text: output.text,
-                chunks: output.chunks,
+                // `output.chunks` ARE the words, so shipping both would send the
+                // same array twice across the worker boundary. `chunks` is only
+                // the FALLBACK, for a model that returned no usable word times;
+                // when there are words, nothing downstream reads it.
+                chunks: words.length > 0 ? [] : output.chunks ?? [],
                 words,
                 tps: tokensPerSecond,
             },

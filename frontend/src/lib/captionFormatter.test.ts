@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
     ConsolidatedSegment,
     WordToken,
+    cleanCaptionText,
     consolidateSegments,
+    normalizeWordTokens,
 } from "./captionFormatter";
 import type { TranscriptionSegment } from "../services/types";
 
@@ -339,6 +341,47 @@ describe("the monotonic clamp must not crush a segment into a sliver", () => {
         const overlaps = cues.slice(1).filter((c, i) => c.start < cues[i].end);
         expect(overlaps).toEqual([]);
     });
+
+    it("floors on the resulting DURATION, not merely on `segmentEnd > start`", () => {
+        // The near-miss the `segmentEnd > start` guard let through. seg2's start is
+        // clamped forward to 30.0 and its end is 30.001 — the guard passes ("it
+        // ends after it starts") and the whole 11-word segment is crushed into a
+        // ONE-MILLISECOND cue, which is the exact failure the span floor exists to
+        // prevent. Only the legacy no-words path can reach this, and that path
+        // serves users' pre-existing transcripts.
+        const cues = consolidateSegments([
+            {
+                start: 20.0,
+                end: 30.0,
+                text: "and that is how the calvin cycle fixes carbon into sugar.",
+            },
+            {
+                start: 25.8,
+                end: 30.001,
+                text: "an entirely different long sentence that the second window transcribed here",
+            },
+        ]);
+
+        const crushed = cues.find((c) => /entirely different/i.test(c.text))!;
+        expect(crushed.end - crushed.start).toBeGreaterThan(3);
+        expect(Math.min(...cues.map((c) => c.end - c.start))).toBeGreaterThan(
+            1.0,
+        );
+    });
+
+    it("still believes a segment whose span is short but genuine (a one-word row)", () => {
+        // The other side of the same guard: word-granular database rows are
+        // routinely far shorter than a nominal word, and inflating THOSE would
+        // break the reload. The floor must fire on 1ms and not on 20ms.
+        const cues = consolidateSegments([
+            { start: 0.0, end: 0.4, text: "photosynthesis" },
+            { start: 0.4, end: 0.42, text: "is" },
+            { start: 0.42, end: 1.1, text: "efficient." },
+        ]);
+        expect(cues).toHaveLength(1);
+        expect(cues[0].start).toBe(0);
+        expect(cues[0].end).toBe(1.1);
+    });
 });
 
 describe("BUG 4: post-dedup cues must not start early", () => {
@@ -474,6 +517,151 @@ describe("real word timestamps replace the fabrication", () => {
                 expect(cues[i].start).toBeGreaterThanOrEqual(cues[i - 1].end);
         }
         expect(cues.at(-1)!.end).toBeLessThanOrEqual(12.83);
+    });
+});
+
+/**
+ * Chinese word tokens as transformers.js actually produces them.
+ *
+ * `combineTokensIntoWords` (tokenizers.js) routes chinese/japanese/thai/lao/
+ * myanmar through `splitTokensOnUnicode`, which splits on codepoints and NEVER
+ * emits a leading space; `mergePunctuations` then appends "。" to the word before
+ * it. So EVERY word here begins with a CJK character and none begins with a
+ * space — the exact input on which "no leading space means this continues the
+ * previous word" folds an entire transcript into one token.
+ */
+const CHINESE_WORDS: WordToken[] = [
+    { text: "光", start: 0.0, end: 0.32 },
+    { text: "合", start: 0.32, end: 0.6 },
+    { text: "作", start: 0.6, end: 0.88 },
+    { text: "用", start: 0.88, end: 1.16 },
+    { text: "是", start: 1.16, end: 1.44 },
+    { text: "植", start: 1.44, end: 1.72 },
+    { text: "物", start: 1.72, end: 2.0 },
+    { text: "把", start: 2.0, end: 2.26 },
+    { text: "光", start: 2.26, end: 2.54 },
+    { text: "能", start: 2.54, end: 2.82 },
+    { text: "转", start: 2.82, end: 3.1 },
+    { text: "化", start: 3.1, end: 3.38 },
+    { text: "为", start: 3.38, end: 3.66 },
+    { text: "化", start: 3.66, end: 3.94 },
+    { text: "学", start: 3.94, end: 4.22 },
+    { text: "能。", start: 4.22, end: 4.6 },
+    { text: "叶", start: 5.8, end: 6.08 },
+    { text: "绿", start: 6.08, end: 6.36 },
+    { text: "素", start: 6.36, end: 6.64 },
+    { text: "吸", start: 6.64, end: 6.92 },
+    { text: "收", start: 6.92, end: 7.2 },
+    { text: "光", start: 7.2, end: 7.48 },
+    { text: "子。", start: 7.48, end: 7.9 },
+];
+
+/** The chunk-level segments the same Chinese audio produced. */
+const CHINESE_SEGMENTS: TranscriptionSegment[] = [
+    { start: 0, end: 4.6, text: "光合作用是植物把光能转化为化学能。" },
+    { start: 5.8, end: 7.9, text: "叶绿素吸收光子。" },
+];
+
+describe("CJK: a script with no spaces must not collapse into one word", () => {
+    it("keeps every Chinese word as its own token", () => {
+        // The bug: `continuesPreviousWord = !/^\s/.test(word.text)` is true for
+        // EVERY Chinese word, so all 23 fold into tokens[0] — one token, one cue
+        // spanning the whole audio, one database row holding the entire transcript.
+        const tokens = normalizeWordTokens(CHINESE_WORDS);
+        expect(tokens).toHaveLength(CHINESE_WORDS.length);
+        expect(tokens[0]).toEqual({ text: "光", start: 0.0, end: 0.32 });
+        expect(tokens.at(-1)).toEqual({ text: "子。", start: 7.48, end: 7.9 });
+    });
+
+    it("joins Chinese words WITHOUT spaces", () => {
+        // Not folding is only half the fix: `joinWords` re-joined with " ", so
+        // simply keeping the tokens apart would print "光 合 作 用".
+        const cues = consolidateSegments(CHINESE_SEGMENTS, CHINESE_WORDS);
+        const text = cues.map((c) => c.text.replace(/\n/g, " ")).join("");
+
+        expect(text).toContain("光合作用是植物把光能转化为化学能。");
+        expect(text).toContain("叶绿素吸收光子。");
+        expect(text).not.toMatch(/光 合/);
+        expect(text).not.toMatch(/\s/);
+    });
+
+    it("cuts more than one cue, on real word times, and honours the 1.2s pause", () => {
+        const cues = consolidateSegments(CHINESE_SEGMENTS, CHINESE_WORDS);
+
+        expect(cues.length).toBeGreaterThan(1);
+        // The first sentence really ends at 4.6 and the next starts at 5.8. A
+        // single folded token would have spanned 0 -> 7.9 and erased the pause.
+        expect(cues[0].end).toBe(4.6);
+        expect(cues[1].start).toBe(5.8);
+        expect(cues.at(-1)!.end).toBe(7.9);
+    });
+
+    it("still folds an English continuation fragment (the CJK rule did not break it)", () => {
+        expect(
+            normalizeWordTokens([
+                { text: " Word", start: 0, end: 0.2 },
+                { text: "-level", start: 0.2, end: 0.6 },
+            ]),
+        ).toEqual([{ text: "Word-level", start: 0, end: 0.6 }]);
+    });
+});
+
+describe("a word-granular transcript round-trips through the database exactly", () => {
+    // The database stores ONE WORD PER ROW and the reload re-derives the word
+    // list by splitting each row's CLEANED text on spaces. Anything that inserts
+    // a space inside a persisted word turns one token into two on reload — and
+    // "3." satisfies endsSentence(), so a cue can even break in the middle of a
+    // number on reload but not live.
+
+    it("does not split a number or an abbreviation", () => {
+        expect(cleanCaptionText("3.14")).toBe("3.14");
+        expect(cleanCaptionText("1,000")).toBe("1,000");
+        expect(cleanCaptionText("3:30")).toBe("3:30");
+        expect(cleanCaptionText("U.S.A.")).toBe("U.S.A.");
+        // ...while still fixing the thing the rule exists for.
+        expect(cleanCaptionText("Hello,world")).toBe("Hello, world");
+        expect(cleanCaptionText("One sentence.Then another")).toBe(
+            "One sentence. Then another",
+        );
+    });
+
+    it("renders identically live and on reload, for words containing 3.14 and 1,000", () => {
+        const words: WordToken[] = [
+            { text: " Pi", start: 0.0, end: 0.3 },
+            { text: " is", start: 0.3, end: 0.5 },
+            { text: " roughly", start: 0.5, end: 0.98 },
+            { text: " 3.14", start: 0.98, end: 1.7 },
+            { text: " and", start: 1.7, end: 1.9 },
+            { text: " a", start: 1.9, end: 2.0 },
+            { text: " kilometre", start: 2.0, end: 2.7 },
+            { text: " is", start: 2.7, end: 2.9 },
+            // A ZERO-DURATION word: DTW quantises to 0.02s and does emit these.
+            { text: " 1,000", start: 2.9, end: 2.9 },
+            { text: " metres.", start: 3.2, end: 3.9 },
+        ];
+
+        const live = consolidateSegments([], words);
+        const persisted = normalizeWordTokens(words).map((word) => ({
+            start: word.start,
+            end: word.end,
+            text: word.text,
+        }));
+        const reloaded = consolidateSegments(persisted);
+
+        expect(reloaded).toEqual(live);
+
+        // The numbers survived as single words on both paths.
+        const text = live.map((c) => c.text.replace(/\n/g, " ")).join(" ");
+        expect(text).toContain("3.14");
+        expect(text).toContain("1,000");
+        expect(text).not.toContain("3. 14");
+        expect(text).not.toContain("1, 000");
+
+        // And the zero-duration word was floored on the way in, so the reload
+        // cannot inflate it to the next word's start and swallow the 0.3s pause.
+        const zeroDuration = persisted.find((s) => s.text === "1,000")!;
+        expect(zeroDuration.end).toBeGreaterThan(zeroDuration.start);
+        expect(zeroDuration.end).toBeLessThan(3.2);
     });
 });
 

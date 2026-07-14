@@ -22,14 +22,34 @@ const findCue = (cues: TranscriptionSegment[], re: RegExp) =>
  *     `size > 2` dedup loop.
  */
 const WHISPER_WINDOW_SEGMENTS: TranscriptionSegment[] = [
-    { start: 0.0, end: 2.46, text: "Welcome to the lecture on photosynthesis." },
-    { start: 2.81, end: 6.11, text: "Today we will cover the light dependent reactions." },
+    {
+        start: 0.0,
+        end: 2.46,
+        text: "Welcome to the lecture on photosynthesis.",
+    },
+    {
+        start: 2.81,
+        end: 6.11,
+        text: "Today we will cover the light dependent reactions.",
+    },
     // 4-word overlap with seg1
-    { start: 4.16, end: 8.6, text: "the light dependent reactions. I want you to think about energy." },
+    {
+        start: 4.16,
+        end: 8.6,
+        text: "the light dependent reactions. I want you to think about energy.",
+    },
     // 2-word overlap with seg2 — NOT stripped (dedup loop stops at size > 2)
-    { start: 7.45, end: 11.55, text: "about energy. Chlorophyll absorbs photons." },
+    {
+        start: 7.45,
+        end: 11.55,
+        text: "about energy. Chlorophyll absorbs photons.",
+    },
     // 1-word overlap with seg3 — NOT stripped
-    { start: 10.6, end: 15.54, text: "photons. That energy is then converted into chemical bonds." },
+    {
+        start: 10.6,
+        end: 15.54,
+        text: "photons. That energy is then converted into chemical bonds.",
+    },
     // 8-word overlap with seg4
     {
         start: 11.9,
@@ -51,26 +71,61 @@ describe("BUG 1: chunk-boundary overlap dedup", () => {
 
     it("removes a 1-word overlap", () => {
         const segs: TranscriptionSegment[] = [
-            { start: 0, end: 4, text: "one two three four five six seven hotel" },
-            { start: 3.5, end: 8, text: "hotel nine ten eleven twelve thirteen fourteen" },
+            {
+                start: 0,
+                end: 4,
+                text: "one two three four five six seven hotel",
+            },
+            {
+                start: 3.5,
+                end: 8,
+                text: "hotel nine ten eleven twelve thirteen fourteen",
+            },
         ];
-        expect(flat(consolidateSegments(segs)).toLowerCase().match(/hotel/g)?.length).toBe(1);
+        expect(
+            flat(consolidateSegments(segs)).toLowerCase().match(/hotel/g)
+                ?.length,
+        ).toBe(1);
     });
 
     it("removes a 2-word overlap", () => {
         const segs: TranscriptionSegment[] = [
-            { start: 0, end: 4, text: "one two three four five six seven golf hotel" },
-            { start: 3.5, end: 8, text: "golf hotel nine ten eleven twelve thirteen fourteen" },
+            {
+                start: 0,
+                end: 4,
+                text: "one two three four five six seven golf hotel",
+            },
+            {
+                start: 3.5,
+                end: 8,
+                text: "golf hotel nine ten eleven twelve thirteen fourteen",
+            },
         ];
-        expect(flat(consolidateSegments(segs)).toLowerCase().match(/golf hotel/g)?.length).toBe(1);
+        expect(
+            flat(consolidateSegments(segs))
+                .toLowerCase()
+                .match(/golf hotel/g)?.length,
+        ).toBe(1);
     });
 
     it("still removes a 3-word overlap (regression — this already worked)", () => {
         const segs: TranscriptionSegment[] = [
-            { start: 0, end: 4, text: "one two three four five six foxtrot golf hotel" },
-            { start: 3.5, end: 8, text: "foxtrot golf hotel nine ten eleven twelve thirteen" },
+            {
+                start: 0,
+                end: 4,
+                text: "one two three four five six foxtrot golf hotel",
+            },
+            {
+                start: 3.5,
+                end: 8,
+                text: "foxtrot golf hotel nine ten eleven twelve thirteen",
+            },
         ];
-        expect(flat(consolidateSegments(segs)).toLowerCase().match(/foxtrot golf hotel/g)?.length).toBe(1);
+        expect(
+            flat(consolidateSegments(segs))
+                .toLowerCase()
+                .match(/foxtrot golf hotel/g)?.length,
+        ).toBe(1);
     });
 
     it("does NOT strip a legitimate repeated word that is not a boundary artifact", () => {
@@ -80,7 +135,11 @@ describe("BUG 1: chunk-boundary overlap dedup", () => {
             { start: 0, end: 4, text: "and I said no" },
             { start: 4, end: 8, text: "no no I really meant it" },
         ];
-        expect(flat(consolidateSegments(segs)).toLowerCase().match(/\bno\b/g)?.length).toBe(3);
+        expect(
+            flat(consolidateSegments(segs))
+                .toLowerCase()
+                .match(/\bno\b/g)?.length,
+        ).toBe(3);
     });
 
     it("never emits cues that overlap in time", () => {
@@ -126,14 +185,24 @@ describe("BUG 3: the final chunk must not be swallowed", () => {
         expect(cue).toBeDefined();
         // Currently 15.425 — mergeShortCaptions treats the 0.01s cue as "short" and
         // absorbs it into "So a plant is really a solar powered factory."
-        expect(cue!.start).toBeGreaterThanOrEqual(ZERO_DURATION_FINAL.start - 0.5);
+        expect(cue!.start).toBeGreaterThanOrEqual(
+            ZERO_DURATION_FINAL.start - 0.5,
+        );
         expect(cue!.text.replace(/\n/g, " ")).not.toMatch(/factory/i);
     });
 
     it("gives the final cue a non-zero duration", () => {
         const segs: TranscriptionSegment[] = [
-            { start: 0.0, end: 15.4, text: "a long opening statement that fills a cue nicely" },
-            { start: 19.74, end: 19.74, text: "any questions before we move on?" },
+            {
+                start: 0.0,
+                end: 15.4,
+                text: "a long opening statement that fills a cue nicely",
+            },
+            {
+                start: 19.74,
+                end: 19.74,
+                text: "any questions before we move on?",
+            },
         ];
         const last = consolidateSegments(segs).at(-1)!;
         expect(last.end - last.start).toBeGreaterThan(0.5);
@@ -160,6 +229,8 @@ describe("BUG 4: post-dedup cues must not start early", () => {
         const overlappedSegment = WHISPER_WINDOW_SEGMENTS[1]; // ends 6.11
         const postOverlapCue = findCue(cues, /want you to think/i);
         expect(postOverlapCue).toBeDefined();
-        expect(postOverlapCue!.start).toBeGreaterThanOrEqual(overlappedSegment.end);
+        expect(postOverlapCue!.start).toBeGreaterThanOrEqual(
+            overlappedSegment.end,
+        );
     });
 });

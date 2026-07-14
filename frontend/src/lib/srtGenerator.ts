@@ -6,7 +6,9 @@ function formatTimestamp(seconds: number, separator: "," | "." = ","): string {
     const minutes = Math.floor((seconds % 3600) / 60);
     const secs = Math.floor(seconds % 60);
     const millis = Math.floor((seconds % 1) * 1000);
-    return `${pad2(hours)}:${pad2(minutes)}:${pad2(secs)}${separator}${pad3(millis)}`;
+    return `${pad2(hours)}:${pad2(minutes)}:${pad2(secs)}${separator}${pad3(
+        millis,
+    )}`;
 }
 
 function pad2(value: number): string {

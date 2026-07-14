@@ -7,6 +7,7 @@ const SHORT_MERGE_MAX_DURATION = 8.0;
 const MIN_CAPTION_DURATION = 1.2;
 const MIN_CAPTION_WORDS = 3;
 const MAX_OVERLAP_WORDS = 16;
+const NOMINAL_WORD_DURATION = 0.35;
 
 const WHITESPACE_RE = /\s+/g;
 const SPACE_BEFORE_PUNCT_RE = /\s+([,.;:!?])/g;
@@ -39,7 +40,11 @@ function splitWords(text: string): string[] {
         .filter((word) => word.length > 0);
 }
 
-function overlapPrefixSize(previous: string[], current: string[]): number {
+function overlapPrefixSize(
+    previous: string[],
+    current: string[],
+    minOverlapSize: number,
+): number {
     const prevNorm = previous.map(normalizeWord).filter((w) => w.length > 0);
     const currNorm = current.map(normalizeWord).filter((w) => w.length > 0);
     const maxOverlap = Math.min(
@@ -48,7 +53,7 @@ function overlapPrefixSize(previous: string[], current: string[]): number {
         currNorm.length,
     );
 
-    for (let size = maxOverlap; size > 2; size--) {
+    for (let size = maxOverlap; size >= minOverlapSize; size--) {
         const prevTail = prevNorm.slice(prevNorm.length - size);
         const currHead = currNorm.slice(0, size);
         if (arraysEqual(prevTail, currHead)) {
@@ -66,33 +71,103 @@ function arraysEqual(a: string[], b: string[]): boolean {
     return true;
 }
 
+function charWeight(word: string): number {
+    return Math.max(word.length, 1);
+}
+
+function charWeightOf(words: string[]): number {
+    return words.reduce((sum, word) => sum + charWeight(word), 0);
+}
+
+/**
+ * A segment whose end is not after its start carries no usable duration. That
+ * happens for Whisper's final chunk, whose end timestamp is null and gets
+ * persisted as `end := start`. Left at zero, mergeShortCaptions treats the cue
+ * as a runt and glues it onto the previous one, so the last sentence of the
+ * transcript is displayed seconds early on top of earlier speech. Fall back to
+ * the next segment's start, then to a nominal speaking rate.
+ */
+function effectiveEnd(
+    segments: TranscriptionSegment[],
+    index: number,
+    wordCount: number,
+): number {
+    const segment = segments[index];
+    if (segment.end > segment.start) {
+        return segment.end;
+    }
+
+    const next = segments[index + 1];
+    if (next && next.start > segment.start) {
+        return next.start;
+    }
+
+    return (
+        segment.start +
+        Math.max(wordCount * NOMINAL_WORD_DURATION, MIN_CAPTION_DURATION)
+    );
+}
+
 function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
     const tokens: WordToken[] = [];
     let emittedWords: string[] = [];
+    let previousEnd: number | null = null;
 
-    for (const segment of segments) {
-        let words = splitWords(segment.text);
-        if (words.length === 0) continue;
+    for (let index = 0; index < segments.length; index++) {
+        const segment = segments[index];
+        const allWords = splitWords(segment.text);
+        if (allWords.length === 0) continue;
 
-        const overlap = overlapPrefixSize(emittedWords, words);
-        const duration = Math.max(segment.end - segment.start, 0.01);
-        const start = segment.start + (duration * overlap) / words.length;
-        words = words.slice(overlap);
-        if (words.length === 0) continue;
+        const segmentEnd = effectiveEnd(segments, index, allWords.length);
+        const duration = Math.max(segmentEnd - segment.start, 0.01);
 
-        const totalWeight = words.reduce(
-            (sum, word) => sum + Math.max(word.length, 1),
-            0,
+        // A 1- or 2-word repeat is only a sliding-window artifact if the two
+        // segments actually overlap in time. Real speech ("no, no, no") repeats
+        // words in chunks that are sequential, not overlapping — stripping those
+        // would delete words the speaker said. Whisper's chunk timestamps are
+        // real (only the *word* times are synthesized), so this test is
+        // trustworthy.
+        const chunksOverlapInTime =
+            previousEnd !== null && segment.start < previousEnd;
+        const minOverlapSize = chunksOverlapInTime ? 1 : 3;
+        const overlap = overlapPrefixSize(
+            emittedWords,
+            allWords,
+            minOverlapSize,
         );
+        previousEnd =
+            previousEnd === null
+                ? segmentEnd
+                : Math.max(previousEnd, segmentEnd);
+
+        // Weight the stripped overlap by characters, not word count — the
+        // tokenizer distributes time by character length everywhere else, and
+        // mixing the two metrics makes every post-dedup cue start early.
+        const totalWeight = charWeightOf(allWords);
+        const strippedWeight = charWeightOf(allWords.slice(0, overlap));
+        const offsetStart =
+            segment.start +
+            (totalWeight > 0 ? (duration * strippedWeight) / totalWeight : 0);
+
+        const words = allWords.slice(overlap);
+        if (words.length === 0) continue;
+
+        // Overlapping chunks time the SAME duplicated words differently, so the
+        // offset can still land before the duplicate finished according to the
+        // chunk that actually emitted it. Word times must be monotonic: never
+        // re-open inside a span already emitted, or the cues collide.
+        const lastEmittedEnd = tokens[tokens.length - 1]?.end ?? offsetStart;
+        const start = Math.max(offsetStart, lastEmittedEnd);
+
+        const survivingWeight = totalWeight - strippedWeight;
+        const usableDuration = Math.max(segmentEnd - start, 0.01);
         let elapsed = 0;
-        const remaining = words.length;
-        const denom = remaining + overlap;
 
         for (const word of words) {
-            const weight = Math.max(word.length, 1) / totalWeight;
-            const wordStart = start + elapsed * duration * (remaining / denom);
+            const weight = charWeight(word) / survivingWeight;
+            const wordStart = start + elapsed * usableDuration;
             elapsed += weight;
-            const wordEnd = start + elapsed * duration * (remaining / denom);
+            const wordEnd = start + elapsed * usableDuration;
             tokens.push({ text: word, start: wordStart, end: wordEnd });
         }
 

@@ -16,8 +16,8 @@ function chunksToSegments(
     if (!chunks) return [];
     return chunks
         .map((chunk) => ({
-            start: chunk.timestamp[0],
-            end: chunk.timestamp[1] ?? chunk.timestamp[0] + 5,
+            start: chunk.start,
+            end: chunk.end,
             text: chunk.text.trim(),
         }))
         .filter((s) => s.text.length > 0);
@@ -72,7 +72,7 @@ export default function Transcript({ transcribedData, jobId }: Props) {
                             className='w-full flex flex-row mb-2 bg-white rounded-lg p-4 shadow-xl shadow-black/5 ring-1 ring-slate-700/10'
                         >
                             <div className='mr-5 text-slate-500 font-mono text-sm'>
-                                {formatAudioTimestamp(chunk.timestamp[0])}
+                                {formatAudioTimestamp(chunk.start)}
                             </div>
                             <div className='flex-1'>{chunk.text}</div>
                         </div>

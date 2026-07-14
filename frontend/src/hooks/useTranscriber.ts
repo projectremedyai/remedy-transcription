@@ -11,7 +11,7 @@ import {
 } from "../config/transcription";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
-import { consolidateChunks } from "../utils/captionFormatter";
+import { consolidateSegments } from "../lib/captionFormatter";
 import {
     api,
     Job,
@@ -59,7 +59,7 @@ interface WorkerProgressMessage {
 export interface TranscriberData {
     isBusy: boolean;
     text: string;
-    chunks: WorkerChunk[];
+    chunks: TranscriptionSegment[];
     filename?: string;
     persisted: boolean;
     modelLabel?: string;
@@ -101,14 +101,28 @@ type PendingWorker = {
     reject: (reason?: unknown) => void;
     filename?: string;
     modelLabel?: string;
+    audioDuration: number;
 };
 
-function convertSegments(
-    segments: TranscriptionSegment[],
-): { text: string; timestamp: [number, number | null] }[] {
-    return segments.map((segment) => ({
-        text: segment.text,
-        timestamp: [segment.start, segment.end] as [number, number | null],
+/**
+ * Whisper leaves the final chunk's end timestamp null. Persisting or rendering
+ * it as `end := start` gives the segment zero duration, which the formatter then
+ * treats as a runt and glues onto the previous cue — silently dropping the last
+ * seconds of every transcript. Fall back to the next chunk's start, then to the
+ * true audio duration, and only then to a guess.
+ */
+function segmentsFromWorkerChunks(
+    chunks: WorkerChunk[],
+    audioDuration: number | null,
+): TranscriptionSegment[] {
+    return chunks.map((chunk, index) => ({
+        start: chunk.timestamp[0],
+        end:
+            chunk.timestamp[1] ??
+            chunks[index + 1]?.timestamp[0] ??
+            audioDuration ??
+            chunk.timestamp[0] + 2,
+        text: chunk.text,
     }));
 }
 
@@ -118,9 +132,12 @@ function wordCount(text: string): number {
 
 function consolidateWorkerTranscript(
     workerTranscript: WorkerTranscript,
+    audioDuration: number | null,
     options: { hideTrailingShortCaption?: boolean } = {},
-): WorkerTranscript {
-    const chunks = consolidateChunks(workerTranscript.chunks);
+): { text: string; chunks: TranscriptionSegment[] } {
+    const chunks = consolidateSegments(
+        segmentsFromWorkerChunks(workerTranscript.chunks, audioDuration),
+    );
     const displayChunks =
         options.hideTrailingShortCaption &&
         chunks.length > 0 &&
@@ -227,11 +244,14 @@ export function useTranscriber(): Transcriber {
                 break;
             case "update": {
                 const updateMessage = message as WorkerUpdateData;
+                // Mid-stream the trailing chunk is still open, so its real end is
+                // unknown — do NOT stretch it to the audio duration here.
                 const displayTranscript = consolidateWorkerTranscript(
                     {
                         text: updateMessage.data.text,
                         chunks: updateMessage.data.chunks,
                     },
+                    null,
                     { hideTrailingShortCaption: true },
                 );
                 setTranscript({
@@ -250,8 +270,10 @@ export function useTranscriber(): Transcriber {
                     text: updateMessage.data.text,
                     chunks: updateMessage.data.chunks,
                 };
-                const displayTranscript =
-                    consolidateWorkerTranscript(nextTranscript);
+                const displayTranscript = consolidateWorkerTranscript(
+                    nextTranscript,
+                    pendingWorkerRef.current?.audioDuration ?? null,
+                );
                 setTranscript({
                     isBusy: true,
                     text: displayTranscript.text,
@@ -355,7 +377,11 @@ export function useTranscriber(): Transcriber {
         setTranscript({
             isBusy: false,
             text: job.full_text || "",
-            chunks: convertSegments(job.segments),
+            // The database stores RAW model segments as the source of truth, so a
+            // formatter improvement retroactively improves old transcripts. They
+            // must be consolidated on read, or the transcript at rest is one that
+            // never went through the formatter.
+            chunks: consolidateSegments(job.segments),
             filename: job.filename || undefined,
             persisted: true,
             modelLabel,
@@ -436,6 +462,7 @@ export function useTranscriber(): Transcriber {
                     reject,
                     filename,
                     modelLabel: config.presetLabel,
+                    audioDuration: audioBuffer.duration,
                 };
                 setStatus("transcribing");
                 setIsBusy(true);
@@ -459,6 +486,7 @@ export function useTranscriber(): Transcriber {
             job: Job,
             config: ResolvedModelConfig,
             workerTranscript: WorkerTranscript,
+            audioDuration: number,
         ) => {
             setStatus("persisting");
             setIsBusy(true);
@@ -467,11 +495,10 @@ export function useTranscriber(): Transcriber {
                 task: config.task,
                 language: config.language,
                 full_text: workerTranscript.text,
-                segments: workerTranscript.chunks.map((chunk) => ({
-                    start: chunk.timestamp[0],
-                    end: chunk.timestamp[1] ?? chunk.timestamp[0],
-                    text: chunk.text,
-                })),
+                segments: segmentsFromWorkerChunks(
+                    workerTranscript.chunks,
+                    audioDuration,
+                ),
             };
 
             const persistedJob = await api.persistTranscript(job.id, payload);
@@ -533,7 +560,12 @@ export function useTranscriber(): Transcriber {
                     config,
                     file.name,
                 );
-                await persistWorkerTranscript(job, config, workerTranscript);
+                await persistWorkerTranscript(
+                    job,
+                    config,
+                    workerTranscript,
+                    audioBuffer.duration,
+                );
             } catch (nextError) {
                 setTranscript((previous) =>
                     previous ? { ...previous, isBusy: false } : previous,
@@ -628,6 +660,7 @@ export function useTranscriber(): Transcriber {
                     readyJob,
                     config,
                     workerTranscript,
+                    audioBuffer.duration,
                 );
             } catch (nextError) {
                 setTranscript((previous) =>

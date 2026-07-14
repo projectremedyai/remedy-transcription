@@ -273,17 +273,34 @@ impl Store {
     /// and likewise for whisper-base, whisper-large-v3-turbo and distil-small.en).
     /// Every transcript a user had already made became unreachable.
     ///
-    /// So the lookup accepts the LEGACY id too, via `model_id_lookup_aliases`. The
-    /// rows are not corrupt, merely coarser: they hold sentence-granular segments
-    /// with no word timings, and the formatter's no-words path
-    /// (`consolidateSegments` with `words` absent -> `tokensFromSegments`) renders
-    /// them correctly — that is the whole reason serving them is safe. What a user
-    /// gets back from an old row is the transcript they already had; what they
-    /// avoid is re-running the model on every source they have ever transcribed.
+    /// So the lookup accepts the LEGACY id too, via `model_id_alias`. This was a
+    /// deliberate trade: users keep every transcript they already made rather than
+    /// losing them to the rename, and they avoid re-running the model on every
+    /// source they have ever transcribed.
     ///
-    /// An exact match wins over an alias match (`ORDER BY`), so once a source is
-    /// re-transcribed under the new id, the new row — with real DTW word times —
-    /// is the one served.
+    /// The cost is permanent, not transitional. A legacy row holds
+    /// sentence-granular segments with FABRICATED word times — character-length
+    /// interpolation, not real DTW output — and there is no path in this app that
+    /// can ever replace it with a `_timestamped` row for the same source: both
+    /// `create_file_job` and `create_youtube_job` call `find_transcript` first and
+    /// skip transcription entirely on a hit, and `create_job_from_cache` (the only
+    /// thing they do on that hit) inserts a JOB row only — it never writes to
+    /// `transcripts`. There is no re-transcribe, force, or cache-bypass path in the
+    /// UI. So for any source that already has a legacy row, the exact
+    /// `_timestamped` row that would out-rank it can never be created; the legacy
+    /// row is a permanent hit, forever serving sentence-granular segments and
+    /// fabricated word times for that source. The `ORDER BY (model_id = ?2) DESC`
+    /// below — exact match wins over alias match — is correct in principle and
+    /// costs nothing to keep, but as things stand today it has no legacy row left
+    /// to lose to: nothing supersedes one once it exists.
+    ///
+    /// Consequence for callers: NEVER assume `job.segments` is word-granular just
+    /// because a job came back from the cache. A legacy row's segments carry
+    /// fabricated, character-length-interpolated word times, not measured ones.
+    /// Speaker diarization in particular must fall back to segment-level speaker
+    /// alignment for a legacy transcript — aligning speaker turns against
+    /// fabricated word times is exactly the failure mode the word-timestamp work
+    /// existed to prevent.
     pub fn find_transcript(
         &self,
         source_id: i64,

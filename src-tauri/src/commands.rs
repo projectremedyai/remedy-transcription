@@ -28,6 +28,33 @@ const TRANSCRIPTION_CONFIG_TS: &str = include_str!("../../frontend/src/config/tr
 static MODEL_ID_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"modelId:\s*"([^"]+)""#).expect("valid regex"));
 
+/// The body of the frontend's `MODEL_PRESETS` array, located WITHOUT
+/// `MODEL_ID_RE` — so the regex's match count can be checked against an
+/// independent count instead of trusting whatever it happens to match.
+///
+/// Shared by `REQUIRED_MODEL_IDS` below (a partial regex miss must fail loudly
+/// at runtime, not only under `cargo test`) and by the guard test in `mod
+/// tests`, which is exactly where this locator originated.
+fn model_presets_block() -> &'static str {
+    let start = TRANSCRIPTION_CONFIG_TS
+        .find("export const MODEL_PRESETS")
+        .expect(
+            "frontend/src/config/transcription.ts no longer exports MODEL_PRESETS — \
+             TRANSCRIPTION_CONFIG_TS is pointing at the wrong file",
+        );
+    let rest = &TRANSCRIPTION_CONFIG_TS[start..];
+    // `\n]` and not `\n];`: the array closes with
+    // `] as const satisfies readonly ModelPreset[];` — the `as const` is what
+    // derives `ModelPresetId` from the array, so a deleted preset is a compile
+    // error at every site that names it. A locator pinned to `];` silently ran
+    // PAST the array into the rest of the file and counted the `"__auto__"`
+    // comparisons in `modelIdForPreset` as if they were presets.
+    let end = rest
+        .find("\n]")
+        .expect("MODEL_PRESETS array is not terminated by a closing bracket");
+    &rest[..end]
+}
+
 /// Every model the frontend can actually resolve, derived from the single source
 /// of truth above. `"__auto__"` is a sentinel the frontend resolves to one of the
 /// real presets, not a model.
@@ -40,20 +67,45 @@ static REQUIRED_MODEL_IDS: Lazy<Vec<String>> = Lazy::new(|| {
 
     // Fail LOUDLY, in the running app and not only under `cargo test`.
     //
-    // A parse miss yields a short or empty Vec, `list_models` answers with fewer
-    // models than the frontend offers, and the frontend — which gates the
-    // Transcribe button on an exact id match against that answer — goes dead with
-    // no error anywhere. That is the exact bug this derivation exists to prevent,
-    // and leaving it to a test means it comes back silently for anyone who builds
-    // without running the suite. A panic here is a crash on startup with a message
-    // that names the cause; a dead button is a bug report six weeks later.
+    // A TOTAL parse miss yields an empty Vec, but a PARTIAL miss is just as
+    // dangerous and easy to overlook: if someone switches one preset to single
+    // quotes, `MODEL_ID_RE` matches the other three, `ids` is non-empty, and
+    // `list_models` quietly answers with three models instead of four — the
+    // fourth preset's Transcribe button goes dead with no error anywhere. That
+    // is the exact bug this derivation exists to prevent, just narrower than an
+    // empty-list check catches.
+    //
+    // So compare the regex's match count against an independent, regex-free
+    // count of the presets declared in the same `include_str!`'d source
+    // (`model_presets_block()`, shared with the guard test below) rather than
+    // merely checking the regex matched *something*. Leaving this to a test
+    // means it comes back silently for anyone who builds without running the
+    // suite. A panic here is a crash on the first `list_models` call with a
+    // message that names the cause; a dead button is a bug report six weeks
+    // later.
+    let block = model_presets_block();
+    let declared = block.matches("modelId:").count();
+
     assert!(
-        !ids.is_empty(),
-        "MODEL_ID_RE matched no models in frontend/src/config/transcription.ts. \
-         list_models would answer with an EMPTY list and the frontend would disable \
-         every entry point to transcription with no error. The config's format has \
-         changed (quoting? a rename? moved file?) — fix MODEL_ID_RE. Do NOT retype \
-         the model list here: that is how it drifted last time."
+        declared > 1,
+        "no model presets found in frontend/src/config/transcription.ts's \
+         MODEL_PRESETS block — model_presets_block() is looking at the wrong thing."
+    );
+
+    assert_eq!(
+        ids.len(),
+        declared - 1, // one `modelId:` belongs to the `__auto__` sentinel, not a real model
+        "MODEL_ID_RE parsed {} model id(s) but frontend/src/config/transcription.ts's \
+         MODEL_PRESETS block declares {} `modelId:` entries (one of which is the \
+         `__auto__` sentinel) — a PARTIAL parse miss. list_models must offer EXACTLY \
+         the ids the frontend can select — the frontend gates the Transcribe button on \
+         an exact id match against this answer — so any preset MODEL_ID_RE missed gets \
+         a dead Transcribe button with no error anywhere. The config's format has \
+         changed (quoting? a rename? moved file?) — fix MODEL_ID_RE. Do NOT retype the \
+         model list here: that is how it drifted last time. parsed: {:?}",
+        ids.len(),
+        declared,
+        ids
     );
 
     ids
@@ -762,29 +814,6 @@ pub async fn export_transcript(request: ExportRequest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The body of the frontend's `MODEL_PRESETS` array, located WITHOUT the
-    /// regex the production code uses — so it can count the presets independently
-    /// of whether that regex still matches anything.
-    fn model_presets_block() -> &'static str {
-        let start = TRANSCRIPTION_CONFIG_TS
-            .find("export const MODEL_PRESETS")
-            .expect(
-                "frontend/src/config/transcription.ts no longer exports MODEL_PRESETS — \
-                 TRANSCRIPTION_CONFIG_TS is pointing at the wrong file",
-            );
-        let rest = &TRANSCRIPTION_CONFIG_TS[start..];
-        // `\n]` and not `\n];`: the array closes with
-        // `] as const satisfies readonly ModelPreset[];` — the `as const` is what
-        // derives `ModelPresetId` from the array, so a deleted preset is a compile
-        // error at every site that names it. A locator pinned to `];` silently ran
-        // PAST the array into the rest of the file and counted the `"__auto__"`
-        // comparisons in `modelIdForPreset` as if they were presets.
-        let end = rest
-            .find("\n]")
-            .expect("MODEL_PRESETS array is not terminated by a closing bracket");
-        &rest[..end]
-    }
 
     /// The guard on the bug that killed the whole app.
     ///

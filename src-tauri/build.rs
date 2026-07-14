@@ -50,6 +50,20 @@ fn ensure_diarization_models_dir() {
         );
     }
 
+    // `tauri_build::copy_resources` only emits `cargo:rerun-if-changed=<path>` for
+    // resources it actually finds (tauri-build's `lib.rs`, around line 93). An
+    // EMPTY directory resolves to zero resources, so it emits ZERO
+    // rerun-if-changed entries anywhere under `models/`. That leaves Cargo with no
+    // dependency edge from this build script to the models directory: dropping the
+    // real models in later (e.g. via `fetch-sidecars.sh --models-only`, which is
+    // exactly what the warning below tells you to run) does not invalidate the
+    // build script's cached output, so `cargo check` stays green with the stale
+    // "models are missing" warning even after the models are on disk. Watching the
+    // directory ourselves closes that gap: Cargo scans a directory path given to
+    // `rerun-if-changed` recursively, and the directory is guaranteed to exist by
+    // this point because of `create_dir_all` above.
+    println!("cargo:rerun-if-changed=../models/diarization");
+
     let missing: Vec<&str> = MODELS
         .iter()
         .copied()
@@ -62,6 +76,74 @@ fn ensure_diarization_models_dir() {
              runs, but diarization will report itself DEGRADED and produce no speaker labels. \
              Fix with: ./scripts/fetch-sidecars.sh --models-only",
             missing.join(", ")
+        );
+    }
+
+    warn_on_unexpected_entries(&dir);
+}
+
+/// The bundle manifest is a directory resource, not a file map: whatever is
+/// physically present under `models/diarization` ships in the signed `.app`,
+/// unpruned, with nothing to notice if it's more than the two files above. A
+/// checkout populated by an older `fetch-sidecars.sh` (before it pruned the
+/// segmentation tarball's extras) would silently bundle the unused 1.5 MB int8
+/// model, a README, and the tarball's Python scripts. Warn once per unexpected
+/// entry so that drifts from the known set are visible in the build log instead
+/// of only in the shipped bundle's size.
+fn warn_on_unexpected_entries(dir: &Path) {
+    // Known-good relative paths: the two models themselves, plus their
+    // directory prefixes (a directory is "expected" if something under it is),
+    // plus the segmentation model's LICENSE file that `fetch-sidecars.sh`
+    // deliberately keeps alongside it.
+    let mut known: Vec<PathBuf> = vec![PathBuf::from(
+        "sherpa-onnx-pyannote-segmentation-3-0/LICENSE",
+    )];
+    for model in MODELS {
+        let path = PathBuf::from(model);
+        for ancestor in path.ancestors() {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            if !known.contains(&ancestor.to_path_buf()) {
+                known.push(ancestor.to_path_buf());
+            }
+        }
+    }
+
+    fn walk(base: &Path, current: &Path, known: &[PathBuf], unexpected: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            if known.contains(&rel.to_path_buf()) {
+                if path.is_dir() {
+                    walk(base, &path, known, unexpected);
+                }
+                continue;
+            }
+            unexpected.push(rel.to_path_buf());
+        }
+    }
+
+    let mut unexpected = Vec::new();
+    walk(dir, dir, &known, &mut unexpected);
+
+    if !unexpected.is_empty() {
+        let mut names: Vec<String> = unexpected
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        names.sort();
+        println!(
+            "cargo:warning=models/diarization contains entries outside the known set ({}). \
+             These will be bundled into the signed .app as-is (a directory resource ships \
+             whatever is present). Likely an older/unpruned fetch-sidecars.sh checkout -- \
+             re-run ./scripts/fetch-sidecars.sh --models-only to prune it.",
+            names.join(", ")
         );
     }
 }

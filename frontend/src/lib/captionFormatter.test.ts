@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { ConsolidatedSegment, consolidateSegments } from "./captionFormatter";
+import {
+    ConsolidatedSegment,
+    WordToken,
+    consolidateSegments,
+} from "./captionFormatter";
 import type { TranscriptionSegment } from "../services/types";
 
 const flat = (segs: TranscriptionSegment[]) =>
@@ -360,5 +364,143 @@ describe("BUG 4: post-dedup cues must not start early", () => {
         expect(postOverlapCue!.start).toBeGreaterThanOrEqual(
             overlappedSegment.end,
         );
+    });
+});
+
+/**
+ * The model's REAL word timings, from `onnx-community/whisper-tiny_timestamped`
+ * with `return_timestamps: 'word'` on a 12.82s clip (two sentences, 1.2s pause).
+ * Verbatim `output.chunks` — note the leading spaces Whisper uses to mark word
+ * boundaries, and "-level" / "-attention" arriving WITHOUT one because they
+ * continue the previous word.
+ */
+const REAL_WORDS: WordToken[] = [
+    { text: " The", start: 0.0, end: 0.16 },
+    { text: " quick", start: 0.16, end: 0.38 },
+    { text: " brown", start: 0.38, end: 0.72 },
+    { text: " fox", start: 0.72, end: 1.06 },
+    { text: " jumps", start: 1.06, end: 1.38 },
+    { text: " over", start: 1.38, end: 1.68 },
+    { text: " the", start: 1.68, end: 1.86 },
+    { text: " lazy", start: 1.86, end: 2.12 },
+    { text: " dog,", start: 2.12, end: 2.5 },
+    { text: " this", start: 2.72, end: 3.0 },
+    { text: " sentence", start: 3.0, end: 3.3 },
+    { text: " is", start: 3.3, end: 3.54 },
+    { text: " used", start: 3.54, end: 3.8 },
+    { text: " for", start: 3.8, end: 4.04 },
+    { text: " testing", start: 4.04, end: 4.4 },
+    { text: " speech", start: 4.4, end: 4.8 },
+    { text: " recognition", start: 4.8, end: 5.36 },
+    { text: " systems.", start: 5.36, end: 6.22 },
+    { text: " Word", start: 7.62, end: 7.66 },
+    { text: "-level", start: 7.66, end: 8.0 },
+    { text: " timestamps", start: 8.0, end: 8.6 },
+    { text: " are", start: 8.6, end: 8.86 },
+    { text: " extracted", start: 8.86, end: 9.3 },
+    { text: " using", start: 9.3, end: 9.74 },
+    { text: " dynamic", start: 9.74, end: 10.3 },
+    { text: " time", start: 10.3, end: 10.68 },
+    { text: " warping", start: 10.68, end: 11.04 },
+    { text: " over", start: 11.04, end: 11.34 },
+    { text: " the", start: 11.34, end: 11.52 },
+    { text: " cross", start: 11.52, end: 11.82 },
+    { text: "-attention", start: 11.82, end: 12.28 },
+    { text: " weights.", start: 12.28, end: 12.8 },
+];
+
+/** The chunk-level segments the SAME clip produced with `return_timestamps: true`. */
+const REAL_SEGMENTS: TranscriptionSegment[] = [
+    {
+        start: 0,
+        end: 5.52,
+        text: " The quick brown fox jumps over the lazy dog, this sentence is used for testing speech recognition",
+    },
+    { start: 5.52, end: 7.52, text: " systems." },
+    {
+        start: 7.52,
+        end: 12.24,
+        text: " Word-level timestamps are extracted using dynamic time warping over the cross-attention",
+    },
+    { start: 12.24, end: 12.76, text: " weights." },
+];
+
+describe("real word timestamps replace the fabrication", () => {
+    it("times every cue from the model's own word times, not from a chunk's span", () => {
+        const cues = consolidateSegments(REAL_SEGMENTS, REAL_WORDS);
+
+        // Every cue boundary must be a real word boundary. Nothing here is
+        // interpolated, so each edge lands exactly on a measured time.
+        const starts = new Set(REAL_WORDS.map((w) => w.start));
+        const ends = new Set(REAL_WORDS.map((w) => w.end));
+        for (const cue of cues) {
+            expect(starts.has(cue.start)).toBe(true);
+            expect(ends.has(cue.end)).toBe(true);
+        }
+
+        // The clip has 1.2s of silence after "systems.", which really ends at
+        // 6.22. The fabricating path cannot see a pause — it only knows the chunk
+        // ran to 7.52 and that "systems." is its last word, so it stretches the
+        // word over the silence and holds the caption on screen 1.3s too long.
+        const sentence = cues.find((c) => /systems\./i.test(c.text))!;
+        expect(sentence.end).toBe(6.22);
+
+        const fabricated = consolidateSegments(REAL_SEGMENTS);
+        const fabricatedSentence = fabricated.find((c) =>
+            /systems\./i.test(c.text),
+        )!;
+        expect(fabricatedSentence.end).toBeCloseTo(7.52, 2);
+        expect(fabricatedSentence.end - sentence.end).toBeCloseTo(1.3, 2);
+    });
+
+    it("folds a word's continuation fragment back into the word", () => {
+        // Whisper emits "Word-level" as [" Word", "-level"]. Tokens are re-joined
+        // with a space, so a fragment left standing prints "Word -level".
+        const text = consolidateSegments(REAL_SEGMENTS, REAL_WORDS)
+            .map((c) => c.text.replace(/\n/g, " "))
+            .join(" ");
+        expect(text).toMatch(/Word-level/);
+        expect(text).not.toMatch(/Word -level/);
+        expect(text).toMatch(/cross-attention/);
+        expect(text).not.toMatch(/cross -attention/);
+    });
+
+    it("never runs a cue backwards, and never past the audio", () => {
+        const cues = consolidateSegments(REAL_SEGMENTS, REAL_WORDS);
+        expect(cues.length).toBeGreaterThan(1);
+        for (let i = 0; i < cues.length; i++) {
+            expect(cues[i].end).toBeGreaterThan(cues[i].start);
+            if (i > 0)
+                expect(cues[i].start).toBeGreaterThanOrEqual(cues[i - 1].end);
+        }
+        expect(cues.at(-1)!.end).toBeLessThanOrEqual(12.83);
+    });
+});
+
+describe("a segment that knows its own end is not stretched past it", () => {
+    // The span floor exists for ONE case: the monotonic clamp pushing `start` at
+    // or past the segment's end. Applied unconditionally it also fires on any
+    // speaker faster than 2.9 words/second, inventing time beyond the segment's
+    // real end — and the next segment's start is then clamped forward to that
+    // invented end, so the error compounds down the transcript.
+    it("keeps a fast segment's words inside the segment", () => {
+        // 12 words in 3.0s = 4 words/second. n * NOMINAL = 4.2s > 3.0s.
+        const cues = consolidateSegments([
+            {
+                start: 0,
+                end: 3.0,
+                text: "one two three four five six seven eight nine ten more words.",
+            },
+            {
+                start: 3.0,
+                end: 6.0,
+                text: "and then the second segment speaks.",
+            },
+        ]);
+        expect(cues[0].end).toBeLessThanOrEqual(3.0);
+        // The second segment therefore still starts where it actually starts.
+        const second = cues.find((c) => /second segment/i.test(c.text))!;
+        expect(second.start).toBeGreaterThanOrEqual(3.0);
+        expect(second.end).toBeLessThanOrEqual(6.0);
     });
 });

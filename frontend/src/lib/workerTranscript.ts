@@ -1,5 +1,10 @@
 import { TranscriptionSegment } from "../services/types";
-import { ConsolidatedSegment, consolidateSegments } from "./captionFormatter";
+import {
+    ConsolidatedSegment,
+    WordToken,
+    consolidateSegments,
+    normalizeWordTokens,
+} from "./captionFormatter";
 
 /** A raw chunk as the transformers.js worker emits it. */
 export interface WorkerChunk {
@@ -10,6 +15,13 @@ export interface WorkerChunk {
 export interface WorkerTranscript {
     text: string;
     chunks: WorkerChunk[];
+    /**
+     * The model's REAL per-word times (`return_timestamps: 'word'`). Present on
+     * the worker's final "complete" message; absent mid-stream, where the words
+     * of the window being decoded have no times yet — DTW over the
+     * cross-attentions only runs once the window is fully generated.
+     */
+    words?: WordToken[];
 }
 
 /** Last-resort end for a chunk with no end, no successor and no known duration. */
@@ -49,6 +61,38 @@ function wordCount(text: string): number {
 }
 
 /**
+ * What goes in the database as the transcript's source of truth.
+ *
+ * When the model gave us real word times, persist THOSE — one segment per word.
+ * The alternative, persisting the worker's `chunks`, is now the same data anyway
+ * (`return_timestamps: 'word'` makes every entry of `output.chunks` a word), but
+ * going through `normalizeWordTokens` first is what keeps a re-read equal to the
+ * live render: it folds "-level" back onto "Word" so the reloaded text does not
+ * come back as "Word -level".
+ *
+ * A word-granular source of truth also means a transcript read back from disk is
+ * NOT re-fabricated: `tokensFromSegments` over one-word segments returns those
+ * words' own times unchanged. Rows written before this existed still hold
+ * sentence chunks and are still fabricated on read — that is the only path left
+ * that invents a word time, and it is the reason `tokensFromSegments` survives.
+ */
+export function segmentsForPersistence(
+    workerTranscript: WorkerTranscript,
+    audioDuration: number | null,
+): TranscriptionSegment[] {
+    const words = workerTranscript.words;
+    if (words && words.length > 0) {
+        return normalizeWordTokens(words).map((word) => ({
+            start: word.start,
+            end: word.end,
+            text: word.text,
+        }));
+    }
+
+    return segmentsFromWorkerChunks(workerTranscript.chunks, audioDuration);
+}
+
+/**
  * Worker output -> the cues the UI renders and the exporters serialize. This is
  * the display path's single call to `consolidateSegments`, on RAW chunks.
  */
@@ -59,6 +103,7 @@ export function consolidateWorkerTranscript(
 ): { text: string; chunks: ConsolidatedSegment[] } {
     const chunks = consolidateSegments(
         segmentsFromWorkerChunks(workerTranscript.chunks, audioDuration),
+        workerTranscript.words,
     );
     const displayChunks =
         options.hideTrailingShortCaption &&

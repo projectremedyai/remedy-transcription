@@ -13,13 +13,14 @@ import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
     ConsolidatedSegment,
+    WordToken,
     consolidateSegments,
 } from "../lib/captionFormatter";
 import {
     WorkerChunk,
     WorkerTranscript,
     consolidateWorkerTranscript,
-    segmentsFromWorkerChunks,
+    segmentsForPersistence,
 } from "../lib/workerTranscript";
 import {
     api,
@@ -41,6 +42,8 @@ interface WorkerUpdateData {
     data: {
         text: string;
         chunks: WorkerChunk[];
+        /** Real per-word times. Only the final "complete" message carries them. */
+        words?: WordToken[];
         tps?: number;
     };
 }
@@ -223,6 +226,7 @@ export function useTranscriber(): Transcriber {
                 const nextTranscript: WorkerTranscript = {
                     text: updateMessage.data.text,
                     chunks: updateMessage.data.chunks,
+                    words: updateMessage.data.words,
                 };
                 const displayTranscript = consolidateWorkerTranscript(
                     nextTranscript,
@@ -449,8 +453,8 @@ export function useTranscriber(): Transcriber {
                 task: config.task,
                 language: config.language,
                 full_text: workerTranscript.text,
-                segments: segmentsFromWorkerChunks(
-                    workerTranscript.chunks,
+                segments: segmentsForPersistence(
+                    workerTranscript,
                     audioDuration,
                 ),
             };

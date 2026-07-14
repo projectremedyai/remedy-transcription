@@ -3,8 +3,10 @@ import {
     FALLBACK_CHUNK_DURATION,
     WorkerChunk,
     consolidateWorkerTranscript,
+    segmentsForPersistence,
     segmentsFromWorkerChunks,
 } from "./workerTranscript";
+import { consolidateSegments } from "./captionFormatter";
 
 /**
  * Whisper leaves the final chunk's end timestamp NULL. Rendering or persisting
@@ -177,5 +179,76 @@ describe("consolidateWorkerTranscript", () => {
                 null,
             ),
         ).toEqual({ text: " raw worker text", chunks: [] });
+    });
+});
+
+/**
+ * With `return_timestamps: 'word'` the worker's `output.chunks` ARE the words,
+ * so a "complete" message carries both. These are verbatim model outputs for a
+ * 12.82s clip (see captionFormatter.test.ts).
+ */
+const WORD_CHUNKS: WorkerChunk[] = [
+    { text: " Hello", timestamp: [0.0, 0.42] },
+    { text: " there", timestamp: [0.42, 0.9] },
+    { text: " and", timestamp: [0.9, 1.1] },
+    { text: " welcome.", timestamp: [1.1, 1.94] },
+    { text: " Word", timestamp: [3.2, 3.4] },
+    { text: "-level", timestamp: [3.4, 3.86] },
+    { text: " timing", timestamp: [3.86, 4.4] },
+    { text: " is", timestamp: [4.4, 4.6] },
+    { text: " real", timestamp: [4.6, 5.28] },
+    { text: " now.", timestamp: [5.28, 5.9] },
+];
+
+const WORD_TRANSCRIPT = {
+    text: " Hello there and welcome. Word-level timing is real now.",
+    chunks: WORD_CHUNKS,
+    words: WORD_CHUNKS.map((c) => ({
+        text: c.text,
+        start: c.timestamp[0],
+        end: c.timestamp[1] as number,
+    })),
+};
+
+describe("segmentsForPersistence: the database keeps the REAL word times", () => {
+    it("persists one segment per word, with the model's own times", () => {
+        const segments = segmentsForPersistence(WORD_TRANSCRIPT, 6.0);
+        expect(segments).toHaveLength(9); // 10 words, "-level" folded into "Word"
+        expect(segments[0]).toEqual({ start: 0.0, end: 0.42, text: "Hello" });
+        expect(segments[3]).toEqual({
+            start: 1.1,
+            end: 1.94,
+            text: "welcome.",
+        });
+        // The continuation fragment is folded in BEFORE it hits the database, so
+        // a reload cannot resurrect it as a separate word and print "Word -level".
+        expect(segments[4]).toEqual({
+            start: 3.2,
+            end: 3.86,
+            text: "Word-level",
+        });
+    });
+
+    it("a transcript read back from the database renders EXACTLY as it did live", () => {
+        // This is the point of persisting words rather than chunks. The reload
+        // path has no `words` — it re-derives them from the stored segments — so
+        // if the stored segments were sentence chunks, the reload would fabricate
+        // word times and the cues would move. One word per segment means
+        // `tokensFromSegments` hands back each word's own measured time unchanged.
+        const live = consolidateWorkerTranscript(WORD_TRANSCRIPT, 6.0);
+        const persisted = segmentsForPersistence(WORD_TRANSCRIPT, 6.0);
+        const reloaded = consolidateSegments(persisted);
+
+        expect(reloaded).toEqual(live.chunks);
+    });
+
+    it("falls back to chunk segments when the model gave no word times", () => {
+        // Legacy rows, and any future model without cross_attentions outputs.
+        const chunks: WorkerChunk[] = [
+            { text: " Hello there.", timestamp: [0, 2.5] },
+        ];
+        expect(
+            segmentsForPersistence({ text: "Hello there.", chunks }, 10),
+        ).toEqual(segmentsFromWorkerChunks(chunks, 10));
     });
 });

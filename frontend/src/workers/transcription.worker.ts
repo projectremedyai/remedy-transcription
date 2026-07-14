@@ -45,7 +45,8 @@ class PipelineFactory {
             }
 
             if (
-                modelId === "onnx-community/whisper-large-v3-turbo" &&
+                modelId ===
+                    "onnx-community/whisper-large-v3-turbo_timestamped" &&
                 device === "webgpu"
             ) {
                 options.dtype = {
@@ -89,7 +90,10 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             transcriber.model.config.max_source_positions;
 
         const isDistil = message.modelId.startsWith("onnx-community/distil");
-        const chunkLength = isDistil ? 20 : 30;
+        // 29, not 30: transformers.js #1357/#1358 — word timestamps break at
+        // exactly chunk_length_s=30. The fix (#1594) shipped only in 4.x, after
+        // the pinned 3.8.1.
+        const chunkLength = isDistil ? 20 : 29;
         const strideLength = isDistil ? 3 : 5;
 
         const chunks: Array<{
@@ -103,16 +107,34 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
         let tokenCount = 0;
         let tokensPerSecond: number | undefined;
 
+        /**
+         * `return_timestamps: 'word'` makes transformers.js turn timestamp TOKENS
+         * off (pipelines.js:1812-1815 — word times come from DTW over the
+         * cross-attentions instead), so `WhisperTextStreamer`'s `on_chunk_start` /
+         * `on_chunk_end` — which only fire on timestamp tokens — never fire at all.
+         * The old code appended streamed text to the chunk that `on_chunk_start`
+         * had opened, so with word timestamps it would append to nothing and the
+         * live preview would stay empty for the whole run.
+         *
+         * Open one chunk per decoding WINDOW instead. Its span is the window,
+         * which is the only timing information that exists mid-stream — good
+         * enough for a preview, and the "complete" message replaces it wholesale
+         * with the model's real per-word times.
+         */
+        const openWindowChunk = () => {
+            if (chunks.length > chunkCount) {
+                return;
+            }
+            const chunkOffset = (chunkLength - strideLength) * chunkCount;
+            chunks.push({
+                text: "",
+                timestamp: [chunkOffset, null],
+                offset: chunkOffset,
+            });
+        };
+
         const streamer = new WhisperTextStreamer(transcriber.tokenizer, {
             time_precision: timePrecision,
-            on_chunk_start: (offset: number) => {
-                const chunkOffset = (chunkLength - strideLength) * chunkCount;
-                chunks.push({
-                    text: "",
-                    timestamp: [chunkOffset + offset, null],
-                    offset: chunkOffset,
-                });
-            },
             token_callback_function: () => {
                 startedAt ??= performance.now();
                 tokenCount += 1;
@@ -122,9 +144,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
                 }
             },
             callback_function: (text: string) => {
-                if (!chunks.length) {
-                    return;
-                }
+                openWindowChunk();
                 chunks[chunks.length - 1].text += text;
                 postMessageSafe({
                     status: "update",
@@ -138,11 +158,11 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
                     },
                 });
             },
-            on_chunk_end: (offset: number) => {
-                const current = chunks[chunks.length - 1];
-                current.timestamp[1] = offset + current.offset;
-            },
             on_finalize: () => {
+                const current = chunks[chunks.length - 1];
+                if (current && current.timestamp[1] === null) {
+                    current.timestamp[1] = current.offset + chunkLength;
+                }
                 startedAt = null;
                 tokenCount = 0;
                 chunkCount += 1;
@@ -156,16 +176,39 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             stride_length_s: strideLength,
             language: message.language,
             task: message.task,
-            return_timestamps: true,
+            return_timestamps: "word",
             force_full_sequences: false,
             streamer,
         });
+
+        // With `return_timestamps: 'word'` every entry of `output.chunks` is a
+        // WORD — `{ text, timestamp: [start, end] }` straight out of
+        // `collateWordTimestamps` (tokenizers.js:4036) — not a sentence chunk.
+        // These are the real times: no more spreading a chunk's duration across
+        // its words by character length.
+        const wordChunks: Array<{
+            text: string;
+            timestamp: [number | null, number | null];
+        }> = output.chunks ?? [];
+
+        const words = wordChunks
+            .filter(
+                (chunk) =>
+                    chunk.timestamp?.[0] != null &&
+                    chunk.timestamp?.[1] != null,
+            )
+            .map((chunk) => ({
+                text: chunk.text,
+                start: chunk.timestamp[0] as number,
+                end: chunk.timestamp[1] as number,
+            }));
 
         postMessageSafe({
             status: "complete",
             data: {
                 text: output.text,
                 chunks: output.chunks,
+                words,
                 tps: tokensPerSecond,
             },
         });

@@ -45,7 +45,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
     {
         id: "fast",
         label: "Fast",
-        modelId: "onnx-community/whisper-tiny",
+        modelId: "onnx-community/whisper-tiny_timestamped",
         description: "Lowest memory usage, lower accuracy",
         webgpuOnly: false,
         englishOnly: false,
@@ -53,7 +53,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
     {
         id: "balanced",
         label: "Balanced",
-        modelId: "onnx-community/whisper-base",
+        modelId: "onnx-community/whisper-base_timestamped",
         description: "Default multilingual model",
         webgpuOnly: false,
         englishOnly: false,
@@ -61,7 +61,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
     {
         id: "quality",
         label: "High Quality",
-        modelId: "onnx-community/whisper-large-v3-turbo",
+        modelId: "onnx-community/whisper-large-v3-turbo_timestamped",
         description: "Best quality for stronger WebGPU desktops",
         webgpuOnly: true,
         englishOnly: false,
@@ -69,7 +69,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
     {
         id: "fast_en",
         label: "Fast English",
-        modelId: "onnx-community/distil-small.en",
+        modelId: "onnx-community/distil-small.en_timestamped",
         description: "Fastest option for English-only transcription",
         webgpuOnly: false,
         englishOnly: true,

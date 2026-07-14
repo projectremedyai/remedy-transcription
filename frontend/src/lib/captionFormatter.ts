@@ -16,7 +16,13 @@ const WORD_NORMALIZE_RE = /[^a-z0-9']+/g;
 const SENTENCE_END_RE = /[.!?]["')\]]*$/;
 const CLAUSE_END_RE = /[,;:]["')\]]*$/;
 
-interface WordToken {
+/**
+ * One word with its own start and end. When these come from the model
+ * (`return_timestamps: 'word'`) they are REAL times, recovered by DTW over the
+ * decoder's cross-attentions. When they don't, `tokensFromSegments` fabricates
+ * them from a segment's span — see the warning there.
+ */
+export interface WordToken {
     text: string;
     start: number;
     end: number;
@@ -140,6 +146,52 @@ function effectiveEnd(
     );
 }
 
+/**
+ * Real word timings from the model, cleaned up for the cue splitter.
+ *
+ * Two things have to happen before Whisper's words are usable as tokens:
+ *
+ *   1. Whisper marks a word boundary with a LEADING SPACE (" quick"), and emits
+ *      intra-word fragments without one: "Word-level" arrives as [" Word",
+ *      "-level"] and "cross-attention" as [" cross", "-attention"]. Tokens are
+ *      re-joined with a space downstream, so a fragment left on its own would
+ *      print "Word -level". Fold every space-less fragment back into the word it
+ *      belongs to, extending that word's end.
+ *   2. Clamp monotonically. The model's words are already ordered and
+ *      non-overlapping in practice, but a cue whose start ran backwards would
+ *      produce invalid SRT, so do not take that on trust.
+ */
+export function normalizeWordTokens(words: readonly WordToken[]): WordToken[] {
+    const tokens: WordToken[] = [];
+
+    for (const word of words) {
+        const continuesPreviousWord = !/^\s/.test(word.text);
+        const text = word.text.trim();
+        if (text.length === 0) continue;
+
+        const previous = tokens[tokens.length - 1];
+        if (continuesPreviousWord && previous) {
+            previous.text += text;
+            previous.end = Math.max(previous.end, word.end);
+            continue;
+        }
+
+        const start = previous
+            ? Math.max(word.start, previous.end)
+            : word.start;
+        tokens.push({ text, start, end: Math.max(word.end, start) });
+    }
+
+    return tokens;
+}
+
+/**
+ * FABRICATED word times: spread each segment's duration across its words by
+ * character length. Only for input that has no real word timings — a transcript
+ * loaded from the database that predates `return_timestamps: 'word'`. Measured
+ * against the model's real word times on a 12.8s clip, this is off by 0.26s on
+ * average and up to 1.30s. Prefer `normalizeWordTokens`.
+ */
 function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
     const tokens: WordToken[] = [];
     let emittedWords: string[] = [];
@@ -202,10 +254,17 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
         // 0.01s crushes the whole segment into a 6ms cue that displaces seconds
         // of speech. Floor the SPAN instead: the words still have to be spoken,
         // so give them a nominal speaking rate's worth of time.
-        const usableEnd = Math.max(
-            segmentEnd,
-            start + words.length * NOMINAL_WORD_DURATION,
-        );
+        //
+        // ONLY in that degenerate case. A `Math.max(segmentEnd, start + n *
+        // NOMINAL)` would also fire on any segment whose speaker is simply faster
+        // than 2.9 words/second, stretching it past its own real end — and since
+        // the next segment's start is then clamped forward to that invented end,
+        // the error compounds down the transcript. A segment that ends after it
+        // starts already knows how long it lasted; believe it.
+        const usableEnd =
+            segmentEnd > start
+                ? segmentEnd
+                : start + words.length * NOMINAL_WORD_DURATION;
         const survivingWeight = totalWeight - strippedWeight;
         const usableDuration = usableEnd - start;
         let elapsed = 0;
@@ -444,13 +503,21 @@ function wrapCaptionText(text: string): string {
  * formatting boundary: it must be called exactly ONCE, on raw segments, and its
  * output fed unchanged to both the screen and the exporters.
  *
- * It is deliberately NOT idempotent, and cannot cheaply be made so. Word times
- * inside a cue are interpolated from the raw segment that produced them; once
- * cues exist, that provenance is gone, and a second pass re-interpolates each
- * word evenly across its cue's span instead. Different word times mean
- * `shouldBreakBefore` cuts in different places, so words migrate between cues.
- * `captionFormatter.test.ts` pins a two-segment counterexample where a second
- * pass moves a word to the previous cue and shifts the boundary by 1.46s.
+ * `words` is the model's real per-word timing (`return_timestamps: 'word'`).
+ * When it is supplied, EVERY decision below — where to cut a cue, how long it
+ * lasts — is made from measured times. When it is not (a transcript read back
+ * from the database that was made before those existed), the word times are
+ * fabricated from each segment's span by character length, and every one of
+ * those decisions is made from a number nobody measured.
+ *
+ * It is deliberately NOT idempotent, and cannot cheaply be made so on the
+ * fabricating path. Word times inside a cue are interpolated from the raw
+ * segment that produced them; once cues exist, that provenance is gone, and a
+ * second pass re-interpolates each word evenly across its cue's span instead.
+ * Different word times mean `shouldBreakBefore` cuts in different places, so
+ * words migrate between cues. `captionFormatter.test.ts` pins a two-segment
+ * counterexample where a second pass moves a word to the previous cue and shifts
+ * the boundary by 1.46s.
  *
  * Consequence: never call this on its own output. That is enforced by the type
  * system, not by convention: it consumes raw `TranscriptionSegment[]` and
@@ -460,8 +527,12 @@ function wrapCaptionText(text: string): string {
  */
 export function consolidateSegments(
     segments: RawSegment[],
+    words?: readonly WordToken[],
 ): ConsolidatedSegment[] {
-    const tokens = tokensFromSegments(segments);
+    const tokens =
+        words && words.length > 0
+            ? normalizeWordTokens(words)
+            : tokensFromSegments(segments);
     if (tokens.length === 0) {
         return [];
     }

@@ -359,8 +359,27 @@ export function useTranscriber(): Transcriber {
         }
     }, []);
 
+    /**
+     * Tear down the wait already in flight — BOTH its listener and its poll.
+     *
+     * Every new run calls this UNCONDITIONALLY, before it can take any early
+     * return. It used to sit below `waitForReady`'s terminal-status check, and
+     * `transcribePreparedJob` skips `waitForReady` entirely for an
+     * already-`completed` (cache-hit) job — so starting a cached YouTube run
+     * while a local file was still extracting cancelled nothing. The first job's
+     * poll then kept overwriting the cached transcript's status every 300 ms and,
+     * on reaching `ready`, resolved its own wait and ran a whole spurious second
+     * transcription on top of it.
+     */
+    const cancelPendingWait = useCallback(() => {
+        unsubscribeRef.current?.();
+        unsubscribeRef.current = null;
+    }, []);
+
     const waitForReady = useCallback(
         (job: Job) => {
+            cancelPendingWait();
+
             if (
                 job.status === "ready" ||
                 job.status === "completed" ||
@@ -368,12 +387,6 @@ export function useTranscriber(): Transcriber {
             ) {
                 return Promise.resolve(job);
             }
-
-            // Tear down any wait already in flight — BOTH its listener and its poll.
-            // Leaving a previous job's poll running would let it keep pushing that
-            // job's status into the UI on top of this one's.
-            unsubscribeRef.current?.();
-            unsubscribeRef.current = null;
 
             return new Promise<Job>((resolve, reject) => {
                 let settled = false;
@@ -402,6 +415,14 @@ export function useTranscriber(): Transcriber {
                 };
 
                 const consider = (nextJob: Job) => {
+                    // A `getJob` already in flight when the wait settled still
+                    // resolves. Without this guard it would push a stale status
+                    // and progress back into the UI — flipping `loading-audio`
+                    // back to `ready` and the progress bar back to 1.0 — after the
+                    // run had already moved on.
+                    if (settled) {
+                        return;
+                    }
                     handleBackendJobUpdate(nextJob);
                     if (
                         nextJob.status === "ready" ||
@@ -448,7 +469,7 @@ export function useTranscriber(): Transcriber {
                 unsubscribeRef.current = teardown;
             });
         },
-        [handleBackendJobUpdate],
+        [cancelPendingWait, handleBackendJobUpdate],
     );
 
     const runWorkerTranscription = useCallback(
@@ -559,6 +580,12 @@ export function useTranscriber(): Transcriber {
      */
     const transcribePreparedJob = useCallback(
         async (initialJob: Job, config: ResolvedModelConfig) => {
+            // FIRST, before any early return: this run supersedes whatever run was
+            // in flight, so that run's listener and poll die here. A cache hit
+            // returns below without ever reaching `waitForReady`, so this cannot
+            // be left to `waitForReady` to do.
+            cancelPendingWait();
+
             if (initialJob.status === "completed") {
                 applyCompletedJob(initialJob, config.presetLabel);
                 return;
@@ -606,6 +633,7 @@ export function useTranscriber(): Transcriber {
         },
         [
             applyCompletedJob,
+            cancelPendingWait,
             handleBackendJobUpdate,
             persistWorkerTranscript,
             runWorkerTranscription,

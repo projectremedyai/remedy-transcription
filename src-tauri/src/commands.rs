@@ -305,6 +305,45 @@ fn ffmpeg_canonical_wav_args<'a>(input: &'a str, output: &'a str) -> Vec<&'a str
     ]
 }
 
+/// Called with the fraction of the extraction ffmpeg has completed, 0.0..=1.0.
+///
+/// `Send + Sync` because the futures these run inside are handed to
+/// `tauri::async_runtime::spawn`, which requires a `Send` future.
+type ProgressSink<'a> = &'a (dyn Fn(f32) + Send + Sync);
+
+/// ffmpeg's `HH:MM:SS.frac` — used for both its `Duration:` banner and the
+/// `out_time=` lines `-progress` writes.
+fn parse_ffmpeg_timestamp(value: &str) -> Option<f64> {
+    let mut seconds = 0.0f64;
+    let mut parts = 0;
+    for field in value.trim().split(':') {
+        let number: f64 = field.parse().ok()?;
+        seconds = seconds * 60.0 + number;
+        parts += 1;
+    }
+    if parts != 3 {
+        return None;
+    }
+    Some(seconds)
+}
+
+/// The total duration, out of ffmpeg's stderr banner:
+/// `  Duration: 00:07:30.05, start: 0.000000, bitrate: 128 kb/s`
+///
+/// A live stream or a malformed container reports `N/A`, which parses to `None`
+/// — progress then simply never advances, rather than dividing by zero.
+fn parse_ffmpeg_duration_line(line: &str) -> Option<f64> {
+    let rest = line.trim_start().strip_prefix("Duration:")?;
+    let value = rest.split(',').next()?;
+    parse_ffmpeg_timestamp(value)
+}
+
+/// A position, out of the `key=value` stream `-progress pipe:1` writes to stdout.
+fn parse_ffmpeg_progress_line(line: &str) -> Option<f64> {
+    let value = line.trim().strip_prefix("out_time=")?;
+    parse_ffmpeg_timestamp(value)
+}
+
 /// Any media file in, the canonical WAV out — the step both source types share.
 ///
 /// ffmpeg writes to `scratch` and the result is renamed into `destination`, so a
@@ -317,9 +356,24 @@ async fn produce_canonical_wav(
     input: &Path,
     scratch: &Path,
     destination: &Path,
+    on_progress: ProgressSink<'_>,
 ) -> Result<(), String> {
-    run_ffmpeg_extract(app, input, scratch).await?;
+    run_ffmpeg_extract(app, input, scratch, on_progress).await?;
     std::fs::rename(scratch, destination).map_err(|e| format!("rename audio failed: {}", e))
+}
+
+/// Move a job's progress bar and tell the frontend. Status is left alone.
+fn report_progress(state: &AppState, job_id: &str, progress: f64) {
+    let _ = state.store.update_job(
+        job_id,
+        JobUpdate {
+            progress: Some(progress.clamp(0.0, 1.0)),
+            ..Default::default()
+        },
+    );
+    if let Ok(Some(j)) = state.store.get_job(job_id) {
+        state.events.publish(&j);
+    }
 }
 
 /// Mark a job failed and tell the frontend. Both `prepare_*` paths end here when
@@ -530,7 +584,12 @@ async fn prepare_youtube_audio(
             state.events.publish(&j);
         }
 
-        produce_canonical_wav(&app, &downloaded, &temp_audio, &cached_audio).await?;
+        // The download owns 0.0..0.65; extraction owns the rest, up to the 1.0
+        // that `Ready` sets.
+        let report = |fraction: f32| {
+            report_progress(&state, &job_id, 0.65 + f64::from(fraction) * 0.30);
+        };
+        produce_canonical_wav(&app, &downloaded, &temp_audio, &cached_audio, &report).await?;
         let _ = std::fs::remove_file(&downloaded);
 
         let _ = state.store.update_source_audio(
@@ -586,13 +645,27 @@ async fn prepare_file_audio(
     // expensive step in both, and it is the step being shared here.
     let _permit = match state.download_semaphore.clone().acquire_owned().await {
         Ok(p) => p,
-        Err(_) => return,
+        // Unreachable while nothing closes the semaphore — but returning here
+        // would strand the job in `Extracting` with no event ever coming, and the
+        // frontend's 300 ms poll would spin on it until the app was quit. A job
+        // this function owns is a job it must resolve, one way or the other.
+        Err(e) => {
+            fail_job(&state, &job_id, format!("Could not queue extraction: {}", e));
+            return;
+        }
     };
+
+    // A file extraction holds a download permit, so it MUST be counted like one.
+    // It was not, so `health()` and `queue_status` reported 0 active downloads
+    // while a permit was held — under-reporting exactly the contention that the
+    // permit exists to express.
+    state.events.track_download_start();
 
     let audio_root = match audio_dir(&app) {
         Ok(p) => p,
         Err(e) => {
             fail_job(&state, &job_id, e);
+            state.events.track_download_end();
             return;
         }
     };
@@ -606,7 +679,7 @@ async fn prepare_file_audio(
             &job_id,
             JobUpdate {
                 status: Some(JobStatus::Extracting),
-                progress: Some(0.1),
+                progress: Some(0.05),
                 ..Default::default()
             },
         );
@@ -614,7 +687,12 @@ async fn prepare_file_audio(
             state.events.publish(&j);
         }
 
-        produce_canonical_wav(&app, &input, &scratch, &destination).await?;
+        // A local file's whole preparation IS the extraction — there is no
+        // download phase to share the bar with — so it gets nearly all of it.
+        let report = |fraction: f32| {
+            report_progress(&state, &job_id, 0.05 + f64::from(fraction) * 0.90);
+        };
+        produce_canonical_wav(&app, &input, &scratch, &destination, &report).await?;
 
         let _ = state.store.update_source_audio(
             source_id,
@@ -644,6 +722,7 @@ async fn prepare_file_audio(
     }
 
     let _ = std::fs::remove_file(&scratch);
+    state.events.track_download_end();
 }
 
 async fn run_yt_dlp_dump_json(app: &AppHandle, url: &str) -> Result<serde_json::Value, String> {
@@ -685,17 +764,87 @@ async fn run_ffmpeg_extract(
     app: &AppHandle,
     input: &Path,
     output: &Path,
+    on_progress: ProgressSink<'_>,
 ) -> Result<(), String> {
     let input_str = input.to_string_lossy().to_string();
     let output_str = output.to_string_lossy().to_string();
-    let handle = spawn_sidecar(
-        app,
-        "ffmpeg",
-        &ffmpeg_canonical_wav_args(&input_str, &output_str),
-        None,
-    )
-    .map_err(|e| e.to_string())?;
-    drain_until_exit(handle).await
+
+    // `-progress pipe:1` writes machine-readable `key=value` progress to STDOUT
+    // (free, since the audio goes to a file), newline-terminated — unlike the
+    // default `\r`-updated stats line, which the sidecar's line-oriented reader
+    // would not surface until the process ended. `-nostats` drops that line.
+    //
+    // These are global options, so they precede `-i`. The canonical argument list
+    // itself is untouched: it is the format contract, and it stays the one thing
+    // both source types share.
+    let mut args = vec!["-nostats", "-progress", "pipe:1"];
+    args.extend(ffmpeg_canonical_wav_args(&input_str, &output_str));
+
+    let handle = spawn_sidecar(app, "ffmpeg", &args, None).map_err(|e| e.to_string())?;
+    drain_ffmpeg(handle, on_progress).await
+}
+
+/// `drain_until_exit`, plus ffmpeg's progress stream.
+///
+/// A local file used to sit at a flat "Extracting audio… 10%" for however long
+/// ffmpeg took — a minute or more on a long recording, with nothing moving. The
+/// total comes from the `Duration:` banner on stderr and the position from
+/// `out_time=` on stdout; if the total is unknown (a live stream, a broken
+/// container) no progress is reported and the bar simply holds, which is what it
+/// did before.
+async fn drain_ffmpeg(
+    mut handle: crate::sidecar::SidecarHandle,
+    on_progress: ProgressSink<'_>,
+) -> Result<(), String> {
+    let mut stderr_text = String::new();
+    let mut code: Option<i32> = None;
+    let mut total: Option<f64> = None;
+    let mut last_reported = 0.0f32;
+
+    while let Some(event) = handle.rx.recv().await {
+        match event {
+            CommandEvent::Stdout(line) => {
+                let text = String::from_utf8_lossy(&line);
+                for entry in text.lines() {
+                    let Some(position) = parse_ffmpeg_progress_line(entry) else {
+                        continue;
+                    };
+                    let Some(duration) = total.filter(|d| *d > 0.0) else {
+                        continue;
+                    };
+                    let fraction = (position / duration).clamp(0.0, 1.0) as f32;
+                    // Every tick is a DB write and an event to the webview, so
+                    // only move on a visible change.
+                    if fraction - last_reported >= 0.02 {
+                        last_reported = fraction;
+                        on_progress(fraction);
+                    }
+                }
+            }
+            CommandEvent::Stderr(line) => {
+                let text = String::from_utf8_lossy(&line);
+                if total.is_none() {
+                    total = text.lines().find_map(parse_ffmpeg_duration_line);
+                }
+                stderr_text.push_str(&text);
+                stderr_text.push('\n');
+            }
+            CommandEvent::Terminated(payload) => {
+                code = payload.code;
+                break;
+            }
+            CommandEvent::Error(err) => return Err(err),
+            _ => {}
+        }
+    }
+    if !matches!(code, Some(0)) {
+        return Err(format!(
+            "sidecar exited with code {:?}: {}",
+            code,
+            stderr_text.trim()
+        ));
+    }
+    Ok(())
 }
 
 async fn collect_json_output(
@@ -1219,5 +1368,68 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The progress bar for a local file used to go 0.1 → 1.0 with NOTHING in
+    /// between, so a long recording sat at a frozen "Extracting audio… 10%" for
+    /// as long as ffmpeg took. These two lines are the whole source of movement:
+    /// the total from ffmpeg's stderr banner, the position from the `-progress`
+    /// stream on stdout. If either stops parsing, the bar silently freezes again
+    /// rather than breaking — which is exactly why it is asserted.
+    #[test]
+    fn ffmpeg_progress_is_read_from_its_duration_banner_and_its_progress_stream() {
+        assert_eq!(
+            parse_ffmpeg_duration_line(
+                "  Duration: 00:07:30.05, start: 0.000000, bitrate: 128 kb/s"
+            ),
+            Some(450.05)
+        );
+        assert_eq!(
+            parse_ffmpeg_progress_line("out_time=00:00:12.500000"),
+            Some(12.5)
+        );
+
+        // An hour-plus source: the fields are HH:MM:SS, so an unhandled hour
+        // would put the bar at 60x the true position and peg it at 100%.
+        assert_eq!(
+            parse_ffmpeg_duration_line("  Duration: 01:30:00.00, start: 0.000000"),
+            Some(5400.0)
+        );
+
+        // A live stream or a broken container reports no duration. That must
+        // yield `None` — not 0.0, which would be a divide-by-zero — and the bar
+        // then simply holds, as it did before.
+        assert_eq!(
+            parse_ffmpeg_duration_line("  Duration: N/A, start: 0.000000, bitrate: N/A"),
+            None
+        );
+
+        // The `-progress` stream is many keys; only `out_time` is a position.
+        assert_eq!(parse_ffmpeg_progress_line("out_time_us=12500000"), None);
+        assert_eq!(parse_ffmpeg_progress_line("progress=continue"), None);
+        assert_eq!(parse_ffmpeg_duration_line("Stream #0:0: Audio: aac"), None);
+    }
+
+    /// The canonical argument list is the format contract, and the progress flags
+    /// must not disturb it: they are GLOBAL options, so they precede `-i`, and the
+    /// output path stays last where ffmpeg expects it.
+    #[test]
+    fn the_progress_flags_do_not_disturb_the_canonical_arguments() {
+        let canonical = ffmpeg_canonical_wav_args("/in.mp4", "/out.wav");
+        let mut args = vec!["-nostats", "-progress", "pipe:1"];
+        args.extend(canonical.clone());
+
+        let input_at = args.iter().position(|a| *a == "-i").expect("-i");
+        let progress_at = args.iter().position(|a| *a == "-progress").expect("-progress");
+        assert!(
+            progress_at < input_at,
+            "-progress is a global option and must precede -i"
+        );
+        assert_eq!(args.last().copied(), Some("/out.wav"));
+        assert!(
+            args.windows(canonical.len())
+                .any(|window| window == canonical.as_slice()),
+            "the canonical argument list must survive intact"
+        );
     }
 }

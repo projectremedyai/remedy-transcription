@@ -48,14 +48,17 @@ export function AudioManager(props: { transcriber: Transcriber }) {
     const [selectedPath, setSelectedPath] = useState<string | null>(null);
     const [isDragging, setIsDragging] = useState(false);
     const [dropError, setDropError] = useState<string | null>(null);
+    const [dropNotice, setDropNotice] = useState<string | null>(null);
 
     const { transcriber } = props;
     const { onInputChange } = transcriber;
+    const isBusy = transcriber.isBusy;
 
     const handleFileSelect = useCallback(
         (path: string) => {
             onInputChange();
             setDropError(null);
+            setDropNotice(null);
             setSelectedPath(path);
         },
         [onInputChange],
@@ -70,7 +73,14 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
         getCurrentWebview()
             .onDragDropEvent((event) => {
-                if (event.payload.type === "over") {
+                // The union is `enter | over | drop | leave`. Only `over` was
+                // handled, so the drop zone stayed un-highlighted until the
+                // pointer MOVED inside the window — a file dragged in and released
+                // without moving showed no affordance at all.
+                if (
+                    event.payload.type === "enter" ||
+                    event.payload.type === "over"
+                ) {
                     setIsDragging(true);
                     return;
                 }
@@ -80,14 +90,38 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 }
                 if (event.payload.type === "drop") {
                     setIsDragging(false);
-                    const path = event.payload.paths.find(hasMediaExtension);
-                    if (!path) {
+
+                    // A run is already in flight and there is no queue, so taking
+                    // the drop would silently supersede it.
+                    if (isBusy) {
+                        setDropNotice(null);
+                        setDropError(
+                            "A transcription is already running. Wait for it to finish, then drop the file again.",
+                        );
+                        return;
+                    }
+
+                    const dropped = event.payload.paths;
+                    const media = dropped.filter(hasMediaExtension);
+                    if (media.length === 0) {
+                        setDropNotice(null);
                         setDropError(
                             "That is not an audio or video file we can read.",
                         );
                         return;
                     }
-                    handleFileSelect(path);
+
+                    // One transcript at a time is all this app models, so a
+                    // multi-file drop can only take the first — but it must SAY so
+                    // rather than quietly discard the rest.
+                    handleFileSelect(media[0]);
+                    if (dropped.length > 1) {
+                        setDropNotice(
+                            `Only one file at a time — using ${basename(
+                                media[0],
+                            )} and ignoring the other ${dropped.length - 1}.`,
+                        );
+                    }
                 }
             })
             .then((fn) => {
@@ -105,12 +139,13 @@ export function AudioManager(props: { transcriber: Transcriber }) {
             cancelled = true;
             unlisten?.();
         };
-    }, [handleFileSelect]);
+    }, [handleFileSelect, isBusy]);
 
     const handleYouTubeSubmit = (url: string) => {
         transcriber.onInputChange();
         setSelectedPath(null);
         setDropError(null);
+        setDropNotice(null);
         transcriber.startFromYouTube(url);
     };
 
@@ -177,18 +212,34 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                         : "ring-slate-700/10"
                 }`}
             >
+                {/*
+                 * Both entry points are gated on `isBusy`. The app models exactly
+                 * ONE transcript at a time — one `jobId`, one output — so a second
+                 * run started mid-flight cannot be shown, only substituted. The
+                 * YouTube tile in particular was startable during a local file's
+                 * extraction, which is the overlap that let a cache-hit YouTube run
+                 * land on top of a still-running file job. The hook now cancels the
+                 * superseded wait unconditionally, so this is defence in depth
+                 * rather than the fix — but there is no legitimate use for
+                 * overlapping runs here, and the `Transcribe` button was already
+                 * hidden while busy, so the two entry points now agree.
+                 */}
                 <div className='flex flex-row space-x-2 py-2 w-full px-2'>
                     <YouTubeTile
                         icon={<YouTubeIcon />}
                         text='YouTube'
                         onUrlSubmit={handleYouTubeSubmit}
-                        enabled={props.transcriber.selectedModelAvailable}
+                        enabled={
+                            props.transcriber.selectedModelAvailable && !isBusy
+                        }
+                        disabled={isBusy}
                     />
                     <VerticalBar />
                     <FileTile
                         icon={<FolderIcon />}
                         text='From file'
                         onFileSelect={handleFileSelect}
+                        disabled={isBusy}
                     />
                 </div>
                 {isDragging && (
@@ -254,10 +305,25 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 </div>
             )}
 
-            {(props.transcriber.error || dropError) && (
+            {/*
+             * `dropError` WINS. It used to be the fallback, so a stale error from
+             * an earlier transcription — which a rejected drop does not and should
+             * not clear, since it never reaches the hook — kept the screen and hid
+             * the reason the drop was refused. The drop error is always the newer
+             * event of the two, and it is cleared the moment a file is accepted.
+             */}
+            {(dropError || props.transcriber.error) && (
                 <div className='w-full mt-4 p-4 bg-red-50 rounded-lg border border-red-200'>
                     <div className='text-red-600 text-center'>
-                        {props.transcriber.error ?? dropError}
+                        {dropError ?? props.transcriber.error}
+                    </div>
+                </div>
+            )}
+
+            {dropNotice && (
+                <div className='w-full mt-4 p-4 bg-amber-50 rounded-lg border border-amber-200'>
+                    <div className='text-amber-800 text-center text-sm'>
+                        {dropNotice}
                     </div>
                 </div>
             )}
@@ -368,6 +434,7 @@ function YouTubeTile(props: {
     text: string;
     onUrlSubmit: (url: string) => void;
     enabled: boolean;
+    disabled?: boolean;
 }) {
     const [showModal, setShowModal] = useState(false);
 
@@ -376,6 +443,7 @@ function YouTubeTile(props: {
             <Tile
                 icon={props.icon}
                 text={props.text}
+                disabled={props.disabled}
                 onClick={() => setShowModal(true)}
             />
             <YouTubeModal
@@ -453,11 +521,13 @@ function FileTile(props: {
     icon: JSX.Element;
     text: string;
     onFileSelect: (path: string) => void;
+    disabled?: boolean;
 }) {
     return (
         <Tile
             icon={props.icon}
             text={props.text}
+            disabled={props.disabled}
             onClick={() => {
                 void open({
                     multiple: false,
@@ -478,11 +548,13 @@ function Tile(props: {
     icon: JSX.Element;
     text?: string;
     onClick?: () => void;
+    disabled?: boolean;
 }) {
     return (
         <button
             onClick={props.onClick}
-            className='flex items-center justify-center rounded-lg p-2 bg-blue text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all duration-200'
+            disabled={props.disabled}
+            className='flex items-center justify-center rounded-lg p-2 bg-blue text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 disabled:text-slate-300 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all duration-200'
         >
             <div className='w-7 h-7'>{props.icon}</div>
             {props.text && (

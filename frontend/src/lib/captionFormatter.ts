@@ -1,4 +1,9 @@
 import { TranscriptionSegment } from "../services/types";
+import {
+    assignSpeakers,
+    speakerLabel,
+    type SpeakerTurn,
+} from "./speakerAlignment";
 
 const MAX_LINE_CHARS = 42;
 const MAX_CAPTION_CHARS = 78;
@@ -86,6 +91,45 @@ export interface WordToken {
     text: string;
     start: number;
     end: number;
+    /**
+     * Who said this word — the OPAQUE label from `speakerLabel`, never a raw
+     * turn id. Absent unless diarization produced turns to align against.
+     *
+     * This is what lets the cue splitter see a speaker change: `shouldBreakBefore`
+     * compares it and breaks unconditionally when it differs.
+     */
+    speaker?: string;
+}
+
+/**
+ * Build a token, keeping `speaker` ABSENT when there is none.
+ *
+ * `{...t, speaker: undefined}` would be a different object: the key exists,
+ * `"speaker" in token` is true, and `JSON.stringify` of a persisted row starts
+ * differing from one written before diarization existed. An undiarized transcript
+ * must be byte-identical to what it was, so the key is omitted, not emptied.
+ */
+function token(
+    text: string,
+    start: number,
+    end: number,
+    speaker?: string,
+): WordToken {
+    return speaker === undefined
+        ? { text, start, end }
+        : { text, start, end, speaker };
+}
+
+/** As `token`, for captions. Same absent-not-empty rule, same reason. */
+function caption(
+    start: number,
+    end: number,
+    text: string,
+    speaker?: string,
+): TranscriptionSegment {
+    return speaker === undefined
+        ? { start, end, text }
+        : { start, end, text, speaker };
 }
 
 /**
@@ -345,7 +389,7 @@ export function normalizeWordTokens(words: readonly WordToken[]): WordToken[] {
             continue;
         }
 
-        folded.push({ text, start: word.start, end: word.end });
+        folded.push(token(text, word.start, word.end, word.speaker));
     }
 
     const tokens: WordToken[] = [];
@@ -355,11 +399,14 @@ export function normalizeWordTokens(words: readonly WordToken[]): WordToken[] {
             const start = previous
                 ? Math.max(piece.start, previous.end)
                 : piece.start;
-            tokens.push({
-                text: piece.text,
-                start,
-                end: Math.max(piece.end, start + MIN_WORD_DURATION),
-            });
+            tokens.push(
+                token(
+                    piece.text,
+                    start,
+                    Math.max(piece.end, start + MIN_WORD_DURATION),
+                    piece.speaker,
+                ),
+            );
         }
     }
 
@@ -377,7 +424,7 @@ function splitGluedToken(word: WordToken): WordToken[] {
     const parts = splitWords(word.text);
     if (parts.length === 0) return [];
     if (parts.length === 1) {
-        return [{ text: parts[0], start: word.start, end: word.end }];
+        return [token(parts[0], word.start, word.end, word.speaker)];
     }
 
     const totalWeight = charWeightOf(parts);
@@ -388,7 +435,9 @@ function splitGluedToken(word: WordToken): WordToken[] {
         const start = word.start + (elapsed / totalWeight) * duration;
         elapsed += charWeight(part);
         const end = word.start + (elapsed / totalWeight) * duration;
-        return { text: part, start, end };
+        // One model word cannot have been said by two people, so every piece it
+        // splits into keeps its speaker.
+        return token(part, start, end, word.speaker);
     });
 }
 
@@ -398,6 +447,14 @@ function splitGluedToken(word: WordToken): WordToken[] {
  * loaded from the database that predates `return_timestamps: 'word'`. Measured
  * against the model's real word times on a 12.8s clip, this is off by 0.26s on
  * average and up to 1.30s. Prefer `normalizeWordTokens`.
+ *
+ * Each token inherits its SEGMENT's `speaker`, unchanged. That is what makes the
+ * legacy diarization path honest: those segment times are real (only the word
+ * times inside them are invented), so a speaker assigned to the segment is a
+ * measured answer, and stamping it on every word of that segment is the coarse
+ * but true one. Assigning speakers to the fabricated word times instead would be
+ * a confident answer built on a number nobody measured — up to 1.3s adrift, which
+ * is longer than many turns.
  */
 function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
     const tokens: WordToken[] = [];
@@ -491,7 +548,7 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
             const wordStart = start + elapsed * usableDuration;
             elapsed += weight;
             const wordEnd = start + elapsed * usableDuration;
-            tokens.push({ text: word, start: wordStart, end: wordEnd });
+            tokens.push(token(word, wordStart, wordEnd, segment.speaker));
         }
 
         emittedWords = emittedWords.concat(words);
@@ -526,6 +583,23 @@ function shouldBreakBefore(
     current: WordToken[],
     nextToken: WordToken,
 ): boolean {
+    // A CUE MUST NEVER SPAN TWO SPEAKERS, and this is checked FIRST, above every
+    // length and duration rule below, because it OUTRANKS them: a speaker change
+    // breaks the cue even when the result is a single word far under
+    // MAX_CAPTION_CHARS and MAX_CAPTION_DURATION — the exact cue every heuristic
+    // below would rather merge away. `mergeShortCaptions` is the other half of
+    // this guarantee; see `canMerge`, which refuses to glue that runt back on.
+    //
+    // Every token in `current` shares one speaker by induction (this rule is why),
+    // so comparing the last one is comparing all of them.
+    //
+    // Undiarized text has no speaker on either side: `undefined !== undefined` is
+    // false, no break, and the cues come out exactly as they did before speakers
+    // existed. Pinned by "renders an undiarized transcript exactly as before".
+    if (current[current.length - 1].speaker !== nextToken.speaker) {
+        return true;
+    }
+
     const currentText = joinWords(current);
     const nextText = joinWords([...current, nextToken]);
     const currentDuration = current[current.length - 1].end - current[0].start;
@@ -570,11 +644,14 @@ function shouldBreakBefore(
 function captionFromTokens(tokens: WordToken[]): TranscriptionSegment {
     const first = tokens[0];
     const last = tokens[tokens.length - 1];
-    return {
-        start: round3(first.start),
-        end: round3(last.end),
-        text: wrapCaptionText(joinWords(tokens)),
-    };
+    // Every token here shares one speaker — `shouldBreakBefore` cut the cue the
+    // moment it changed — so the first token's speaker is the cue's speaker.
+    return caption(
+        round3(first.start),
+        round3(last.end),
+        wrapCaptionText(joinWords(tokens)),
+        first.speaker,
+    );
 }
 
 function round3(value: number): number {
@@ -592,6 +669,17 @@ function canMerge(
     left: TranscriptionSegment,
     right: TranscriptionSegment,
 ): boolean {
+    // NEVER across a speaker boundary — the other half of the guarantee
+    // `shouldBreakBefore` opens with. Without this, the split it just made is
+    // undone one function later: a one-word answer ("Yes.") is a runt by both the
+    // word-count and the duration test, it fits inside MAX_CAPTION_CHARS and
+    // SHORT_MERGE_MAX_DURATION with room to spare, so `mergeShortCaptions` would
+    // glue it onto the previous speaker's cue and attribute it to them. Pinned by
+    // "breaks on speaker change even when under the char and duration limits".
+    if (left.speaker !== right.speaker) {
+        return false;
+    }
+
     const mergedText = mergeCaptionText(left, right);
     return (
         mergedText.replace(/\n/g, " ").length <= MAX_CAPTION_CHARS &&
@@ -604,26 +692,30 @@ function mergeShortCaptions(
 ): TranscriptionSegment[] {
     const merged: TranscriptionSegment[] = [];
 
-    for (const caption of captions) {
+    for (const short of captions) {
         const isShort =
-            countCaptionWords(caption.text) < MIN_CAPTION_WORDS ||
-            caption.end - caption.start < MIN_CAPTION_DURATION;
+            countCaptionWords(short.text) < MIN_CAPTION_WORDS ||
+            short.end - short.start < MIN_CAPTION_DURATION;
 
         if (
             isShort &&
             merged.length > 0 &&
-            canMerge(merged[merged.length - 1], caption)
+            canMerge(merged[merged.length - 1], short)
         ) {
             const previous = merged.pop()!;
-            merged.push({
-                start: previous.start,
-                end: caption.end,
-                text: wrapCaptionText(mergeCaptionText(previous, caption)),
-            });
+            merged.push(
+                caption(
+                    previous.start,
+                    short.end,
+                    wrapCaptionText(mergeCaptionText(previous, short)),
+                    // Identical on both sides — `canMerge` refused otherwise.
+                    previous.speaker,
+                ),
+            );
             continue;
         }
 
-        merged.push(caption);
+        merged.push(short);
     }
 
     return merged;
@@ -645,17 +737,13 @@ function normalizeCaptionStarts(
 ): TranscriptionSegment[] {
     const normalized: TranscriptionSegment[] = [];
 
-    for (const caption of captions) {
-        let text = caption.text;
+    for (const cue of captions) {
+        let text = cue.text;
         const previous = normalized[normalized.length - 1];
         if (!previous || endsSentence(previous.text.replace(/\n/g, " "))) {
             text = capitalizeFirstAlpha(text);
         }
-        normalized.push({
-            start: caption.start,
-            end: caption.end,
-            text,
-        });
+        normalized.push(caption(cue.start, cue.end, text, cue.speaker));
     }
 
     if (
@@ -666,11 +754,14 @@ function normalizeCaptionStarts(
     ) {
         const final = normalized.pop()!;
         const terminator = sentenceTerminatorFor(final.text);
-        normalized.push({
-            start: final.start,
-            end: final.end,
-            text: `${final.text}${terminator}`,
-        });
+        normalized.push(
+            caption(
+                final.start,
+                final.end,
+                `${final.text}${terminator}`,
+                final.speaker,
+            ),
+        );
     }
 
     return normalized;
@@ -783,6 +874,148 @@ function wrapCaptionText(text: string): string {
 }
 
 /**
+ * Do these segments carry REAL word times, or will they be FABRICATED?
+ *
+ * This is the question speaker alignment turns on, and it must be ASKED, never
+ * assumed — a transcript's granularity is not knowable from where it came from.
+ * `job.segments` off a cache hit may be either (see the doc comment on
+ * `store.rs::find_transcript`): the model rename aliased old rows to the new
+ * model id, and nothing supersedes a legacy row once it exists, so pre-rename
+ * transcripts persist indefinitely and are served for the same sources forever.
+ *
+ * The two shapes, and how they are told apart:
+ *
+ *   - WORD-GRANULAR (`segmentsForPersistence` wrote it): one word per row, each
+ *     with the model's own DTW-measured start and end. Every row is one word, so
+ *     `countCaptionWords` of it is 1.
+ *   - SENTENCE-GRANULAR (legacy): one Whisper chunk per row. The chunk's OWN times
+ *     are real, but the word times `tokensFromSegments` derives inside it are
+ *     interpolated by character length — off by 0.26s on average and up to 1.30s.
+ *     A row holds a sentence, so `countCaptionWords` of it is >1.
+ *
+ * `countCaptionWords`, not `split(" ")`, and the difference is worth being precise
+ * about because a whitespace count is WRONG here in a way that currently hides.
+ *
+ * A legacy Chinese row ("光合作用是植物") contains no spaces at all, so a whitespace
+ * count reports ONE word and declares an entire legacy CJK transcript
+ * word-granular. `countCaptionWords` counts each no-space-script character as its
+ * own word — the way the model tokenised them, and the way they are persisted — so
+ * it sees the sentence for what it is.
+ *
+ * TODAY, both answers happen to produce the same CUES for that row, and the honest
+ * reason is that `tokensFromSegments` is blind to CJK in exactly the same way:
+ * `splitWords` splits on spaces, so a legacy Chinese segment becomes ONE token
+ * spanning the whole segment, and aligning that token is aligning the segment.
+ * Two blindnesses cancelling is not a safety property. Teach `tokensFromSegments`
+ * to split CJK — which it arguably should, since a legacy Chinese transcript
+ * currently comes back as one un-wrappable cue — and a whitespace-based detector
+ * becomes a live bug that hangs speaker labels off per-character times nobody
+ * measured. So the predicate is correct ON ITS OWN TERMS, and is tested directly
+ * ("tells a legacy Chinese sentence from a word-granular Chinese row") rather than
+ * through cues it does not currently change.
+ *
+ * Degenerate case, stated because it is real and harmless: a transcript whose every
+ * legacy chunk happens to be one word is called word-granular. Its chunk times ARE
+ * its word times then, so both alignments agree and the answer is the same.
+ *
+ * Exported for that direct test, and for callers that must decide the same thing.
+ */
+export function hasRealWordTimings(
+    segments: readonly TranscriptionSegment[],
+): boolean {
+    return (
+        segments.length > 0 &&
+        segments.every((segment) => countCaptionWords(segment.text) === 1)
+    );
+}
+
+/**
+ * The tokens the cue splitter runs on, each already knowing who said it.
+ *
+ * WHICH GRANULARITY the speakers are aligned at is the whole point of this
+ * function, and it is decided per-transcript:
+ *
+ *   - REAL word times (live from the model, or read back from word-granular rows)
+ *     -> align the WORDS. A turn boundary lands between two words, which is where
+ *     it actually is.
+ *   - FABRICATED word times (a legacy sentence-granular row) -> align the
+ *     SEGMENTS, and stamp each segment's speaker on every token derived from it.
+ *     Coarse: a cue cannot then change speaker mid-segment. But the segment times
+ *     are MEASURED, so the label is true — where aligning turns against word times
+ *     that are up to 1.3s adrift (longer than many turns) would hand back a
+ *     confidently wrong speaker, which is strictly worse than a coarse right one.
+ *
+ * `assignSpeakers` is generic over `{text,start,end}` for exactly this reason, so
+ * both paths are the same function over different tokens.
+ */
+function tokensWithSpeakers(
+    segments: RawSegment[],
+    words: readonly WordToken[] | undefined,
+    turns: readonly SpeakerTurn[] | null,
+): WordToken[] {
+    if (words && words.length > 0) {
+        const wordTokens = normalizeWordTokens(words);
+        return turns ? assignSpeakersToTokens(wordTokens, turns) : wordTokens;
+    }
+
+    if (turns && !hasRealWordTimings(segments)) {
+        return tokensFromSegments(assignSpeakersToSegments(segments, turns));
+    }
+
+    // Either word-granular rows (whose times are the model's own, so aligning the
+    // tokens IS aligning the words) or no diarization at all, in which case any
+    // speaker already persisted on a row rides through `tokensFromSegments`
+    // untouched.
+    const tokens = tokensFromSegments(segments);
+    return turns ? assignSpeakersToTokens(tokens, turns) : tokens;
+}
+
+/**
+ * `assignSpeakers` answers with the turn's own id (a number, or null when there
+ * are no turns). The transcript carries an opaque LABEL. These two adapters are
+ * the only place the one becomes the other.
+ *
+ * They pass `assignSpeakers` a bare `{text,start,end}` rather than the token or
+ * segment itself, deliberately: `SpeakerTagged<T>` sets `speaker: number | null`,
+ * which would collide with the `speaker?: string` these types already carry.
+ */
+function assignSpeakersToTokens(
+    tokens: WordToken[],
+    turns: readonly SpeakerTurn[],
+): WordToken[] {
+    const tagged = assignSpeakers(timedOnly(tokens), [...turns]);
+    return tokens.map((t, index) =>
+        token(t.text, t.start, t.end, labelOf(tagged[index].speaker)),
+    );
+}
+
+function assignSpeakersToSegments(
+    segments: RawSegment[],
+    turns: readonly SpeakerTurn[],
+): RawSegment[] {
+    const tagged = assignSpeakers(timedOnly(segments), [...turns]);
+    return segments.map((segment, index) => {
+        const speaker = labelOf(tagged[index].speaker);
+        return speaker === undefined ? segment : { ...segment, speaker };
+    });
+}
+
+function timedOnly(
+    items: readonly { text: string; start: number; end: number }[],
+): { text: string; start: number; end: number }[] {
+    return items.map(({ text, start, end }) => ({ text, start, end }));
+}
+
+/**
+ * A token that overlaps no turn at all gets `null` — never speaker 0. It has to
+ * stay unlabelled: inventing a speaker for it would be the same lie, one token at
+ * a time, that rendering a degraded run as "no speakers" would be wholesale.
+ */
+function labelOf(speaker: number | null): string | undefined {
+    return speaker === null ? undefined : speakerLabel(speaker);
+}
+
+/**
  * Turn RAW model segments into display/export captions. This is the single
  * formatting boundary: it must be called exactly ONCE, on raw segments, and its
  * output fed unchanged to both the screen and the exporters.
@@ -808,15 +1041,36 @@ function wrapCaptionText(text: string): string {
  * produces branded `ConsolidatedSegment[]`, which it will not accept back.
  * `lib/srtGenerator.ts` is a set of pure serializers over `ConsolidatedSegment[]`
  * precisely so that the export path cannot re-format.
+ *
+ * `turns` is diarization's answer, and it is deliberately typed `SpeakerTurn[]`
+ * and NOT `DiarizationOutcome`. A caller cannot reach turns without narrowing
+ * that union to its `succeeded` arm first, so the two things that both LOOK like
+ * "no speakers" cannot arrive here as the same value:
+ *
+ *   - `succeeded { turns: [] }` — a real, measured answer (silence, or one
+ *     speaker). Passing `[]`, or nothing at all, is correct: no cue gets a
+ *     speaker, and the transcript renders exactly as it did before diarization
+ *     existed.
+ *   - `degraded { reason }` — the sidecar crashed, or its model is missing. It
+ *     has NO `turns` key, cannot be coerced into one (`outcome.turns ?? []` does
+ *     not compile, and a test pins that), and so cannot reach this function at
+ *     all. It is not this function's answer to give; the caller must SHOW the
+ *     reason. Silently consolidating with no turns would render a crash as
+ *     silence, which is the one failure the union exists to prevent.
+ *
+ * When turns ARE supplied, the alignment granularity is chosen by
+ * `hasRealWordTimings`, not assumed. See it.
  */
 export function consolidateSegments(
     segments: RawSegment[],
     words?: readonly WordToken[],
+    turns?: readonly SpeakerTurn[],
 ): ConsolidatedSegment[] {
-    const tokens =
-        words && words.length > 0
-            ? normalizeWordTokens(words)
-            : tokensFromSegments(segments);
+    const tokens = tokensWithSpeakers(
+        segments,
+        words,
+        turns && turns.length > 0 ? turns : null,
+    );
     if (tokens.length === 0) {
         return [];
     }
@@ -824,12 +1078,12 @@ export function consolidateSegments(
     const captions: TranscriptionSegment[] = [];
     let current: WordToken[] = [];
 
-    for (const token of tokens) {
-        if (current.length > 0 && shouldBreakBefore(current, token)) {
+    for (const next of tokens) {
+        if (current.length > 0 && shouldBreakBefore(current, next)) {
             captions.push(captionFromTokens(current));
             current = [];
         }
-        current.push(token);
+        current.push(next);
     }
 
     if (current.length > 0) {

@@ -5,6 +5,20 @@ export interface TranscriptionSegment {
     start: number;
     end: number;
     text: string;
+    /**
+     * Who said it, e.g. "SPEAKER_00" — an OPAQUE label, produced by
+     * `speakerLabel` from a diarization turn's id.
+     *
+     * ABSENT, not empty, when diarization did not run, was cancelled, degraded,
+     * or found no turns at all. A segment without this key must render and
+     * serialize exactly as it did before diarization existed, which is why it is
+     * left off rather than set to `undefined` or `""`.
+     *
+     * A cue (`ConsolidatedSegment`) carrying this label is guaranteed to have
+     * exactly ONE speaker: `consolidateSegments` treats a speaker change as a
+     * hard break. See `shouldBreakBefore` and `canMerge` in `captionFormatter`.
+     */
+    speaker?: string;
 }
 
 export interface Job {

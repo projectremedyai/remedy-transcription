@@ -4,9 +4,14 @@ import {
     WordToken,
     cleanCaptionText,
     consolidateSegments,
+    hasRealWordTimings,
     normalizeWordTokens,
 } from "./captionFormatter";
-import type { TranscriptionSegment } from "../services/types";
+import type { SpeakerTurn } from "./speakerAlignment";
+import type {
+    DiarizationOutcome,
+    TranscriptionSegment,
+} from "../services/types";
 
 const flat = (segs: TranscriptionSegment[]) =>
     segs.map((s) => s.text.replace(/\n/g, " ")).join(" ");
@@ -819,5 +824,378 @@ describe("I3: one persisted row must re-derive as exactly ONE token", () => {
 
         expect(consolidateSegments(persisted)).toEqual(live);
         expect(flat(live)).toContain("Hello, world");
+    });
+});
+
+/**
+ * Two speakers, changing over at 2.5s. Used by every test below that needs turns.
+ */
+const TWO_SPEAKER_TURNS: SpeakerTurn[] = [
+    { start: 0.0, end: 2.5, speaker: 0 },
+    { start: 2.5, end: 4.0, speaker: 1 },
+];
+
+/** Whisper marks a word boundary with a LEADING SPACE. Real input has them. */
+const spacedWords = (words: Array<[string, number, number]>): WordToken[] =>
+    words.map(([text, start, end]) => ({ text: ` ${text}`, start, end }));
+
+describe("a cue must never span two speakers", () => {
+    it("never emits a cue spanning two speakers", () => {
+        const segments: TranscriptionSegment[] = [
+            {
+                start: 0.0,
+                end: 2.0,
+                text: "hello there how are you",
+                speaker: "SPEAKER_00",
+            },
+            {
+                start: 2.0,
+                end: 4.0,
+                text: "i am doing very well thanks",
+                speaker: "SPEAKER_01",
+            },
+        ];
+
+        const cues = consolidateSegments(segments);
+        for (const cue of cues) {
+            expect(cue.speaker).toBeDefined();
+        }
+        expect(new Set(cues.map((c) => c.speaker)).size).toBe(2);
+
+        // The property itself, stated directly: no cue's text mixes the two
+        // speakers' words.
+        const first = cues.filter((c) => c.speaker === "SPEAKER_00");
+        const second = cues.filter((c) => c.speaker === "SPEAKER_01");
+        expect(flat(first)).not.toMatch(/thanks/);
+        expect(flat(second)).not.toMatch(/hello/i);
+    });
+
+    it("breaks on speaker change even when under the char and duration limits", () => {
+        // Two tiny adjacent cues that every other rule wants to merge: 6 chars
+        // against MAX_CAPTION_CHARS=78, 1.0s against MAX_CAPTION_DURATION=6.5,
+        // and both are runts under MIN_CAPTION_WORDS=3 and MIN_CAPTION_DURATION,
+        // so `mergeShortCaptions` would glue them into one cue. The speaker
+        // change outranks all of it.
+        const segments: TranscriptionSegment[] = [
+            { start: 0.0, end: 0.5, text: "yes", speaker: "SPEAKER_00" },
+            { start: 0.5, end: 1.0, text: "no", speaker: "SPEAKER_01" },
+        ];
+
+        const cues = consolidateSegments(segments);
+        expect(cues.length).toBe(2);
+        expect(cues[0].speaker).toBe("SPEAKER_00");
+        expect(cues[1].speaker).toBe("SPEAKER_01");
+
+        // Lowercase "no", deliberately unchanged: `normalizeCaptionStarts`
+        // capitalizes a cue only after one that ENDS A SENTENCE, and "Yes" does
+        // not. A speaker change is a hard break in TIME, not a claim that the
+        // previous speaker finished their sentence — they were interrupted. The
+        // rule is untouched by this task.
+        expect(cues[0].text).toBe("Yes");
+        expect(cues[1].text).toBe("no.");
+    });
+
+    it("merges two runts that DO share a speaker (the merge rule still works)", () => {
+        // The control for the test above: identical input but ONE speaker. If this
+        // also came back as two cues, the test above would prove nothing.
+        const segments: TranscriptionSegment[] = [
+            { start: 0.0, end: 0.5, text: "yes", speaker: "SPEAKER_00" },
+            { start: 0.5, end: 1.0, text: "no", speaker: "SPEAKER_00" },
+        ];
+
+        expect(consolidateSegments(segments).length).toBe(1);
+    });
+});
+
+describe("speaker alignment granularity is detected, not assumed", () => {
+    /**
+     * A fresh transcript: the model's REAL word times, and a turn boundary that
+     * falls INSIDE what would otherwise be a single cue.
+     */
+    const WORDS: WordToken[] = spacedWords([
+        ["so", 0.0, 0.5],
+        ["what", 0.5, 1.0],
+        ["do", 1.0, 1.5],
+        ["you", 1.5, 2.0],
+        ["think", 2.0, 2.5],
+        ["it", 2.5, 3.0],
+        ["is", 3.0, 3.4],
+        ["totally", 3.4, 3.7],
+        ["fine", 3.7, 4.0],
+    ]);
+
+    it("without turns, all nine words are ONE cue (the baseline this splits)", () => {
+        const cues = consolidateSegments([], WORDS);
+        expect(cues.length).toBe(1);
+        expect(cues[0].speaker).toBeUndefined();
+    });
+
+    it("aligns REAL word times at word granularity, cutting the cue at the turn", () => {
+        const cues = consolidateSegments([], WORDS, TWO_SPEAKER_TURNS);
+
+        expect(cues.map((c) => c.speaker)).toEqual([
+            "SPEAKER_00",
+            "SPEAKER_01",
+        ]);
+        // The cut lands exactly on the turn boundary, because the word times are
+        // measured: "think" ends at 2.5 and "it" opens the next turn.
+        expect(cues[0].end).toBe(2.5);
+        expect(cues[1].start).toBe(2.5);
+        expect(flat([cues[0]])).toBe("So what do you think");
+    });
+
+    /**
+     * The legacy shape: ONE sentence-granular row. Its own start and end are real,
+     * but the word times inside it are fabricated by character-length
+     * interpolation and are off by up to 1.3s. Aligning turns against THOSE is the
+     * confidently-wrong labelling this detection exists to prevent, so the whole
+     * SEGMENT is aligned instead and its speaker stamped on every word.
+     */
+    const LEGACY_SEGMENT: TranscriptionSegment[] = [
+        {
+            start: 0.0,
+            end: 4.0,
+            text: "one two three four five six seven eight",
+        },
+    ];
+
+    /**
+     * The SAME text and the SAME (interpolated) times, but persisted one word per
+     * row — which is what `segmentsForPersistence` writes and therefore what a
+     * post-rename transcript looks like on reload. Byte-for-byte the same instants
+     * as the fabrication above; the only difference is that here they are the
+     * model's own, so they may be trusted.
+     */
+    const WORD_GRANULAR_ROWS: TranscriptionSegment[] = [
+        { start: 0.0, end: 0.375, text: "one" },
+        { start: 0.375, end: 0.75, text: "two" },
+        { start: 0.75, end: 1.375, text: "three" },
+        { start: 1.375, end: 1.875, text: "four" },
+        { start: 1.875, end: 2.375, text: "five" },
+        { start: 2.375, end: 2.75, text: "six" },
+        { start: 2.75, end: 3.375, text: "seven" },
+        { start: 3.375, end: 4.0, text: "eight" },
+    ];
+
+    it("aligns a LEGACY sentence-granular transcript at SEGMENT granularity", () => {
+        const cues = consolidateSegments(
+            LEGACY_SEGMENT,
+            undefined,
+            TWO_SPEAKER_TURNS,
+        );
+
+        // The segment (0.0-4.0) overlaps speaker 0 for 2.5s and speaker 1 for
+        // 1.5s, so the whole of it is speaker 0. Coarse — and TRUE, which the
+        // alternative is not.
+        expect(new Set(cues.map((c) => c.speaker))).toEqual(
+            new Set(["SPEAKER_00"]),
+        );
+        expect(flat(cues)).toBe("One two three four five six seven eight.");
+    });
+
+    it("would have labelled that legacy transcript DIFFERENTLY at word granularity — which is the point", () => {
+        // Identical instants, identical text. The ONLY difference is that these
+        // times are the model's own, so word alignment is legitimate here and the
+        // turn boundary at 2.5s falls inside the word "six" (2.375-2.75).
+        const cues = consolidateSegments(
+            WORD_GRANULAR_ROWS,
+            undefined,
+            TWO_SPEAKER_TURNS,
+        );
+
+        expect(cues.map((c) => c.speaker)).toEqual([
+            "SPEAKER_00",
+            "SPEAKER_01",
+        ]);
+        // Lowercase: the cue before it does not end a sentence, so
+        // `normalizeCaptionStarts` leaves it alone. See the note above.
+        expect(flat([cues[1]])).toBe("six seven eight.");
+
+        // And that is a DIFFERENT answer from the one the legacy row got above.
+        // If the detection were dropped and everything aligned at word
+        // granularity, a legacy transcript would get this labelling — built on
+        // times nobody measured.
+        const legacy = consolidateSegments(
+            LEGACY_SEGMENT,
+            undefined,
+            TWO_SPEAKER_TURNS,
+        );
+        expect(new Set(cues.map((c) => c.speaker)).size).toBe(2);
+        expect(new Set(legacy.map((c) => c.speaker)).size).toBe(1);
+    });
+
+    it("tells a legacy Chinese sentence from a word-granular Chinese row", () => {
+        // The trap a whitespace word count falls into: a Chinese sentence has NO
+        // SPACES, so `split(" ")` reports ONE word and declares an entire legacy
+        // CJK transcript word-granular — then hangs speaker labels off
+        // per-character times nobody measured.
+        //
+        // This is asserted on the PREDICATE, not on the cues, and deliberately.
+        // Today the cues come out the same either way, because `tokensFromSegments`
+        // is blind to CJK in the same way (`splitWords` splits on spaces, so the
+        // whole sentence is one token spanning the segment, and aligning that token
+        // IS aligning the segment). Asserting on the cues would therefore pass with
+        // the bug in place — it would test nothing. The predicate is what has to be
+        // right, and this is what pins it.
+        expect(
+            hasRealWordTimings([
+                { start: 0.0, end: 4.0, text: "光合作用是植物利用光能的过程" },
+            ]),
+        ).toBe(false);
+
+        // One CJK character per row — what `segmentsForPersistence` writes, since
+        // `normalizeWordTokens` gives every CJK character its own token.
+        expect(
+            hasRealWordTimings([
+                { start: 0.0, end: 0.3, text: "光" },
+                { start: 0.3, end: 0.6, text: "合" },
+            ]),
+        ).toBe(true);
+    });
+
+    it("tells an English sentence row from an English word row", () => {
+        expect(
+            hasRealWordTimings([
+                { start: 0.0, end: 4.0, text: "one two three four" },
+            ]),
+        ).toBe(false);
+        expect(hasRealWordTimings(WORD_GRANULAR_ROWS)).toBe(true);
+        expect(hasRealWordTimings(LEGACY_SEGMENT)).toBe(false);
+
+        // No segments at all is not a claim that their (nonexistent) times are
+        // real. The live path supplies `words` and never consults this.
+        expect(hasRealWordTimings([])).toBe(false);
+    });
+});
+
+/**
+ * Hands back the WHOLE union, which is what `await api.diarizeJob(...)` gives a
+ * caller. An annotated `const` literal would be narrowed to its own arm by
+ * control-flow analysis, quietly testing something easier.
+ */
+const outcome = (o: DiarizationOutcome): DiarizationOutcome => o;
+
+describe("diarization is optional, and its absence is not a failure", () => {
+    it("renders an undiarized transcript exactly as it did before speakers existed", () => {
+        const withoutTurns = consolidateSegments(WHISPER_WINDOW_SEGMENTS);
+
+        // Not `speaker: undefined` — the key is ABSENT, so a persisted row is
+        // byte-identical to one written before diarization existed.
+        for (const cue of withoutTurns) {
+            expect("speaker" in cue).toBe(false);
+        }
+        expect(withoutTurns.length).toBeGreaterThan(1);
+    });
+
+    it("treats a REAL zero-speaker success (silence) as 'no labels', identically to no diarization at all", () => {
+        // `succeeded { turns: [] }` is a MEASURED answer: the engine ran and heard
+        // nobody. It must render as today's transcript — not as an error.
+        const silence = outcome({
+            status: "succeeded",
+            turns: [],
+            speaker_count: 0,
+        });
+        if (silence.status !== "succeeded") throw new Error("unreachable");
+
+        expect(
+            consolidateSegments(
+                WHISPER_WINDOW_SEGMENTS,
+                undefined,
+                silence.turns,
+            ),
+        ).toEqual(consolidateSegments(WHISPER_WINDOW_SEGMENTS));
+    });
+
+    it("cannot be handed a DEGRADED outcome at all — a crash cannot be laundered into silence here", () => {
+        // Built through a function, not an annotated literal: an annotated literal
+        // is narrowed to its own arm by control-flow analysis, which would test
+        // something easier than the union a caller actually holds.
+        const broken = outcome({
+            status: "degraded",
+            reason: "the diarization sidecar was killed by signal 6 (SIGABRT)",
+        });
+
+        // @ts-expect-error `turns` is not on the degraded arm. THIS is the line
+        // that would render a crashed engine as "0 speakers found", and `tsc`
+        // fails here if it ever starts compiling. `consolidateSegments` takes
+        // `SpeakerTurn[]`, never a `DiarizationOutcome`, precisely so that the
+        // only way to reach it is to narrow — which forces the degraded arm to be
+        // handled, which means the reason gets shown.
+        const smuggled = broken.turns ?? [];
+        expect(smuggled).toEqual([]);
+
+        if (broken.status === "succeeded") {
+            throw new Error("narrowed to the wrong arm");
+        }
+        // The reason survives, and it is what the user has to see. It is NOT the
+        // empty turn list a zero-speaker success hands over — the two are
+        // different values of different shapes, and stay that way.
+        expect(broken.status).toBe("degraded");
+        if (broken.status !== "degraded") throw new Error("unreachable");
+        expect(broken.reason).toContain("SIGABRT");
+    });
+});
+
+describe("speaker survives the parts of the formatter that rebuild a cue", () => {
+    it("keeps the speaker on a cue that mergeShortCaptions actually merged", () => {
+        // This has to reach `mergeShortCaptions`, which means the token loop must
+        // first emit TWO captions and the second must be a runt. So cue 1 ends a
+        // sentence with 3 words over 1.5s (`shouldBreakBefore` breaks after it),
+        // and cue 2 is one word — a runt by both tests, glued back on by the merge.
+        // Two same-speaker segments that never break in the first place would prove
+        // nothing here: the speaker would come from `captionFromTokens`, and the
+        // merge path — which rebuilds the cue from scratch and can silently drop
+        // the field — would never run.
+        const segments: TranscriptionSegment[] = [
+            {
+                start: 0.0,
+                end: 1.5,
+                text: "Hello there friend.",
+                speaker: "SPEAKER_00",
+            },
+            { start: 1.5, end: 1.8, text: "yes", speaker: "SPEAKER_00" },
+        ];
+
+        const cues = consolidateSegments(segments);
+        expect(cues.length).toBe(1);
+        // "yes" stays lowercase: `normalizeCaptionStarts` capitalizes only a cue's
+        // FIRST letter, and the merge happens before it. Pre-existing, cosmetic,
+        // and untouched here — the assertion that matters is the speaker below.
+        expect(flat(cues)).toBe("Hello there friend. yes.");
+        expect(cues[0].speaker).toBe("SPEAKER_00");
+    });
+
+    it("keeps the speaker on the final cue, which normalizeCaptionStarts rebuilds to terminate it", () => {
+        const segments: TranscriptionSegment[] = [
+            {
+                start: 0.0,
+                end: 2.0,
+                text: "no full stop at the end here",
+                speaker: "SPEAKER_01",
+            },
+        ];
+
+        const cues = consolidateSegments(segments);
+        expect(cues.at(-1)?.text.endsWith(".")).toBe(true);
+        expect(cues.at(-1)?.speaker).toBe("SPEAKER_01");
+    });
+
+    it("keeps a word's speaker through normalizeWordTokens' fold and split", () => {
+        const tokens = normalizeWordTokens([
+            { text: " Word", start: 0, end: 0.4, speaker: "SPEAKER_00" },
+            { text: "-level", start: 0.4, end: 0.6, speaker: "SPEAKER_00" },
+            {
+                text: " Hello,world",
+                start: 0.6,
+                end: 1.4,
+                speaker: "SPEAKER_01",
+            },
+        ]);
+
+        expect(tokens.map((t) => [t.text, t.speaker])).toEqual([
+            ["Word-level", "SPEAKER_00"],
+            ["Hello,", "SPEAKER_01"],
+            ["world", "SPEAKER_01"],
+        ]);
     });
 });

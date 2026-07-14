@@ -32,6 +32,19 @@ export interface SpeakerTurn {
 
 export type SpeakerTagged<T> = T & { speaker: number | null };
 
+/**
+ * Render a turn's speaker id as the label the transcript carries.
+ *
+ * The id is OPAQUE here, and deliberately so. Rust densifies the engine's sparse
+ * ids to `0..speaker_count` at the command boundary, but nothing downstream may
+ * lean on that: this must not index an array with it, count speakers from it, or
+ * assume it is small. It only renders it. Pass 7 and get "SPEAKER_07"; pass 120
+ * and get "SPEAKER_120".
+ */
+export function speakerLabel(speaker: number): string {
+    return `SPEAKER_${String(speaker).padStart(2, "0")}`;
+}
+
 function overlap(a: TimedToken, b: SpeakerTurn): number {
     return Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
 }

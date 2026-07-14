@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { assignSpeakers, type SpeakerTurn } from "./speakerAlignment";
+import {
+    assignSpeakers,
+    speakerLabel,
+    type SpeakerTurn,
+} from "./speakerAlignment";
 
 const TURNS: SpeakerTurn[] = [
     { start: 0.0, end: 5.0, speaker: 0 },
@@ -106,5 +110,21 @@ describe("assignSpeakers", () => {
             reversed,
         );
         expect(t2.speaker).toBe(1);
+    });
+});
+
+describe("speakerLabel", () => {
+    it("pads the common case to two digits", () => {
+        expect(speakerLabel(0)).toBe("SPEAKER_00");
+        expect(speakerLabel(7)).toBe("SPEAKER_07");
+        expect(speakerLabel(11)).toBe("SPEAKER_11");
+    });
+
+    it("treats the id as OPAQUE — it does not assume a dense 0..n-1 range", () => {
+        // Rust densifies the engine's sparse ids at the command boundary, but
+        // nothing downstream may re-derive that. This must not truncate, wrap, or
+        // index anything: it only renders whatever id it is handed.
+        expect(speakerLabel(120)).toBe("SPEAKER_120");
+        expect(speakerLabel(3)).not.toBe(speakerLabel(30));
     });
 });

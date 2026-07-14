@@ -209,6 +209,53 @@ describe("BUG 3: the final chunk must not be swallowed", () => {
     });
 });
 
+/**
+ * The Task 3 plan claimed `consolidateSegments` was self-idempotent, which is what
+ * made the export path's second consolidation "near-harmless". IT IS NOT, and the
+ * cost is real: display shows `consolidate(raw)` while the export used to write
+ * `consolidate(consolidate(raw))` — a different cut of the same words.
+ */
+describe("consolidateSegments is NOT idempotent", () => {
+    // Two clean, strictly sequential segments. No time overlap, no zero-duration
+    // chunk, no dedup — none of the degenerate cases. The non-idempotence is
+    // intrinsic to the timing math, not an artifact of bad input.
+    const CLEAN_SEQUENTIAL: TranscriptionSegment[] = [
+        { start: 0, end: 6.66, text: "photons which the energy stores." },
+        { start: 6.66, end: 10, text: "the sugar converts." },
+    ];
+
+    it("moves a word between cues on a second pass", () => {
+        const once = consolidateSegments(CLEAN_SEQUENTIAL);
+        const twice = consolidateSegments(once);
+
+        // Pass 1 breaks on duration: adding "stores." would push the cue past
+        // MAX_CAPTION_DURATION, so it starts a new cue before it.
+        expect(once.map((c) => c.text)).toEqual([
+            "Photons which the energy",
+            "stores. the sugar converts.",
+        ]);
+
+        // Pass 2 re-interpolates each word evenly across its CUE's span, losing the
+        // raw segment's word times. The duration rule no longer fires, so the
+        // sentence-end rule wins instead and "stores." lands in the first cue.
+        expect(twice.map((c) => c.text)).toEqual([
+            "Photons which the energy stores.",
+            "The sugar converts.",
+        ]);
+
+        expect(twice).not.toEqual(once);
+        // Not a rounding wobble: the cue boundary moves by ~1.46 SECONDS.
+        expect(Math.abs(twice[0].end - once[0].end)).toBeGreaterThan(1.4);
+    });
+
+    it("is stable on the realistic sliding-window fixture (which is why this went unnoticed)", () => {
+        // Idempotence DOES hold here. That is exactly why the double consolidation
+        // looked safe. It is a property of this fixture, not of the function.
+        const once = consolidateSegments(WHISPER_WINDOW_SEGMENTS);
+        expect(consolidateSegments(once)).toEqual(once);
+    });
+});
+
 describe("BUG 4: post-dedup cues must not start early", () => {
     // lib/captionFormatter.ts:79 offsets the start by (duration * overlap) / words.length,
     // assuming the stripped overlap words consumed time proportional to their COUNT.

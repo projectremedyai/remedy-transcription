@@ -184,7 +184,7 @@ function joinWords(tokens: WordToken[]): string {
     return cleanCaptionText(tokens.map((t) => t.text).join(" "));
 }
 
-function endsSentence(text: string): boolean {
+export function endsSentence(text: string): boolean {
     return SENTENCE_END_RE.test(text);
 }
 
@@ -392,6 +392,22 @@ function wrapCaptionText(text: string): string {
     return candidates[0].joined;
 }
 
+/**
+ * Turn RAW model segments into display/export captions. This is the single
+ * formatting boundary: it must be called exactly ONCE, on raw segments, and its
+ * output fed unchanged to both the screen and the exporters.
+ *
+ * It is deliberately NOT idempotent, and cannot cheaply be made so. Word times
+ * inside a cue are interpolated from the raw segment that produced them; once
+ * cues exist, that provenance is gone, and a second pass re-interpolates each
+ * word evenly across its cue's span instead. Different word times mean
+ * `shouldBreakBefore` cuts in different places, so words migrate between cues.
+ * `captionFormatter.test.ts` pins a two-segment counterexample where a second
+ * pass moves a word to the previous cue and shifts the boundary by 1.46s.
+ *
+ * Consequence: never call this on its own output. `lib/srtGenerator.ts` is a set
+ * of pure serializers precisely so that the export path cannot re-format.
+ */
 export function consolidateSegments(
     segments: TranscriptionSegment[],
 ): TranscriptionSegment[] {
@@ -416,22 +432,4 @@ export function consolidateSegments(
     }
 
     return normalizeCaptionStarts(mergeShortCaptions(captions));
-}
-
-export function formatPlainText(segments: TranscriptionSegment[]): string {
-    let text = joinWords(tokensFromSegments(segments));
-    if (!text) {
-        return "";
-    }
-
-    text = text.replace(
-        /(^|[.!?]\s+)([a-z])/g,
-        (_, prefix: string, letter: string) =>
-            `${prefix}${letter.toUpperCase()}`,
-    );
-
-    if (!endsSentence(text)) {
-        text = `${text}.`;
-    }
-    return text;
 }

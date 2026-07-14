@@ -1,5 +1,20 @@
 import { TranscriptionSegment } from "../services/types";
-import { consolidateSegments, formatPlainText } from "./captionFormatter";
+import { cleanCaptionText, endsSentence } from "./captionFormatter";
+
+/**
+ * Serializers for already-consolidated captions.
+ *
+ * PRECONDITION: every function here takes the output of `consolidateSegments`.
+ * They are pure serializers — they format cues into SRT/VTT/TXT/JSON text and
+ * MUST NOT re-run the formatter.
+ *
+ * `consolidateSegments` is NOT idempotent (see captionFormatter.test.ts):
+ * consolidating a second time re-interpolates word times inside each cue's span,
+ * which moves the caption break points and can shift words from one cue to the
+ * next. Calling it here as well as on the display path would therefore export
+ * captions that do not match the transcript on screen. Consolidation happens
+ * exactly once, when raw model segments are read (`useTranscriber`).
+ */
 
 function formatTimestamp(seconds: number, separator: "," | "." = ","): string {
     const hours = Math.floor(seconds / 3600);
@@ -19,52 +34,63 @@ function pad3(value: number): string {
     return value.toString().padStart(3, "0");
 }
 
-export function generateSrt(segments: TranscriptionSegment[]): string {
-    const consolidated = consolidateSegments(segments);
+function cueLines(
+    captions: TranscriptionSegment[],
+    separator: "," | ".",
+): string[] {
     const lines: string[] = [];
 
-    consolidated.forEach((segment, index) => {
+    captions.forEach((caption, index) => {
         lines.push(String(index + 1));
         lines.push(
-            `${formatTimestamp(segment.start)} --> ${formatTimestamp(
-                segment.end,
+            `${formatTimestamp(caption.start, separator)} --> ${formatTimestamp(
+                caption.end,
+                separator,
             )}`,
         );
-        lines.push(segment.text);
+        lines.push(caption.text);
         lines.push("");
     });
 
-    return lines.join("\n");
+    return lines;
 }
 
-export function generateVtt(segments: TranscriptionSegment[]): string {
-    const consolidated = consolidateSegments(segments);
-    const lines: string[] = ["WEBVTT", ""];
-
-    consolidated.forEach((segment, index) => {
-        lines.push(String(index + 1));
-        lines.push(
-            `${formatTimestamp(segment.start, ".")} --> ${formatTimestamp(
-                segment.end,
-                ".",
-            )}`,
-        );
-        lines.push(segment.text);
-        lines.push("");
-    });
-
-    return lines.join("\n");
+export function generateSrt(captions: TranscriptionSegment[]): string {
+    return cueLines(captions, ",").join("\n");
 }
 
-export function generateTxt(segments: TranscriptionSegment[]): string {
-    return formatPlainText(segments);
+export function generateVtt(captions: TranscriptionSegment[]): string {
+    return ["WEBVTT", "", ...cueLines(captions, ".")].join("\n");
 }
 
-export function generateJson(segments: TranscriptionSegment[]): string {
-    const consolidated = consolidateSegments(segments).map((s) => ({
-        start: s.start,
-        end: s.end,
-        text: s.text,
-    }));
-    return JSON.stringify(consolidated, null, 2);
+export function generateTxt(captions: TranscriptionSegment[]): string {
+    // Unwrap the two-line caption layout back into flowing prose. The cue text is
+    // already cleaned, deduped and sentence-cased by the formatter, so this only
+    // joins and fixes up sentence starts — a sentence can end mid-cue (the
+    // formatter does not split a cue that is too short to stand alone), so those
+    // starts were never capitalized.
+    const text = cleanCaptionText(captions.map((c) => c.text).join(" "));
+    if (!text) {
+        return "";
+    }
+
+    const capitalized = text.replace(
+        /(^|[.!?]\s+)([a-z])/g,
+        (_, prefix: string, letter: string) =>
+            `${prefix}${letter.toUpperCase()}`,
+    );
+
+    return endsSentence(capitalized) ? capitalized : `${capitalized}.`;
+}
+
+export function generateJson(captions: TranscriptionSegment[]): string {
+    return JSON.stringify(
+        captions.map((caption) => ({
+            start: caption.start,
+            end: caption.end,
+            text: caption.text,
+        })),
+        null,
+        2,
+    );
 }

@@ -40,6 +40,9 @@ jobs:
       - name: Lint frontend
         run: npm --prefix frontend run lint
 
+      - name: Frontend tests
+        run: npm --prefix frontend test
+
       - name: Fetch Tauri sidecars
         run: ./scripts/fetch-sidecars.sh
 

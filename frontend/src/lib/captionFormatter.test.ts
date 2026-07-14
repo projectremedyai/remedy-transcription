@@ -5,6 +5,46 @@ import type { TranscriptionSegment } from "../services/types";
 const flat = (segs: TranscriptionSegment[]) =>
     segs.map((s) => s.text.replace(/\n/g, " ")).join(" ");
 
+const findCue = (cues: TranscriptionSegment[], re: RegExp) =>
+    cues.find((c) => re.test(c.text.replace(/\n/g, " ")));
+
+/**
+ * Realistic Whisper sliding-window output (chunk_length_s=30 / stride_length_s=5).
+ * Timestamps are the TRUE word times of a synthetic lecture; the chunk boundaries
+ * re-emit 4, 2, 1 and 8 words respectively, exactly as Whisper does.
+ *
+ * Key facts used by the assertions below:
+ *   - seg1 ends at 6.11. Its last four words ("the light dependent reactions.")
+ *     are re-emitted as the head of seg2, so seg2's FIRST SURVIVING word ("I")
+ *     cannot legitimately begin before 6.11.
+ *   - seg3's head ("about energy.") is a 2-word overlap and seg4's head
+ *     ("photons.") is a 1-word overlap — neither is stripped by the current
+ *     `size > 2` dedup loop.
+ */
+const WHISPER_WINDOW_SEGMENTS: TranscriptionSegment[] = [
+    { start: 0.0, end: 2.46, text: "Welcome to the lecture on photosynthesis." },
+    { start: 2.81, end: 6.11, text: "Today we will cover the light dependent reactions." },
+    // 4-word overlap with seg1
+    { start: 4.16, end: 8.6, text: "the light dependent reactions. I want you to think about energy." },
+    // 2-word overlap with seg2 — NOT stripped (dedup loop stops at size > 2)
+    { start: 7.45, end: 11.55, text: "about energy. Chlorophyll absorbs photons." },
+    // 1-word overlap with seg3 — NOT stripped
+    { start: 10.6, end: 15.54, text: "photons. That energy is then converted into chemical bonds." },
+    // 8-word overlap with seg4
+    {
+        start: 11.9,
+        end: 19.39,
+        text: "That energy is then converted into chemical bonds. So a plant is really a solar powered factory.",
+    },
+];
+
+/** Whisper's final chunk carries a null end timestamp, which useTranscriber persists as `end := start`. */
+const ZERO_DURATION_FINAL: TranscriptionSegment = {
+    start: 19.74,
+    end: 19.74,
+    text: "Any questions before we move on?",
+};
+
 describe("BUG 1: chunk-boundary overlap dedup", () => {
     // lib/captionFormatter.ts:51 loops `for (let size = maxOverlap; size > 2; size--)`,
     // so 1- and 2-word overlaps are NEVER tested and survive into the output.
@@ -44,14 +84,25 @@ describe("BUG 1: chunk-boundary overlap dedup", () => {
     });
 
     it("never emits cues that overlap in time", () => {
-        const segs: TranscriptionSegment[] = [
-            { start: 0, end: 4, text: "one two three four five six seven golf hotel" },
-            { start: 3.5, end: 8, text: "golf hotel nine ten eleven twelve thirteen fourteen" },
-        ];
-        const cues = consolidateSegments(segs);
-        for (let i = 1; i < cues.length; i++) {
-            expect(cues[i].start).toBeGreaterThanOrEqual(cues[i - 1].end);
-        }
+        // A two-segment toy fixture does NOT surface this: it produces one cue per
+        // segment and they happen not to collide. It takes the real sliding-window
+        // pattern — where an un-stripped 1/2-word overlap makes a cue restart inside
+        // the span the previous cue already covered — to produce invalid SRT.
+        const cues = consolidateSegments(WHISPER_WINDOW_SEGMENTS);
+
+        const overlaps = cues
+            .slice(1)
+            .map((cue, i) => ({ cue, previous: cues[i] }))
+            .filter(({ cue, previous }) => cue.start < previous.end)
+            .map(
+                ({ cue, previous }) =>
+                    `cue starting ${cue.start} runs back into the previous cue, which ends at ${previous.end}`,
+            );
+
+        // Currently 4 collisions, e.g. cue 4 starts at 7.45 while cue 3 runs to 8.6:
+        // seg3's "about energy." duplicate survives dedup, so its cue re-opens at the
+        // duplicate's own (earlier) timestamp.
+        expect(overlaps).toEqual([]);
     });
 });
 
@@ -60,14 +111,23 @@ describe("BUG 3: the final chunk must not be swallowed", () => {
     // becomes 0.01s, which makes mergeShortCaptions glue the final sentence onto the
     // previous cue. The last seconds of every transcript end up uncaptioned.
 
-    it("emits a cue that covers a zero-duration final segment", () => {
-        const segs: TranscriptionSegment[] = [
-            { start: 0.0, end: 15.4, text: "a long opening statement that fills a cue nicely" },
-            { start: 19.74, end: 19.74, text: "any questions before we move on?" },
-        ];
-        const cues = consolidateSegments(segs);
-        const covering = cues.filter((c) => c.start <= 19.74 && c.end >= 19.74);
-        expect(covering.length).toBeGreaterThan(0);
+    it("gives the zero-duration final segment its own cue instead of gluing it onto earlier speech", () => {
+        // "A cue covers timestamp 19.74" is far too weak to detect the swallowing: the
+        // glued cue spans 15.425 -> 19.75 and therefore "covers" 19.74 while actually
+        // displaying the final sentence 4.3s early, on top of the previous sentence.
+        // The real invariant is that the final segment's words are timed to the final
+        // segment, not back-dated to whenever the previous cue happened to start.
+        const cues = consolidateSegments([
+            ...WHISPER_WINDOW_SEGMENTS,
+            ZERO_DURATION_FINAL,
+        ]);
+
+        const cue = findCue(cues, /questions/i);
+        expect(cue).toBeDefined();
+        // Currently 15.425 — mergeShortCaptions treats the 0.01s cue as "short" and
+        // absorbs it into "So a plant is really a solar powered factory."
+        expect(cue!.start).toBeGreaterThanOrEqual(ZERO_DURATION_FINAL.start - 0.5);
+        expect(cue!.text.replace(/\n/g, " ")).not.toMatch(/factory/i);
     });
 
     it("gives the final cue a non-zero duration", () => {
@@ -84,19 +144,22 @@ describe("BUG 4: post-dedup cues must not start early", () => {
     // lib/captionFormatter.ts:79 offsets the start by (duration * overlap) / words.length,
     // assuming the stripped overlap words consumed time proportional to their COUNT.
 
-    it("a cue never starts before its segment's own start time", () => {
-        const segs: TranscriptionSegment[] = [
-            { start: 0, end: 6, text: "one two three four five six foxtrot golf hotel" },
-            { start: 6, end: 12, text: "foxtrot golf hotel nine ten eleven twelve thirteen" },
-        ];
-        const cues = consolidateSegments(segs);
-        // No cue may begin before the first segment starts.
-        for (const cue of cues) {
-            expect(cue.start).toBeGreaterThanOrEqual(0);
-        }
-        // The cue carrying post-overlap words must not start before that segment did.
-        const post = cues.find((c) => /nine|ten|eleven/.test(c.text));
-        expect(post).toBeDefined();
-        expect(post!.start).toBeGreaterThanOrEqual(6 - 0.25); // small tolerance only
+    it("a cue whose overlap was stripped does not start before the words it duplicated were finished", () => {
+        // The overlap offset assumes the stripped words consumed time proportional to
+        // their COUNT (overlap / words.length) rather than to how long they actually
+        // took. Here seg2 = "the light dependent reactions. I want you to think about
+        // energy." (11 words) with a 4-word overlap over 4.44s, so the code starts the
+        // surviving text at 4.16 + (4.44 * 4) / 11 = 5.775.
+        //
+        // But those 4 duplicated words were ALREADY emitted by seg1, which ends at 6.11.
+        // So the first surviving word ("I") is placed 0.335s BEFORE the duplicate it is
+        // supposed to follow had even finished being spoken. This is a pure timing
+        // invariant — it needs no ground truth, and it holds for any correct offset.
+        const cues = consolidateSegments(WHISPER_WINDOW_SEGMENTS);
+
+        const overlappedSegment = WHISPER_WINDOW_SEGMENTS[1]; // ends 6.11
+        const postOverlapCue = findCue(cues, /want you to think/i);
+        expect(postOverlapCue).toBeDefined();
+        expect(postOverlapCue!.start).toBeGreaterThanOrEqual(overlappedSegment.end);
     });
 });

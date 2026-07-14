@@ -219,17 +219,31 @@ impl CancelToken {
 
     /// Hand a freshly spawned child to the token.
     ///
-    /// Returns `Err(())` if [`Self::cancel`] already fired -- and kills the child
-    /// before doing so. This is the whole reason adoption happens under the same
-    /// lock `cancel()` takes: a cancellation that lands between the pre-spawn
-    /// check and here must still kill this child rather than sail past it and
-    /// leave an orphan burning a core.
-    fn adopt(&self, mut child: Child) -> std::result::Result<(), ()> {
+    /// Returns [`AdoptError::Cancelled`] if [`Self::cancel`] already fired -- and
+    /// kills the child before doing so. This is the whole reason adoption
+    /// happens under the same lock `cancel()` takes: a cancellation that lands
+    /// between the pre-spawn check and here must still kill this child rather
+    /// than sail past it and leave an orphan burning a core.
+    ///
+    /// Returns [`AdoptError::AlreadyOccupied`] if the slot already holds a live
+    /// child -- i.e. this token was handed to a second concurrent `diarize()`
+    /// call, in violation of "one token per run". `*slot = Some(child)` would
+    /// silently drop the *existing* `Child`, and `Drop for Child` on Unix
+    /// neither kills nor reaps it: that existing child would keep running,
+    /// orphaned, still burning a core, while this call's poll loop went on to
+    /// watch the *new* child instead. So the incoming child is killed here
+    /// instead -- refusing the adoption rather than evicting a live one.
+    fn adopt(&self, mut child: Child) -> std::result::Result<(), AdoptError> {
         let mut slot = lock(&self.0.child);
         if self.0.cancelled.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(());
+            return Err(AdoptError::Cancelled);
+        }
+        if slot.is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AdoptError::AlreadyOccupied);
         }
         *slot = Some(child);
         Ok(())
@@ -252,6 +266,18 @@ impl CancelToken {
     fn release(&self) {
         let _ = lock(&self.0.child).take();
     }
+}
+
+/// Why [`CancelToken::adopt`] refused the child.
+#[derive(Debug, PartialEq, Eq)]
+enum AdoptError {
+    /// [`CancelToken::cancel`] fired before this child could be adopted.
+    Cancelled,
+    /// The slot already held a live child -- this token is being shared by two
+    /// concurrent runs, which is exactly the misuse "one token per run" warns
+    /// against. The incoming child was killed rather than evicting the one
+    /// already there.
+    AlreadyOccupied,
 }
 
 /// A poisoned mutex here means a thread panicked while holding a `Child`. The
@@ -471,18 +497,25 @@ impl Diarizer for SidecarDiarizer {
         let mut stdout = child.stdout.take().expect("stdout was piped");
         let mut stderr = child.stderr.take().expect("stderr was piped");
         let (out_tx, out_rx) = mpsc::sync_channel::<String>(1);
-        let (err_tx, err_rx) = mpsc::sync_channel::<String>(1);
+        let (err_tx, err_rx) = mpsc::sync_channel::<(String, bool)>(1);
         std::thread::spawn(move || {
             let _ = out_tx.send(read_capped(&mut stdout, STDOUT_CAP));
         });
         std::thread::spawn(move || {
-            let _ = err_tx.send(read_capped(&mut stderr, STDERR_CAP));
+            let _ = err_tx.send(read_stderr(&mut stderr, STDERR_CAP));
         });
 
         // From here on the child belongs to the token: it is the only thing that
         // can kill it, and it is reachable from the cancel command.
-        if cancel.adopt(child).is_err() {
-            return Err(anyhow!(CANCELLED));
+        match cancel.adopt(child) {
+            Ok(()) => {}
+            Err(AdoptError::Cancelled) => return Err(anyhow!(CANCELLED)),
+            Err(AdoptError::AlreadyOccupied) => {
+                return Err(anyhow!(
+                    "this CancelToken is already running a diarization -- use one \
+                     CancelToken per diarize() call (see CancelToken's docs)"
+                ))
+            }
         }
 
         let deadline = Instant::now() + self.timeout;
@@ -514,14 +547,15 @@ impl Diarizer for SidecarDiarizer {
         // The child has exited, so both pipes are at EOF and the readers are
         // finishing. Bounded rather than joined outright -- see DRAIN_GRACE.
         // Missing stderr only costs us a less specific message, so it degrades
-        // to empty; missing stdout is the invariant actually breaking, and says so.
-        let stderr = err_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
+        // to empty (and un-panicked); missing stdout is the invariant actually
+        // breaking, and says so.
+        let (stderr, panicked) = err_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
 
         if !status.success() {
             // The SIGABRT case lands here, as a signal rather than an exit code.
             return Err(anyhow!(
                 "the diarization sidecar {}{}",
-                describe(&status, &stderr),
+                describe(&status, panicked),
                 match stderr.trim() {
                     "" => String::new(),
                     msg => format!(": {}", truncate(msg, 2000)),
@@ -561,17 +595,68 @@ fn read_capped<R: Read>(r: &mut R, cap: u64) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Read stderr like [`read_capped`] -- retaining at most `cap` bytes -- but also
+/// scan the *entire* stream, including the part thrown away past the cap, for
+/// [`SIDECAR_PANIC_MARKER`]. Returns `(retained stderr, marker was seen)`.
+///
+/// The panic hook writes the marker **last**, immediately before the process
+/// aborts. A plain `read_capped` keeps only the first `cap` bytes, so a sidecar
+/// that chatters past the cap and then panics would have its marker silently
+/// discarded along with the rest -- and [`describe`] would misattribute a real
+/// bug in the sidecar to "a corrupt or truncated ONNX model", which is exactly
+/// the misattribution the marker exists to prevent.
+///
+/// Scanning (rather than storing) the discarded tail keeps the memory bound
+/// `cap` exists for: this never buffers more than `cap` retained bytes plus a
+/// small sliding window (one marker-length's worth) used to catch the marker
+/// when it straddles a chunk boundary.
+fn read_stderr<R: Read>(r: &mut R, cap: u64) -> (String, bool) {
+    let marker = SIDECAR_PANIC_MARKER.as_bytes();
+    let overlap = marker.len().saturating_sub(1);
+    let cap = cap as usize;
+
+    let mut retained = Vec::new();
+    let mut found = false;
+    let mut window: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let chunk = &buf[..n];
+
+        if retained.len() < cap {
+            let take = (cap - retained.len()).min(chunk.len());
+            retained.extend_from_slice(&chunk[..take]);
+        }
+
+        if !found {
+            window.extend_from_slice(chunk);
+            found = window.windows(marker.len()).any(|w| w == marker);
+            if !found && window.len() > overlap {
+                let drop_to = window.len() - overlap;
+                window.drain(0..drop_to);
+            }
+        }
+    }
+
+    (String::from_utf8_lossy(&retained).into_owned(), found)
+}
+
 /// A signal is not an exit code, and conflating them is how a SIGABRT gets
 /// reported as a mysterious "exit code 134" (or, on some paths, as success).
 ///
-/// `stderr` is not decoration. The sidecar is `panic = "abort"`, so a plain Rust
-/// bug in it -- an indexing slip in `wav.rs`, say -- arrives here as the very
-/// same SIGABRT that a corrupt model produces. Blaming the model for that would
-/// be confidently wrong and would send the user off re-downloading a file that
-/// was fine. The marker is the only thing that tells the two apart.
-fn describe(status: &ExitStatus, stderr: &str) -> String {
-    let panicked = stderr.contains(SIDECAR_PANIC_MARKER);
-
+/// `panicked` is not decoration. The sidecar is `panic = "abort"`, so a plain
+/// Rust bug in it -- an indexing slip in `wav.rs`, say -- arrives here as the
+/// very same SIGABRT that a corrupt model produces. Blaming the model for that
+/// would be confidently wrong and would send the user off re-downloading a file
+/// that was fine. `panicked` -- whether [`SIDECAR_PANIC_MARKER`] was seen
+/// anywhere in the child's stderr, not just in the retained, capped prefix of
+/// it -- is the only thing that tells the two apart. See [`read_stderr`].
+fn describe(status: &ExitStatus, panicked: bool) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -990,7 +1075,16 @@ mod tests {
         // The finding this exists for: with the 30-minute default timeout and no
         // kill handle, a cancelled job left an ONNX child pinning a core for half
         // an hour while the app showed idle.
-        let (_dir, exe) = stub("sleep 300");
+        //
+        // `sleep 5`, not `sleep 300`: if cancel regressed, the stub would simply
+        // exit on its own at 5s -- well inside the real 30-minute deadline below
+        // -- and diarize() would return an ordinary "not the expected JSON" error
+        // from the empty stdout, not hang for half an hour. `sleep 5` catches
+        // that identical regression (no CANCELLED error by any path) in about 5
+        // seconds instead of 30 minutes, while the assertion below still proves
+        // the thing that matters: cancellation returns almost immediately, not
+        // after the stub's own sleep elapses.
+        let (_dir, exe) = stub("sleep 5");
         let cancel = CancelToken::new();
 
         let watcher = cancel.clone();
@@ -1001,8 +1095,8 @@ mod tests {
 
         let started = Instant::now();
         let err = SidecarDiarizer::new(exe, PathBuf::from("/s.onnx"), PathBuf::from("/e.onnx"))
-            // The real default. If cancel did not work, this test would take 30
-            // minutes -- which is precisely the bug.
+            // Keep the real DEFAULT_TIMEOUT (30 min) here -- that part of the
+            // test is right, and is what proves cancel doesn't just wait it out.
             .diarize(Path::new("/a.wav"), &DiarizeOptions::default(), &cancel)
             .expect_err("a cancelled run is not a success");
 
@@ -1013,6 +1107,62 @@ mod tests {
             started.elapsed()
         );
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn adopt_kills_the_incoming_child_rather_than_evicting_the_live_one() {
+        // The finding this exists for: `*slot = Some(child)` with the slot
+        // already occupied used to silently drop the existing live `Child`.
+        // `Drop for Child` on Unix neither kills nor reaps, so that child would
+        // be orphaned -- still running ONNX, still burning a core, never
+        // waited -- while this run's poll loop went on to watch the *new*
+        // child instead. Two concurrent `diarize()` calls sharing one token is
+        // exactly the reachable misuse: `CancelToken` is `Clone + Send + Sync`
+        // and is meant to live in a job map.
+        let cancel = CancelToken::new();
+
+        let (_dir1, exe1) = stub("sleep 5");
+        let child1 = Command::new(&exe1)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        cancel.adopt(child1).expect("the first adoption must succeed");
+
+        let (_dir2, exe2) = stub("sleep 5");
+        let child2 = Command::new(&exe2)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid2 = child2.id();
+        let err = cancel
+            .adopt(child2)
+            .expect_err("a second live child must be refused, not silently evicted");
+        assert_eq!(err, AdoptError::AlreadyOccupied);
+
+        // The first child must still be the adopted one: poll() reports
+        // "still running", not "gone" the way an evicted slot would look.
+        assert!(
+            matches!(cancel.poll(), Some(Ok(None))),
+            "the first child should still be adopted and running"
+        );
+
+        // The second (incoming, refused) child must have been killed, not left
+        // running as an orphan.
+        std::thread::sleep(Duration::from_millis(200));
+        let still_alive = Command::new("kill")
+            .args(["-0", &pid2.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !still_alive,
+            "the refused child must be killed rather than orphaned, pid {pid2}"
+        );
+
+        // Clean up the still-running first child.
+        cancel.kill_adopted();
     }
 
     #[test]
@@ -1110,6 +1260,39 @@ mod tests {
         assert!(
             !msg.contains("corrupt or truncated ONNX model"),
             "must NOT blame the model when the sidecar said it panicked: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_panic_marker_past_the_stderr_cap_still_blames_the_sidecar_not_the_model() {
+        // The finding this exists for: read_capped kept only the *first*
+        // STDERR_CAP (64 KiB) bytes and discarded the rest, but the panic hook
+        // writes the marker *last*, immediately before the abort. So a sidecar
+        // that chatters past the cap and then panics used to lose its own
+        // marker and get misattributed to "a corrupt or truncated ONNX model"
+        // -- the exact misattribution the marker exists to prevent.
+        //
+        // ~130 KB of chatter, comfortably past the 64 KiB cap (matching the
+        // scale of the existing "chatters a lot" test), with the marker
+        // appended only at the very end, just like the real panic hook does.
+        let err = run_stub(&format!(
+            "i=0; while [ $i -lt 3000 ]; do \
+               echo 'ONNX Runtime is very chatty, over and over and over again' >&2; \
+               i=$((i+1)); done; \
+             echo '{SIDECAR_PANIC_MARKER}: index out of bounds at wav.rs:51' >&2; \
+             kill -ABRT $$"
+        ))
+        .expect_err("a panic is not a success");
+
+        let msg = err.to_string();
+        assert!(msg.contains("signal 6"), "still names the signal: {msg}");
+        assert!(
+            msg.contains("BUG IN THE SIDECAR"),
+            "the marker landed past the cap, but must still be found: {msg}"
+        );
+        assert!(
+            !msg.contains("corrupt or truncated ONNX model"),
+            "must NOT blame the model when the sidecar panicked, even past the cap: {msg}"
         );
     }
 

@@ -45,7 +45,13 @@ jobs:
 
       # --skip-models: the 34 MB of diarization models are only touched by the
       # #[ignore]d real-model tests, and CI does not pass --ignored. Downloading
-      # them here was 34 MB per run for nothing.
+      # them here would be 34 MB per run for nothing.
+      #
+      # This is only safe because src-tauri/build.rs makes a missing models/
+      # directory a cargo:warning rather than a build failure. tauri-build
+      # validates bundle.resources during `cargo check` exactly as it validates
+      # externalBin, so a per-file resource map here would fail EVERY job below
+      # on a fresh clone, with an opaque `resource path ... doesn't exist`.
       - name: Fetch Tauri sidecars
         run: ./scripts/fetch-sidecars.sh --skip-models
 

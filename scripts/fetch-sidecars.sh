@@ -162,9 +162,40 @@ fetch_models() {
     rm -rf "$MODELS_TMP"
     MODELS_TMP=""
 
+    prune_seg_extras
+
     echo
     echo "Diarization models in place:"
     ls -la "$MODELS" "$MODELS/sherpa-onnx-pyannote-segmentation-3-0"
+}
+
+# WHAT IS IN models/diarization IS WHAT SHIPS.
+#
+# `tauri.conf.json` bundles the DIRECTORY (`"../models/diarization"`), not a
+# hand-listed file map -- that is what lets a checkout with no models still
+# `cargo check` (see src-tauri/build.rs). The cost of a directory resource is
+# that it is not selective: every file in here is copied into the .app.
+#
+# The segmentation tarball unpacks with an unused 1.5 MB int8 model, a README and
+# eight Python export/demo scripts alongside the model.onnx the engine actually
+# loads. None of them belong in a shipped bundle. So the directory is pruned to
+# exactly what the app opens (model.onnx) plus what redistribution requires
+# (LICENSE).
+#
+# Unconditional, not part of the download branch: it also cleans up trees that
+# were populated by the older script, which left all of it in place.
+prune_seg_extras() {
+    local seg_dir="$MODELS/sherpa-onnx-pyannote-segmentation-3-0" entry name
+    [[ -d "$seg_dir" ]] || return 0
+
+    for entry in "$seg_dir"/* "$seg_dir"/.??*; do
+        [[ -e "$entry" ]] || continue
+        name="$(basename "$entry")"
+        case "$name" in
+            model.onnx|LICENSE) ;;
+            *) rm -rf "$entry" ;;
+        esac
+    done
 }
 
 if [[ "$WANT_BINARIES" -eq 0 ]]; then
@@ -207,15 +238,29 @@ esac
 
 BIN_TMP="$(mktemp -d)"
 
-# `u+w` and not just `+x`: the macOS ffmpeg/ffprobe zips unpack as mode 555, and
-# `tauri build` runs `xattr -cr` over the finished .app to strip quarantine
-# attributes. Clearing an extended attribute needs WRITE permission on the file
-# -- even for its owner -- so a read-only sidecar makes the bundler fail with a
-# bare "failed to run xattr" that names no file and no reason. Belongs here, on
-# the way in, rather than on three copies of it later.
+# An ABSOLUTE mode, not a `+`/`u+` adjustment. Two different bugs meet here, and
+# only 755 fixes both:
+#
+#   - The WRITE bit, and not just execute: the macOS ffmpeg/ffprobe zips unpack as
+#     mode 555, and `tauri build` runs `xattr -crs` over the finished .app to strip
+#     quarantine attributes. Clearing an extended attribute needs WRITE permission
+#     on the file -- even for its owner -- so a read-only sidecar makes the bundler
+#     fail with a bare "failed to run xattr" that names no file and no reason.
+#
+#   - GROUP and OTHER execute, and not just the owner's: `curl -o` creates a fresh
+#     file 644, so a `chmod u+wx` on a freshly downloaded yt-dlp yields 744 --
+#     -rwxr--r--, executable by its OWNER ALONE. Tauri's `fs::copy` preserves that
+#     mode into Contents/MacOS/yt-dlp, so a release .app would ship a yt-dlp that
+#     nobody but the building user can run: every admin-installed, MDM-deployed or
+#     otherwise multi-user install fails YouTube ingest with EACCES.
+#
+#     This one hid because `curl -o` over an EXISTING file keeps the old mode. Any
+#     tree that already had 755 binaries kept them, so the bug was invisible to
+#     every build that did not start from a genuinely empty src-tauri/binaries/.
+#     If you touch these lines, verify with `rm -rf src-tauri/binaries` first.
 echo "Fetching yt-dlp -> $DEST/yt-dlp-${TRIPLE}${ext}"
 curl -fsSL --output "$DEST/yt-dlp-${TRIPLE}${ext}" "$ytdlp_url"
-chmod u+wx "$DEST/yt-dlp-${TRIPLE}${ext}"
+chmod 755 "$DEST/yt-dlp-${TRIPLE}${ext}"
 
 if [[ -n "$ffmpeg_url" ]]; then
     echo "Fetching ffmpeg -> $DEST/ffmpeg-${TRIPLE}${ext}"
@@ -226,7 +271,7 @@ if [[ -n "$ffmpeg_url" ]]; then
     else
         curl -fsSL -o "$DEST/ffmpeg-${TRIPLE}${ext}" "$ffmpeg_url"
     fi
-    chmod u+wx "$DEST/ffmpeg-${TRIPLE}${ext}"
+    chmod 755 "$DEST/ffmpeg-${TRIPLE}${ext}"
 fi
 
 if [[ -n "$ffprobe_url" ]]; then
@@ -238,7 +283,7 @@ if [[ -n "$ffprobe_url" ]]; then
     else
         curl -fsSL -o "$DEST/ffprobe-${TRIPLE}${ext}" "$ffprobe_url"
     fi
-    chmod u+wx "$DEST/ffprobe-${TRIPLE}${ext}"
+    chmod 755 "$DEST/ffprobe-${TRIPLE}${ext}"
 fi
 
 echo

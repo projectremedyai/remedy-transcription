@@ -10,6 +10,7 @@ import {
     generateVtt,
 } from "../lib/srtGenerator";
 import {
+    DiarizationOutcome,
     FileJobRequest,
     HealthResponse,
     Job,
@@ -20,6 +21,7 @@ import {
 } from "./types";
 
 export type {
+    DiarizationOutcome,
     FileJobRequest,
     HealthResponse,
     Job,
@@ -116,6 +118,33 @@ class TauriApiClient {
             jobId,
         });
         return convertFileSrc(path);
+    }
+
+    /**
+     * Speaker turns for a job's already-prepared audio.
+     *
+     * **Returns an outcome, not a list.** Read the `status` — see
+     * {@link DiarizationOutcome}. There is no `turns` to reach for until you have
+     * narrowed to `"succeeded"`, and that is deliberate: a `"degraded"` result is
+     * a broken engine, and rendering it as an empty turn list would show the user
+     * "0 speakers" for a crash.
+     *
+     * This method rejects only when the REQUEST was wrong (unknown job, no
+     * prepared audio, an impossible `numSpeakers`). Every engine failure —
+     * missing model, dead sidecar, timeout — resolves as `"degraded"` instead,
+     * because no failure of diarization is worth failing a transcript over.
+     *
+     * `numSpeakers` is a HINT: asking for 4 can still return 3, and omitting it
+     * auto-detects.
+     */
+    async diarizeJob(
+        jobId: string,
+        numSpeakers?: number,
+    ): Promise<DiarizationOutcome> {
+        return invoke<DiarizationOutcome>("diarize_job", {
+            jobId,
+            numSpeakers: numSpeakers ?? null,
+        });
     }
 
     /**

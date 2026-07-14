@@ -1,4 +1,5 @@
 import { TaskMode } from "../config/transcription";
+import type { SpeakerTurn } from "../lib/speakerAlignment";
 
 export interface TranscriptionSegment {
     start: number;
@@ -79,3 +80,54 @@ export interface ModelStatusResponse {
     missing_models: string[];
     items: ModelStatusItem[];
 }
+
+/**
+ * What `diarize_job` produced. **Three outcomes, not two — and the type is the
+ * only thing that keeps the third one visible.**
+ *
+ * A transcript with no speaker labels *because the engine crashed* must never be
+ * indistinguishable from a transcript with no speaker labels *because one person
+ * was talking*. `SpeakerTurn[]` cannot tell those apart — both are "nothing to
+ * draw" — so a failure would arrive in the UI as a confident, silent, wrong
+ * answer: "0 speakers", rendered as if it were the truth.
+ *
+ * Rust already refuses to serialize them the same way (`#[serde(tag = "status")]`,
+ * and a `degraded` payload carries **no `turns` key at all**). This union is the
+ * other half of that guard rail, and the half that actually binds a caller:
+ *
+ * ```ts
+ * outcome.turns ?? []          // ✗ does not compile — `turns` is not on every arm
+ * if (outcome.status === "succeeded") outcome.turns   // ✓ the only way in
+ * ```
+ *
+ * So a degradation cannot be read as zero speakers by accident. It has to be
+ * handled — which means shown. That is the point.
+ *
+ * `cancelled` is separate from `degraded` for the same reason at one remove:
+ * telling users "speaker detection failed" for something they themselves stopped
+ * is a lie in the other direction.
+ */
+export type DiarizationOutcome =
+    | {
+          status: "succeeded";
+          /**
+           * MAY BE EMPTY, and that is a real success: silence has no speaker
+           * turns. Do not treat `[]` as a failure, and do not divide by
+           * `speaker_count`.
+           *
+           * Speaker ids are DENSE (`0..speaker_count`) — Rust remaps the engine's
+           * sparse ids at the boundary, so `speaker` is a valid index.
+           */
+          turns: SpeakerTurn[];
+          speaker_count: number;
+      }
+    | {
+          status: "degraded";
+          /**
+           * User-facing, and already specific: it names the missing model, the
+           * signal that killed the sidecar, or the timeout. Show it. The
+           * transcript itself is completely unaffected.
+           */
+          reason: string;
+      }
+    | { status: "cancelled" };

@@ -51,9 +51,7 @@
       "binaries/diarize-sidecar"
     ],
     "resources": {
-      "../models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx": "models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
-      "../models/diarization/sherpa-onnx-pyannote-segmentation-3-0/LICENSE": "models/diarization/sherpa-onnx-pyannote-segmentation-3-0/LICENSE",
-      "../models/diarization/wespeaker_en_voxceleb_CAM++.onnx": "models/diarization/wespeaker_en_voxceleb_CAM++.onnx"
+      "../models/diarization": "models/diarization"
     },
     "macOS": {
       "minimumSystemVersion": "11.0",

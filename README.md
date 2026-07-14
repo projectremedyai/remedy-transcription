@@ -51,6 +51,24 @@ npm run dev
 > ```
 >
 > If you see that, you skipped step 2.
+>
+> **The models in step 1 are different: they are optional to BUILD, required to
+> get speaker labels.** `tauri-build` validates configured `bundle.resources` the
+> same way it validates `externalBin`, so listing the two `.onnx` files there
+> would make `cargo check` fail on any checkout without them — including CI, and
+> including a fresh clone. Instead the bundle takes the whole
+> `models/diarization` **directory**, and `src-tauri/build.rs` creates it if it is
+> absent. A build with no models therefore compiles, runs, and prints:
+>
+> ```
+> warning: speaker diarization models are missing (...). This build compiles and
+> runs, but diarization will report itself DEGRADED and produce no speaker labels.
+> Fix with: ./scripts/fetch-sidecars.sh --models-only
+> ```
+>
+> which is exactly what the app then does at runtime — `diarize_job` returns
+> `Degraded` and the transcript is untouched. That degradation is a real, reachable
+> path, not a theoretical one.
 
 ## Build an installer
 
@@ -77,6 +95,8 @@ npm --prefix frontend test
 
 # --skip-models: the diarization models are 34 MB and only the #[ignore]d
 # real-model tests touch them, so CI would be downloading them for nothing.
+# This is safe ONLY because a missing models/ directory is a warning, not a
+# build failure — see build.rs. It did not used to be.
 ./scripts/fetch-sidecars.sh --skip-models
 
 # --debug: CI never bundles, so it only needs the binary to exist (for
@@ -89,9 +109,11 @@ cargo test  --workspace --manifest-path src-tauri/Cargo.toml
 
 Both sidecar steps run in CI, not only during release packaging, because Tauri validates the configured `externalBin` entries during `cargo check` and `cargo test` — a missing sidecar fails the build before a single test runs.
 
+The models are the one bundled asset that `cargo check` tolerates being absent, and that is a deliberate, load-bearing exception rather than an accident: `build.rs` creates an empty `models/diarization` so `tauri-build` has a resource path to walk. If you ever move the models back to a per-file `bundle.resources` map (or a glob — an empty glob is a `GlobPathNotFound` error), CI breaks on a fresh clone and so does every `cargo check` without a 34 MB download.
+
 `--workspace` matters: `diarize-sidecar` is a separate workspace member, and the app's crash-isolation tests spawn the real binary. Without it, those tests have nothing to point at.
 
-Release jobs still need the models and a release-profile sidecar for the target being packaged. Windows ffmpeg/ffprobe setup remains manual, as the script notes.
+Release jobs must run `./scripts/fetch-sidecars.sh` **without** `--skip-models`: an installer built without them is a signed app with no speaker labels, and it will not tell you so at build time — only at runtime, as a degradation. Windows ffmpeg/ffprobe setup remains manual, as the script notes.
 
 ## Where your data lives
 

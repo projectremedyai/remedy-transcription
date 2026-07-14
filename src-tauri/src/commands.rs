@@ -10,9 +10,12 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_shell::process::CommandEvent;
 
+// `CANCELLED` is deliberately NOT imported here: cancellation is decided by
+// asking the `CancelToken`, never by matching the engine's error text (a
+// subprocess's stderr is not evidence about what the user did). The tests import
+// it, to prove an engine that prints those very words still degrades.
 use crate::diarize::{
     diarize_in_background, CancelToken, DiarizeOptions, Diarizer, SidecarDiarizer, SpeakerTurn,
-    CANCELLED,
 };
 use crate::events::HealthStatus;
 use crate::sidecar::spawn_sidecar;
@@ -1311,9 +1314,16 @@ fn densify(turns: Vec<SpeakerTurn>) -> (Vec<SpeakerTurn>, usize) {
 /// idle. Abandoning it is not enough, the way abandoning an ffmpeg is.
 pub type DiarizationRegistry = Mutex<HashMap<String, CancelToken>>;
 
-/// Removes the job's token on EVERY exit from `diarize_job`, including the early
-/// returns and a panic. A leaked entry would make the next diarization of that
-/// same job fail as "already running", forever.
+/// Removes the job's token on every `return` from `diarize_job`, including the
+/// early ones. A leaked entry would make the next diarization of that same job
+/// fail as "already running", forever.
+///
+/// NOT on a panic, and it is worth being exact about that rather than claiming a
+/// guarantee this build does not have: the release profile sets
+/// `panic = "abort"`, so an unwinding-drop never happens -- the process dies with
+/// the map in it. That is survivable precisely because there is no surviving
+/// process to see the stale entry; it is the ordinary returns that matter, and
+/// those are covered.
 struct Registered<'a> {
     registry: &'a DiarizationRegistry,
     job_id: String,
@@ -1359,16 +1369,26 @@ fn register<'a>(
     })
 }
 
+/// The kill handle for a running diarization, if there is one.
+///
+/// The clone is taken and the registry lock released immediately: `cancel()`
+/// kills and REAPS the child, which blocks, and the run's own `Drop` needs this
+/// same lock to deregister. Holding it across the kill would have the canceller
+/// and the cancellee waiting on each other.
+fn registered_token(registry: &DiarizationRegistry, job_id: &str) -> Option<CancelToken> {
+    lock_registry(registry).get(job_id).cloned()
+}
+
 /// Kill the sidecar for `job_id`, if one is running. Returns whether there was.
 ///
 /// A no-op for a job that is not diarizing -- Cancel is pressed far more often
 /// than diarization runs, and "you cancelled nothing" is not an error.
+///
+/// Synchronous, and therefore BLOCKING: see [`cancel_diarization`], which is what
+/// the IPC calls and which keeps this off the async workers.
 fn cancel_registered(registry: &DiarizationRegistry, job_id: &str) -> bool {
-    let token = lock_registry(registry).get(job_id).cloned();
-    match token {
+    match registered_token(registry, job_id) {
         Some(token) => {
-            // Not under the lock: `cancel()` kills and REAPS the child, which
-            // blocks, and the run's own `Drop` needs this lock to deregister.
             token.cancel();
             true
         }
@@ -1410,7 +1430,7 @@ async fn run_diarization(
     opts: DiarizeOptions,
     cancel: CancelToken,
 ) -> DiarizationOutcome {
-    match diarize_in_background(diarizer, wav_path, opts, cancel).await {
+    match diarize_in_background(diarizer, wav_path, opts, cancel.clone()).await {
         Ok(turns) => {
             // An empty list is a SUCCESS (silence has no speakers), so it goes
             // down this arm, with speaker_count 0 and no division by it.
@@ -1420,7 +1440,23 @@ async fn run_diarization(
                 speaker_count,
             }
         }
-        Err(e) if e.to_string().contains(CANCELLED) => DiarizationOutcome::Cancelled,
+        // ASK THE TOKEN, NEVER THE MESSAGE.
+        //
+        // This used to be `e.to_string().contains(CANCELLED)`, and that is a
+        // forgeable test: the sidecar's own stderr is interpolated verbatim into
+        // the non-zero-exit error, so a child that printed the words "diarization
+        // was cancelled" on its way to dying would have been reported to the user
+        // as *their own cancellation* -- a real engine failure, silently relabelled
+        // as a thing the user did, and never shown as a degradation. The token is
+        // the only authority on whether a cancel was actually requested, and it
+        // cannot be spoofed by a subprocess.
+        //
+        // Every `CANCELLED` the engine returns is raised under a set flag
+        // (`SidecarDiarizer` checks `is_cancelled()` before spawning, `adopt()`
+        // refuses under the same lock `cancel()` takes, and an emptied child slot
+        // means `cancel()` took it), so this is exactly as sensitive as the
+        // substring was -- and no longer credulous.
+        Err(_) if cancel.is_cancelled() => DiarizationOutcome::Cancelled,
         Err(e) => {
             let reason = format!("{e:#}");
             eprintln!("diarization failed, continuing without speaker labels: {reason}");
@@ -1446,14 +1482,39 @@ pub async fn diarize_job(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DiarizationOutcome, String> {
+    // REGISTER FIRST. Nothing may precede this that can block or touch the disk.
+    //
+    // The token used to be registered last, after the store lookup and three
+    // `is_file()` stats -- and that opened a window in which the job was ALREADY
+    // ACCEPTED but NOT YET CANCELLABLE. A `cancel_diarization` landing in it found
+    // no token, returned `false`, and was gone: the cancel is fire-and-forget on
+    // the frontend and is never retried, so the run it failed to catch went on to
+    // spawn an ONNX child that nothing would kill until the 30-minute backstop.
+    // The user pressed Cancel, the UI cleared, and a core burned for half an hour.
+    //
+    // Registering before the checks closes it: from the first line of this command
+    // there is a token, so a cancel either finds it (and the run below sees a
+    // cancelled token before it spawns anything) or genuinely arrived before the
+    // command did. The guard's `Drop` removes the entry on every return path
+    // below, including the `?`s -- so a job that turns out not to exist does not
+    // leave a token behind.
+    let cancel = CancelToken::new();
+    let _registered = register(&state.diarizations, &job_id, cancel.clone())?;
+
     // The real errors, all of them checked BEFORE anything is spawned.
     let wav_path = prepared_audio_for_job(&job_id, &state, &app)?;
     let opts = diarize_options(num_speakers)?;
 
     // Everything from here on degrades rather than fails. A build with no models
-    // (or no sidecar) is a build without speaker labels, not a broken app.
+    // (or no sidecar) is a build without speaker labels, not a broken app. That
+    // build is reachable: `src-tauri/build.rs` deliberately lets a checkout with
+    // no models compile, so this is not dead code.
     let assets = match diarization_assets(&app) {
         Ok(assets) => assets,
+        // ...unless the user cancelled while we were stat'ing. Reporting "speaker
+        // detection is not installed" for a run they stopped themselves is the
+        // same lie `Cancelled` exists to prevent, just on a different path.
+        Err(_) if cancel.is_cancelled() => return Ok(DiarizationOutcome::Cancelled),
         Err(reason) => return Ok(DiarizationOutcome::Degraded { reason }),
     };
 
@@ -1462,11 +1523,6 @@ pub async fn diarize_job(
         assets.segmentation_model,
         assets.embedding_model,
     ));
-
-    // The token is reachable from `cancel_diarization` for as long as this guard
-    // lives, and no longer.
-    let cancel = CancelToken::new();
-    let _registered = register(&state.diarizations, &job_id, cancel.clone())?;
 
     Ok(run_diarization(diarizer, wav_path, opts, cancel).await)
 }
@@ -1480,9 +1536,29 @@ pub async fn diarize_job(
 ///
 /// Never an error: cancelling a job that is not diarizing is a no-op, and the UI
 /// has no way to know whether one was in flight.
+///
+/// The kill runs on a BLOCKING pool, not on this async worker. `CancelToken::cancel`
+/// is `kill()` + `wait()` -- two synchronous syscalls, the second of which sleeps
+/// until the child is actually reaped, while holding the child mutex that the
+/// engine's 20 ms poll loop is contending for. SIGKILL is uncatchable, so today
+/// that wait is short and parking a worker on it is merely rude. It stops being
+/// merely rude the moment the reap is slow for a reason nobody predicted (a child
+/// wedged in an uninterruptible syscall, a signal the child does catch), and the
+/// worker it parks is one of the handful serving ALL IPC -- including the next
+/// Cancel. Blocking work belongs on the blocking pool; this is blocking work.
 #[tauri::command]
 pub async fn cancel_diarization(job_id: String, state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(cancel_registered(&state.diarizations, &job_id))
+    // The lookup itself is a `Mutex` that is never held across a blocking call
+    // (see `registered_token`), so it is safe to do here; only the kill moves.
+    let Some(token) = registered_token(&state.diarizations, &job_id) else {
+        return Ok(false);
+    };
+
+    tokio::task::spawn_blocking(move || token.cancel())
+        .await
+        .map_err(|e| format!("the diarization kill task did not complete: {e}"))?;
+
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1578,6 +1654,7 @@ pub async fn export_transcript(request: ExportRequest) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::diarize::mock::MockDiarizer;
+    use crate::diarize::CANCELLED;
 
     fn turn(start: f32, end: f32, speaker: u32) -> SpeakerTurn {
         SpeakerTurn {
@@ -1683,6 +1760,46 @@ mod tests {
         assert_eq!(outcome, DiarizationOutcome::Cancelled);
     }
 
+    /// **A subprocess cannot talk its way out of a degradation.**
+    ///
+    /// "Cancelled" used to be decided by `e.to_string().contains(CANCELLED)`, and
+    /// the sidecar's own stderr is interpolated verbatim into the non-zero-exit
+    /// error. So a broken engine that happened to print the words "diarization was
+    /// cancelled" on its way down was reported to the user as THEIR OWN
+    /// CANCELLATION: a genuine failure, relabelled as a deliberate act, and never
+    /// shown as the degradation it was. Precisely the class of silent lie the
+    /// three-outcome type exists to prevent, arriving through the error string.
+    ///
+    /// The token is now the only authority, and NOBODY CANCELLED THIS ONE.
+    #[tokio::test]
+    async fn an_engine_that_prints_the_word_cancelled_is_still_a_degradation() {
+        let never_cancelled = CancelToken::new();
+
+        let outcome = diarize_with(
+            // The sidecar's stderr, verbatim, as the non-zero-exit path formats it.
+            MockDiarizer::failing(&format!(
+                "the diarization sidecar exited with status 1: {CANCELLED} (onnxruntime: bad alloc)"
+            )),
+            never_cancelled.clone(),
+        )
+        .await;
+
+        assert!(
+            !never_cancelled.is_cancelled(),
+            "the premise of this test: nobody asked to cancel"
+        );
+        match outcome {
+            DiarizationOutcome::Degraded { reason } => assert!(
+                reason.contains("bad alloc"),
+                "the real reason must survive: {reason}"
+            ),
+            other => panic!(
+                "an engine failure that merely MENTIONS cancellation must degrade, not be \
+                 reported as the user's own cancellation, got {other:?}"
+            ),
+        }
+    }
+
     // -- the sparse-id hazard, closed at the boundary -------------------------
 
     /// The engine's ids are sparse: the two-speaker fixture really does come back
@@ -1780,6 +1897,39 @@ mod tests {
         );
     }
 
+    /// **A cancel that lands before the run starts must still kill the run.**
+    ///
+    /// `diarize_job` registers its token on its FIRST line, before the store
+    /// lookup and the three `is_file()` stats. It used to register last, and a
+    /// `cancel_diarization` arriving in that window found nothing, returned
+    /// `false`, and was gone -- the frontend fires it and never retries -- leaving
+    /// a run that had been cancelled by the user but was unkillable by that
+    /// cancel, right up to the 30-minute backstop.
+    ///
+    /// This walks the command's real sequence at its real seam: register, THEN
+    /// the racing cancel, THEN the run. The run must never reach the engine.
+    #[tokio::test]
+    async fn a_cancel_racing_the_start_of_a_run_still_kills_it() {
+        let registry = DiarizationRegistry::default();
+        let cancel = CancelToken::new();
+        let _registered = register(&registry, "job-1", cancel.clone()).expect("a free job");
+
+        // The cancel lands here: after the job is claimed, before the engine is
+        // resolved or spawned. It must FIND the token.
+        assert!(
+            cancel_registered(&registry, "job-1"),
+            "a cancel arriving before the run has spawned anything must still find its token"
+        );
+
+        // MockDiarizer, like SidecarDiarizer, refuses to run on a cancelled token.
+        let outcome = diarize_with(MockDiarizer::returning(vec![turn(0.0, 1.0, 0)]), cancel).await;
+        assert_eq!(
+            outcome,
+            DiarizationOutcome::Cancelled,
+            "the run must observe the cancel that landed before it started"
+        );
+    }
+
     #[test]
     fn a_second_concurrent_diarization_of_the_same_job_is_refused() {
         // Two runs sharing one token is exactly the misuse `CancelToken` warns
@@ -1821,15 +1971,60 @@ mod tests {
                      to `_up_/models/..` under $RESOURCE (tauri_utils::resources::resource_relpath \
                      rewrites `..`), and the paths in this file would not exist in the bundle");
 
-        // A file source with a target lands at EXACTLY that target under
-        // $RESOURCE, so these two strings are the bundle's actual layout -- and
-        // they are the same two strings the app opens.
+        // Resolve each model through the config the way tauri_utils does, and
+        // demand it come out at the exact path the app opens.
+        //
+        // Two mapping styles reach the same place, and the test accepts either, so
+        // that the CHOICE between them stays free (it is not free: see build.rs --
+        // the directory form is what lets a checkout with no models still build):
+        //
+        //   - a file entry, whose target IS the resource path; and
+        //   - a directory entry, which walks the tree and preserves the relative
+        //     path underneath the target.
+        //
+        // Either way the source must be `../<the same path>`: the repo-root layout
+        // that scripts/fetch-sidecars.sh writes. That is the whole invariant --
+        // where the script puts a model, where the bundle puts it, and where the
+        // code opens it are one path.
         for model in [SEGMENTATION_MODEL, EMBEDDING_MODEL] {
+            let source = resources
+                .iter()
+                .find_map(|(source, target)| {
+                    let target = target.as_str()?;
+                    if target == model {
+                        Some(source.clone())
+                    } else {
+                        // A directory entry: `$RESOURCE/<target>/<rest>`.
+                        let rest = model.strip_prefix(&format!("{target}/"))?;
+                        Some(format!("{source}/{rest}"))
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no bundle.resources entry puts {model:?} under $RESOURCE, so a packaged \
+                         build would find no diarization models. Entries: {resources:?}"
+                    )
+                });
+
+            assert_eq!(
+                source,
+                format!("../{model}"),
+                "tauri.conf.json bundles {model:?} from {source:?}, but fetch-sidecars.sh writes \
+                 it to ../{model}"
+            );
+        }
+
+        // And build.rs -- which has to know the same two paths, to tell a
+        // no-models build to warn instead of exploding -- must not drift from them.
+        const BUILD_RS: &str = include_str!("../build.rs");
+        for model in [SEGMENTATION_MODEL, EMBEDDING_MODEL] {
+            let relative = model
+                .strip_prefix("models/diarization/")
+                .expect("the models live under models/diarization/");
             assert!(
-                resources.values().any(|target| target == model),
-                "{model:?} is not bundled by tauri.conf.json, so a packaged build would find \
-                 no diarization models. bundle.resources targets: {:?}",
-                resources.values().collect::<Vec<_>>()
+                BUILD_RS.contains(&format!("\"{relative}\"")),
+                "build.rs does not know about {relative:?}, so a build missing that model would \
+                 not warn about it"
             );
         }
 

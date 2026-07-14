@@ -1066,6 +1066,85 @@ describe("speaker alignment granularity is detected, not assumed", () => {
         // real. The live path supplies `words` and never consults this.
         expect(hasRealWordTimings([])).toBe(false);
     });
+
+    it("labels a token that overlaps no turn with the nearest turn's speaker", () => {
+        // Pins what the code ACTUALLY does, against a comment that used to claim the
+        // opposite ("a token that overlaps no turn stays unlabelled"). It does not:
+        // `assignSpeakers` falls back to the nearest turn (fill_nearest, Task 5), and
+        // that is the behaviour here — a word 99s past the only turn is still given
+        // that turn's speaker.
+        //
+        // This is deliberately NOT asserted as `undefined`. If a distance cutoff is
+        // ever added, this test is the one that must change, and changing it is the
+        // decision — not a silent side effect.
+        const cues = consolidateSegments(
+            [{ start: 100, end: 101, text: "Hello" }],
+            undefined,
+            [{ start: 0, end: 1, speaker: 0 }],
+        );
+        expect(cues.map((c) => c.speaker)).toEqual(["SPEAKER_00"]);
+    });
+
+    it("counts the CLEANED text, so a glued 'Hello,world' row is not word-granular", () => {
+        // The same class of bug as the CJK one, and it fails in the DANGEROUS
+        // direction: it declares a legacy row word-granular.
+        //
+        // `cleanCaptionText` puts back the space Whisper drops after a comma, so
+        // `splitWords` — which cleans FIRST — makes TWO tokens out of this row.
+        // Counting the RAW text sees one word and calls the row word-granular;
+        // `tokensFromSegments` then fabricates two word times by character-length
+        // interpolation, and the turns get aligned against numbers nobody measured.
+        // The predicate must count the text the tokenizer will actually split.
+        expect(
+            hasRealWordTimings([{ start: 0, end: 4, text: "Hello,world" }]),
+        ).toBe(false);
+
+        // And the consequence, end to end: two confidently-labelled speakers off
+        // fabricated times. Aligned at SEGMENT granularity, the row has one
+        // measured span and therefore exactly one speaker.
+        const cues = consolidateSegments(
+            [{ start: 0, end: 4, text: "Hello,world" }],
+            undefined,
+            [
+                { start: 0, end: 2, speaker: 0 },
+                { start: 2, end: 4, speaker: 1 },
+            ],
+        );
+        expect(new Set(cues.map((c) => c.speaker)).size).toBe(1);
+
+        // The fix must not reclassify anything else. Cleaning is a no-op on all of
+        // these, so each keeps the answer it had.
+        expect(hasRealWordTimings([{ start: 0, end: 1, text: "Hello" }])).toBe(
+            true,
+        );
+        expect(hasRealWordTimings([{ start: 0, end: 1, text: "光" }])).toBe(
+            true,
+        );
+        // Trailing punctuation is not a word boundary: nothing follows it.
+        expect(hasRealWordTimings([{ start: 0, end: 1, text: "Hello," }])).toBe(
+            true,
+        );
+        expect(hasRealWordTimings([{ start: 0, end: 1, text: "Yes." }])).toBe(
+            true,
+        );
+        // `needsSpaceAfterPunctuation` refuses to split a number or an abbreviation,
+        // so these stay ONE word after cleaning — as they must, or a persisted "3.14"
+        // would come back as "3." and "14".
+        expect(hasRealWordTimings([{ start: 0, end: 1, text: "3.14" }])).toBe(
+            true,
+        );
+        expect(hasRealWordTimings([{ start: 0, end: 1, text: "U.S.A." }])).toBe(
+            true,
+        );
+        // Legacy rows stay legacy.
+        expect(
+            hasRealWordTimings([{ start: 0, end: 4, text: "one two three" }]),
+        ).toBe(false);
+        expect(
+            hasRealWordTimings([{ start: 0, end: 4, text: "光合作用是植物" }]),
+        ).toBe(false);
+        expect(hasRealWordTimings([])).toBe(false);
+    });
 });
 
 /**

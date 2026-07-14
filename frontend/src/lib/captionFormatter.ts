@@ -456,7 +456,7 @@ function splitGluedToken(word: WordToken): WordToken[] {
  * a confident answer built on a number nobody measured — up to 1.3s adrift, which
  * is longer than many turns.
  */
-function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
+function tokensFromSegments(segments: RawSegment[]): WordToken[] {
     const tokens: WordToken[] = [];
     let emittedWords: string[] = [];
     let previousEnd: number | null = null;
@@ -893,6 +893,18 @@ function wrapCaptionText(text: string): string {
  *     interpolated by character length — off by 0.26s on average and up to 1.30s.
  *     A row holds a sentence, so `countCaptionWords` of it is >1.
  *
+ * COUNT THE CLEANED TEXT, because that is the text the tokenizer will split.
+ * `countCaptionWords(raw)` and `splitWords` are two different notions of "word",
+ * and this predicate's only job is to predict what `tokensFromSegments` will do —
+ * so it must use the one the tokenizer uses. `splitWords` runs `cleanCaptionText`
+ * FIRST, and cleaning puts back the space Whisper drops after a punctuation mark:
+ * a row of "Hello,world" is ONE word raw and TWO words as the tokenizer sees it.
+ * Count it raw and the row is called word-granular, `tokensFromSegments`
+ * fabricates two word times by character-length interpolation, and the speaker
+ * turns are aligned against numbers nobody measured — precisely the failure this
+ * predicate exists to prevent. Pinned by "counts the CLEANED text, so a glued
+ * 'Hello,world' row is not word-granular".
+ *
  * `countCaptionWords`, not `split(" ")`, and the difference is worth being precise
  * about because a whitespace count is WRONG here in a way that currently hides.
  *
@@ -925,7 +937,10 @@ export function hasRealWordTimings(
 ): boolean {
     return (
         segments.length > 0 &&
-        segments.every((segment) => countCaptionWords(segment.text) === 1)
+        segments.every(
+            (segment) =>
+                countCaptionWords(cleanCaptionText(segment.text)) === 1,
+        )
     );
 }
 
@@ -1007,9 +1022,26 @@ function timedOnly(
 }
 
 /**
- * A token that overlaps no turn at all gets `null` — never speaker 0. It has to
- * stay unlabelled: inventing a speaker for it would be the same lie, one token at
- * a time, that rendering a degraded run as "no speakers" would be wholesale.
+ * Render an assigned turn id as a label.
+ *
+ * WHAT THIS DOES NOT DO, stated plainly because an earlier version of this comment
+ * claimed the opposite: it does NOT leave a non-overlapping token unlabelled. A
+ * token that overlaps no turn is assigned the NEAREST turn's speaker by
+ * `assignSpeakers` (`fill_nearest`, Task 5's deliberate choice, documented at
+ * `speakerAlignment.ts`), and it arrives here as a real number. So a word far from
+ * every turn IS given a speaker — see "labels a token that overlaps no turn with
+ * the nearest turn's speaker", which pins exactly that.
+ *
+ * `assignSpeakers` answers `null` in ONE case only: `turns.length === 0`. That case
+ * cannot reach this function. `consolidateSegments` collapses empty turns to `null`
+ * and `tokensWithSpeakers` then skips speaker assignment entirely, so both adapters
+ * above are only ever called with a NON-EMPTY turns array.
+ *
+ * The `null` branch below is therefore unreachable at runtime today. It is kept
+ * because `assignSpeakers` is generic and its return type (`number | null`) admits
+ * null for the zero-turns case; this is a total function over that signature, not a
+ * safety net. Same for the `undefined` check in `assignSpeakersToSegments`. Neither
+ * guards against fill_nearest — nothing here does.
  */
 function labelOf(speaker: number | null): string | undefined {
     return speaker === null ? undefined : speakerLabel(speaker);

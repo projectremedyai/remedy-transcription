@@ -76,7 +76,12 @@ export interface Transcriber {
     isBusy: boolean;
     isModelLoading: boolean;
     progressItems: ProgressItem[];
-    start: (file: File) => void;
+    /**
+     * Takes a filesystem PATH, not a browser `File`. A `File` has no path, so
+     * Rust could never see it — which is why local files now come from the Tauri
+     * dialog or a file drop.
+     */
+    start: (path: string) => void;
     startFromYouTube: (url: string) => void;
     output?: TranscriberData;
     jobId: string | null;
@@ -109,13 +114,6 @@ type PendingWorker = {
     modelLabel?: string;
     audioDuration: number;
 };
-
-async function sha256Hex(arrayBuffer: ArrayBuffer): Promise<string> {
-    const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);
-    return Array.from(new Uint8Array(digest))
-        .map((byte) => byte.toString(16).padStart(2, "0"))
-        .join("");
-}
 
 async function decodeAudio(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
     const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -371,38 +369,83 @@ export function useTranscriber(): Transcriber {
                 return Promise.resolve(job);
             }
 
-            return new Promise<Job>((resolve, reject) => {
-                if (unsubscribeRef.current) {
-                    unsubscribeRef.current();
-                }
+            // Tear down any wait already in flight — BOTH its listener and its poll.
+            // Leaving a previous job's poll running would let it keep pushing that
+            // job's status into the UI on top of this one's.
+            unsubscribeRef.current?.();
+            unsubscribeRef.current = null;
 
-                unsubscribeRef.current = api.subscribeToProgress(
-                    job.id,
-                    (nextJob) => {
-                        handleBackendJobUpdate(nextJob);
-                        if (
-                            nextJob.status === "ready" ||
-                            nextJob.status === "completed"
-                        ) {
-                            unsubscribeRef.current?.();
-                            unsubscribeRef.current = null;
-                            resolve(nextJob);
-                        } else if (nextJob.status === "failed") {
-                            unsubscribeRef.current?.();
-                            unsubscribeRef.current = null;
+            return new Promise<Job>((resolve, reject) => {
+                let settled = false;
+                let poll: ReturnType<typeof setInterval> | null = null;
+                let unlistenEvents: (() => void) | null = null;
+
+                const teardown = () => {
+                    if (poll !== null) {
+                        clearInterval(poll);
+                        poll = null;
+                    }
+                    unlistenEvents?.();
+                    unlistenEvents = null;
+                };
+
+                const finish = (settleWith: () => void) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    teardown();
+                    if (unsubscribeRef.current === teardown) {
+                        unsubscribeRef.current = null;
+                    }
+                    settleWith();
+                };
+
+                const consider = (nextJob: Job) => {
+                    handleBackendJobUpdate(nextJob);
+                    if (
+                        nextJob.status === "ready" ||
+                        nextJob.status === "completed"
+                    ) {
+                        finish(() => resolve(nextJob));
+                    } else if (nextJob.status === "failed") {
+                        finish(() =>
                             reject(
                                 new Error(
                                     nextJob.error || "Failed to prepare audio",
                                 ),
-                            );
-                        }
-                    },
-                    (workerError) => {
-                        unsubscribeRef.current?.();
-                        unsubscribeRef.current = null;
-                        reject(workerError);
-                    },
+                            ),
+                        );
+                    }
+                };
+
+                unlistenEvents = api.subscribeToProgress(
+                    job.id,
+                    consider,
+                    (workerError) => finish(() => reject(workerError)),
                 );
+
+                // Tauri's `listen()` registers the listener ASYNCHRONOUSLY, so a job
+                // that finishes fast can emit `ready` into the void before the
+                // listener exists — and the UI would then wait forever for an event
+                // that has already fired.
+                //
+                // The YouTube path never hit this only because downloading takes
+                // seconds. ffmpeg over a short LOCAL file finishes in tens of
+                // milliseconds, comfortably inside that window, so routing local
+                // files through Rust is what exposes the race. Polling the job as a
+                // backstop closes it for both sources: whichever of the event or the
+                // poll first observes a terminal state wins, and `finish` makes that
+                // idempotent.
+                poll = setInterval(() => {
+                    api.getJob(job.id)
+                        .then(consider)
+                        .catch(() => {
+                            // Transient; the next tick (or the event) will catch it.
+                        });
+                }, 300);
+
+                unsubscribeRef.current = teardown;
             });
         },
         [handleBackendJobUpdate],
@@ -465,186 +508,147 @@ export function useTranscriber(): Transcriber {
         [applyCompletedJob],
     );
 
+    /**
+     * The setup both sources share: reset the view, resolve which model this run
+     * will actually use, and check it is available.
+     */
+    const beginRun = useCallback(async (): Promise<ResolvedModelConfig> => {
+        setTranscript(undefined);
+        setIsBusy(true);
+        setError(null);
+        setProgress(0);
+        setStatus("checking-cache");
+
+        const caps = await ensureBrowserCaps();
+        const config = resolveModelConfig(presetId, caps, task, language);
+        if (
+            modelStatus &&
+            !modelStatus.items.some(
+                (item) => item.model_id === config.modelId && item.ready,
+            )
+        ) {
+            throw new Error(
+                `Model files for ${config.presetLabel} are not installed on the server`,
+            );
+        }
+        setEffectivePresetLabel(config.presetLabel);
+        return config;
+    }, [ensureBrowserCaps, language, modelStatus, presetId, task]);
+
+    const failRun = useCallback((nextError: unknown, fallback: string) => {
+        setTranscript((previous) =>
+            previous ? { ...previous, isBusy: false } : previous,
+        );
+        setError(nextError instanceof Error ? nextError.message : fallback);
+        setStatus("failed");
+        setIsBusy(false);
+    }, []);
+
+    /**
+     * Everything after a job exists — and it is now the SAME for every source.
+     *
+     * Wait for Rust to report `ready` (it has produced the canonical 16 kHz mono
+     * WAV), fetch that WAV back through the asset protocol, decode it, transcribe
+     * it, persist it.
+     *
+     * Local files used to take a different route entirely: the webview read the
+     * browser `File` into an `ArrayBuffer` and decoded THAT, so no WAV ever
+     * reached the disk and Rust never saw the audio — which left a Rust-side
+     * diarizer with nothing to work from for exactly the sources users are most
+     * likely to want diarized. Both sources now run this one already-proven path.
+     */
+    const transcribePreparedJob = useCallback(
+        async (initialJob: Job, config: ResolvedModelConfig) => {
+            if (initialJob.status === "completed") {
+                applyCompletedJob(initialJob, config.presetLabel);
+                return;
+            }
+
+            handleBackendJobUpdate(initialJob);
+            const readyJob = await waitForReady(initialJob);
+
+            if (readyJob.status === "completed") {
+                applyCompletedJob(readyJob, config.presetLabel);
+                return;
+            }
+
+            setStatus("loading-audio");
+            const audioUrl = await api.getAudioUrl(readyJob.id);
+            const audioResponse = await fetch(audioUrl);
+            if (!audioResponse.ok) {
+                throw new Error("Failed to load prepared audio");
+            }
+
+            // The WAV is 16 kHz mono and `decodeAudio` opens its `AudioContext` at
+            // exactly 16 kHz, so nothing is resampled and `audioBuffer.duration` is
+            // the true duration of the source — the same number the in-browser
+            // decode of the original file used to yield.
+            //
+            // That number is load-bearing: `persistWorkerTranscript` passes it to
+            // `segmentsForPersistence`, which uses it to CLOSE the final segment. A
+            // missing or wrong duration silently swallows the end of the transcript
+            // rather than throwing, so it must keep coming from a real decode of
+            // the real audio.
+            const audioBuffer = await decodeAudio(
+                await audioResponse.arrayBuffer(),
+            );
+            const workerTranscript = await runWorkerTranscription(
+                audioBuffer,
+                config,
+                readyJob.filename || undefined,
+            );
+            await persistWorkerTranscript(
+                readyJob,
+                config,
+                workerTranscript,
+                audioBuffer.duration,
+            );
+        },
+        [
+            applyCompletedJob,
+            handleBackendJobUpdate,
+            persistWorkerTranscript,
+            runWorkerTranscription,
+            waitForReady,
+        ],
+    );
+
     const startFromFile = useCallback(
-        async (file: File) => {
+        async (path: string) => {
             try {
-                setTranscript(undefined);
-                setIsBusy(true);
-                setError(null);
-                setProgress(0);
-                setStatus("checking-cache");
-
-                const caps = await ensureBrowserCaps();
-                const config = resolveModelConfig(
-                    presetId,
-                    caps,
-                    task,
-                    language,
-                );
-                if (
-                    modelStatus &&
-                    !modelStatus.items.some(
-                        (item) =>
-                            item.model_id === config.modelId && item.ready,
-                    )
-                ) {
-                    throw new Error(
-                        `Model files for ${config.presetLabel} are not installed on the server`,
-                    );
-                }
-                setEffectivePresetLabel(config.presetLabel);
-
-                const arrayBuffer = await file.arrayBuffer();
-                const fileHash = await sha256Hex(arrayBuffer);
+                const config = await beginRun();
                 const job = await api.createFileJob({
-                    file_hash: fileHash,
-                    filename: file.name,
-                    size_bytes: file.size,
+                    path,
                     model_id: config.modelId,
                     task: config.task,
                     language: config.language,
                 });
-
                 setJobId(job.id);
-
-                if (job.status === "completed") {
-                    applyCompletedJob(job, config.presetLabel);
-                    return;
-                }
-
-                const audioBuffer = await decodeAudio(arrayBuffer);
-                const workerTranscript = await runWorkerTranscription(
-                    audioBuffer,
-                    config,
-                    file.name,
-                );
-                await persistWorkerTranscript(
-                    job,
-                    config,
-                    workerTranscript,
-                    audioBuffer.duration,
-                );
+                await transcribePreparedJob(job, config);
             } catch (nextError) {
-                setTranscript((previous) =>
-                    previous ? { ...previous, isBusy: false } : previous,
-                );
-                setError(
-                    nextError instanceof Error
-                        ? nextError.message
-                        : "Failed to transcribe file",
-                );
-                setStatus("failed");
-                setIsBusy(false);
+                failRun(nextError, "Failed to transcribe file");
             }
         },
-        [
-            applyCompletedJob,
-            ensureBrowserCaps,
-            language,
-            modelStatus,
-            persistWorkerTranscript,
-            presetId,
-            runWorkerTranscription,
-            task,
-        ],
+        [beginRun, failRun, transcribePreparedJob],
     );
 
     const startFromYouTube = useCallback(
         async (url: string) => {
             try {
-                setTranscript(undefined);
-                setIsBusy(true);
-                setError(null);
-                setProgress(0);
-                setStatus("checking-cache");
-
-                const caps = await ensureBrowserCaps();
-                const config = resolveModelConfig(
-                    presetId,
-                    caps,
-                    task,
-                    language,
-                );
-                if (
-                    modelStatus &&
-                    !modelStatus.items.some(
-                        (item) =>
-                            item.model_id === config.modelId && item.ready,
-                    )
-                ) {
-                    throw new Error(
-                        `Model files for ${config.presetLabel} are not installed on the server`,
-                    );
-                }
-                setEffectivePresetLabel(config.presetLabel);
-
-                const initialJob = await api.createYouTubeJob({
+                const config = await beginRun();
+                const job = await api.createYouTubeJob({
                     url,
                     model_id: config.modelId,
                     task: config.task,
                     language: config.language,
                 });
-                setJobId(initialJob.id);
-
-                if (initialJob.status === "completed") {
-                    applyCompletedJob(initialJob, config.presetLabel);
-                    return;
-                }
-
-                handleBackendJobUpdate(initialJob);
-                const readyJob = await waitForReady(initialJob);
-
-                if (readyJob.status === "completed") {
-                    applyCompletedJob(readyJob, config.presetLabel);
-                    return;
-                }
-
-                setStatus("loading-audio");
-                const audioUrl = await api.getAudioUrl(readyJob.id);
-                const audioResponse = await fetch(audioUrl);
-                if (!audioResponse.ok) {
-                    throw new Error("Failed to load prepared audio");
-                }
-
-                const audioBuffer = await decodeAudio(
-                    await audioResponse.arrayBuffer(),
-                );
-                const workerTranscript = await runWorkerTranscription(
-                    audioBuffer,
-                    config,
-                    readyJob.filename || undefined,
-                );
-                await persistWorkerTranscript(
-                    readyJob,
-                    config,
-                    workerTranscript,
-                    audioBuffer.duration,
-                );
+                setJobId(job.id);
+                await transcribePreparedJob(job, config);
             } catch (nextError) {
-                setTranscript((previous) =>
-                    previous ? { ...previous, isBusy: false } : previous,
-                );
-                setError(
-                    nextError instanceof Error
-                        ? nextError.message
-                        : "YouTube preparation failed",
-                );
-                setStatus("failed");
-                setIsBusy(false);
+                failRun(nextError, "YouTube preparation failed");
             }
         },
-        [
-            applyCompletedJob,
-            ensureBrowserCaps,
-            handleBackendJobUpdate,
-            language,
-            modelStatus,
-            persistWorkerTranscript,
-            presetId,
-            runWorkerTranscription,
-            task,
-            waitForReady,
-        ],
+        [beginRun, failRun, transcribePreparedJob],
     );
 
     const onInputChange = useCallback(() => {

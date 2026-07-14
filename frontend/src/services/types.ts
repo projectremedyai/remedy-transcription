@@ -25,9 +25,16 @@ export interface Job {
 }
 
 export interface FileJobRequest {
-    file_hash: string;
-    filename: string;
-    size_bytes: number;
+    /**
+     * A real filesystem path — from the Tauri dialog or a file drop, never a
+     * browser `File` (which has no path).
+     *
+     * Rust derives the filename, the size and the content hash from it, and runs
+     * the same ffmpeg pass over it that YouTube downloads get. The webview used
+     * to send a hash it computed itself over an `ArrayBuffer` of the file, which
+     * meant Rust never saw the audio at all.
+     */
+    path: string;
     model_id: string;
     task: TaskMode;
     language: string;

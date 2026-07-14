@@ -501,6 +501,20 @@ impl Store {
         fetch_job(&conn, job_id)
     }
 
+    /// Expire the prepared WAVs nobody has touched in `ttl_hours`.
+    ///
+    /// This used to be scoped to `source_type = 'youtube'`, because YouTube jobs
+    /// were the only ones that ever wrote a WAV. Local files now write one too,
+    /// so a filter on `youtube` would let every local file's WAV pile up in the
+    /// audio directory forever — the app would slowly eat the disk, one
+    /// transcription at a time.
+    ///
+    /// Expiring a local file's WAV is safe for the same reason expiring a
+    /// YouTube one is: the WAV is a derived artifact, not the source. Its `Source`
+    /// row survives (with `audio_path` cleared), the TRANSCRIPT survives — so a
+    /// cache hit still needs no audio at all — and a fresh job for the same file
+    /// simply re-runs ffmpeg over the original, which is still sitting on the
+    /// user's disk.
     pub fn cleanup_expired_audio(&self, ttl_hours: i64, _audio_dir: &Path) -> usize {
         let cutoff = Utc::now() - Duration::hours(ttl_hours);
         let cutoff_str = cutoff.to_rfc3339();
@@ -510,8 +524,7 @@ impl Store {
         let rows: Vec<(i64, String)> = match conn
             .prepare(
                 "SELECT id, audio_path FROM sources
-                 WHERE source_type = 'youtube'
-                   AND audio_path IS NOT NULL
+                 WHERE audio_path IS NOT NULL
                    AND last_accessed_at < ?1",
             )
             .and_then(|mut stmt| {
@@ -933,5 +946,116 @@ mod tests {
             Some("onnx-community/whisper-large-v3-turbo")
         );
         assert_eq!(model_id_alias("_timestamped"), None);
+    }
+
+    /// The lifecycle a LOCAL FILE now goes through, which it did not before.
+    ///
+    /// A file job used to be created straight into `Ready` with no audio anywhere
+    /// — the webview decoded the file itself and Rust never saw it. It now walks
+    /// the same `Extracting` -> ffmpeg -> `Ready` path a YouTube job walks, and
+    /// lands with a prepared WAV recorded on its `Source`. Rust-side diarization
+    /// depends on that being true for EVERY job, so it is asserted here rather
+    /// than assumed.
+    #[test]
+    fn a_local_file_job_reaches_ready_with_prepared_audio_on_disk() {
+        let (temp, source_id) = store_with_source();
+
+        let job = temp
+            .store
+            .create_pending_job(
+                source_id,
+                SourceType::File,
+                "sha256",
+                JobStatus::Extracting,
+                Some("lecture.mp3"),
+                None,
+                "onnx-community/whisper-base_timestamped",
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("create job");
+
+        // Extraction is in flight: no audio yet, and the frontend must not be told
+        // to go fetch one.
+        assert!(matches!(job.status, JobStatus::Extracting));
+        assert!(job.audio_url.is_none());
+
+        // What `prepare_file_audio` does once ffmpeg has produced the WAV.
+        temp.store
+            .update_source_audio(source_id, "/audio/file-sha256.wav", "audio/wav", None)
+            .expect("record the prepared wav");
+        temp.store
+            .update_job(
+                &job.id,
+                JobUpdate {
+                    status: Some(JobStatus::Ready),
+                    progress: Some(1.0),
+                    audio_mime_type: Some("audio/wav".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("update job");
+
+        let ready = temp
+            .store
+            .get_job(&job.id)
+            .expect("query")
+            .expect("the job still exists");
+
+        assert!(matches!(ready.status, JobStatus::Ready));
+        assert_eq!(ready.progress, 1.0);
+        assert_eq!(ready.audio_mime_type.as_deref(), Some("audio/wav"));
+        assert!(
+            ready.audio_url.is_some(),
+            "a Ready file job must advertise prepared audio — the frontend fetches \
+             the WAV back exactly as it does for YouTube"
+        );
+    }
+
+    /// A local file's prepared WAV expires like any other.
+    ///
+    /// `cleanup_expired_audio` used to filter on `source_type = 'youtube'`, which
+    /// was correct only while YouTube jobs were the only ones writing a WAV. Now
+    /// that local files write one too, that filter would let their WAVs pile up in
+    /// the audio directory forever.
+    #[test]
+    fn an_expired_local_file_wav_is_cleaned_up_like_a_youtube_one() {
+        let temp = temp_store();
+        let audio_dir = std::env::temp_dir().join(format!("remedy-audio-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+
+        let mut written = Vec::new();
+        for (source_type, key) in [
+            (SourceType::File, "sha256-of-a-local-file"),
+            (SourceType::Youtube, "dQw4w9WgXcQ"),
+        ] {
+            let source = temp
+                .store
+                .get_or_create_source(source_type, key, None, Some("clip"), Some(1))
+                .expect("create source");
+
+            let wav = audio_dir.join(format!("{}-{}.wav", source_type.as_str(), key));
+            std::fs::write(&wav, b"RIFF").expect("write a wav");
+
+            temp.store
+                .update_source_audio(source.id, wav.to_string_lossy().as_ref(), "audio/wav", None)
+                .expect("record the wav");
+            written.push(wav);
+        }
+
+        // A negative TTL puts the cutoff in the future, so everything just written
+        // is already expired.
+        let removed = temp.store.cleanup_expired_audio(-1, &audio_dir);
+
+        assert_eq!(removed, 2, "both source types' WAVs must expire");
+        for wav in &written {
+            assert!(
+                !wav.exists(),
+                "{} survived cleanup — the audio directory grows without bound",
+                wav.display()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&audio_dir);
     }
 }

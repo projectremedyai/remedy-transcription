@@ -1,27 +1,122 @@
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
 
 import Modal from "./modal/Modal";
 import { UrlInput } from "./modal/UrlInput";
 import { Transcriber } from "../hooks/useTranscriber";
 import Progress from "./Progress";
 
-export function AudioManager(props: { transcriber: Transcriber }) {
-    const [selectedFile, setSelectedFile] = useState<File | null>(null);
+/**
+ * What ffmpeg is willing to be pointed at. Used for BOTH the file picker's filter
+ * and the drop target's check, so the two entry points cannot disagree about what
+ * counts as media.
+ */
+const MEDIA_EXTENSIONS = [
+    "mp3",
+    "wav",
+    "m4a",
+    "aac",
+    "ogg",
+    "opus",
+    "flac",
+    "wma",
+    "mp4",
+    "mkv",
+    "avi",
+    "mov",
+    "webm",
+    "m4v",
+    "mpeg",
+    "mpg",
+];
 
-    const handleFileSelect = (file: File) => {
-        props.transcriber.onInputChange();
-        setSelectedFile(file);
-    };
+function basename(path: string): string {
+    const parts = path.split(/[\\/]/);
+    return parts[parts.length - 1] || path;
+}
+
+function hasMediaExtension(path: string): boolean {
+    const extension = basename(path).split(".").pop()?.toLowerCase() ?? "";
+    return MEDIA_EXTENSIONS.includes(extension);
+}
+
+export function AudioManager(props: { transcriber: Transcriber }) {
+    // A PATH, not a browser `File`. A `File` has no path, so Rust could never
+    // run ffmpeg over it — which is why local files now arrive from the Tauri
+    // dialog or a file drop.
+    const [selectedPath, setSelectedPath] = useState<string | null>(null);
+    const [isDragging, setIsDragging] = useState(false);
+    const [dropError, setDropError] = useState<string | null>(null);
+
+    const { transcriber } = props;
+    const { onInputChange } = transcriber;
+
+    const handleFileSelect = useCallback(
+        (path: string) => {
+            onInputChange();
+            setDropError(null);
+            setSelectedPath(path);
+        },
+        [onInputChange],
+    );
+
+    // Dropping a file onto the window. Tauri intercepts the webview's native
+    // drag-and-drop and re-emits it here WITH the real filesystem paths, which is
+    // exactly the currency this app now runs on.
+    useEffect(() => {
+        let unlisten: (() => void) | undefined;
+        let cancelled = false;
+
+        getCurrentWebview()
+            .onDragDropEvent((event) => {
+                if (event.payload.type === "over") {
+                    setIsDragging(true);
+                    return;
+                }
+                if (event.payload.type === "leave") {
+                    setIsDragging(false);
+                    return;
+                }
+                if (event.payload.type === "drop") {
+                    setIsDragging(false);
+                    const path = event.payload.paths.find(hasMediaExtension);
+                    if (!path) {
+                        setDropError(
+                            "That is not an audio or video file we can read.",
+                        );
+                        return;
+                    }
+                    handleFileSelect(path);
+                }
+            })
+            .then((fn) => {
+                if (cancelled) {
+                    fn();
+                } else {
+                    unlisten = fn;
+                }
+            })
+            .catch(() => {
+                // Drag-and-drop is a convenience; the picker still works without it.
+            });
+
+        return () => {
+            cancelled = true;
+            unlisten?.();
+        };
+    }, [handleFileSelect]);
 
     const handleYouTubeSubmit = (url: string) => {
-        props.transcriber.onInputChange();
-        setSelectedFile(null);
-        props.transcriber.startFromYouTube(url);
+        transcriber.onInputChange();
+        setSelectedPath(null);
+        setDropError(null);
+        transcriber.startFromYouTube(url);
     };
 
     const handleTranscribe = () => {
-        if (selectedFile) {
-            props.transcriber.start(selectedFile);
+        if (selectedPath) {
+            transcriber.start(selectedPath);
         }
     };
 
@@ -75,7 +170,13 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
     return (
         <div className='w-full'>
-            <div className='flex flex-col justify-center items-center rounded-lg bg-white shadow-xl shadow-black/5 ring-1 ring-slate-700/10'>
+            <div
+                className={`flex flex-col justify-center items-center rounded-lg bg-white shadow-xl shadow-black/5 ring-1 transition-all duration-150 ${
+                    isDragging
+                        ? "ring-2 ring-indigo-500 bg-indigo-50"
+                        : "ring-slate-700/10"
+                }`}
+            >
                 <div className='flex flex-row space-x-2 py-2 w-full px-2'>
                     <YouTubeTile
                         icon={<YouTubeIcon />}
@@ -90,6 +191,11 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                         onFileSelect={handleFileSelect}
                     />
                 </div>
+                {isDragging && (
+                    <div className='w-full px-4 pb-2 text-center text-sm font-medium text-indigo-600'>
+                        Drop an audio or video file to transcribe it
+                    </div>
+                )}
                 <div className='w-full px-4 pb-4'>
                     <SettingsPanel transcriber={props.transcriber} />
                 </div>
@@ -148,18 +254,18 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 </div>
             )}
 
-            {props.transcriber.error && (
+            {(props.transcriber.error || dropError) && (
                 <div className='w-full mt-4 p-4 bg-red-50 rounded-lg border border-red-200'>
                     <div className='text-red-600 text-center'>
-                        {props.transcriber.error}
+                        {props.transcriber.error ?? dropError}
                     </div>
                 </div>
             )}
 
-            {selectedFile && !props.transcriber.isBusy && (
+            {selectedPath && !props.transcriber.isBusy && (
                 <div className='w-full mt-4 flex justify-center items-center'>
                     <div className='text-sm text-slate-500 mr-4 flex items-center'>
-                        {selectedFile.name}
+                        {basename(selectedPath)}
                     </div>
                     <button
                         onClick={handleTranscribe}
@@ -334,43 +440,35 @@ function YouTubeModal(props: {
     );
 }
 
+/**
+ * The native file picker, via the Tauri dialog plugin.
+ *
+ * This used to build an `<input type="file">` and hand the resulting browser
+ * `File` straight to the transcriber. A `File` exposes only its bytes, never its
+ * path — so the audio could only ever be decoded in the webview, and Rust (where
+ * diarization runs) had no file to point ffmpeg or sherpa-onnx at. The dialog
+ * returns a real path instead.
+ */
 function FileTile(props: {
     icon: JSX.Element;
     text: string;
-    onFileSelect: (file: File) => void;
+    onFileSelect: (path: string) => void;
 }) {
     return (
         <Tile
             icon={props.icon}
             text={props.text}
             onClick={() => {
-                const input = document.createElement("input");
-                input.type = "file";
-                input.accept =
-                    "video/*,audio/*,.mp4,.mkv,.avi,.mov,.webm,.mp3,.wav,.m4a,.aac,.ogg,.flac";
-                input.style.display = "none";
-                document.body.appendChild(input);
-
-                const cleanup = () => {
-                    if (input.parentNode) {
-                        input.parentNode.removeChild(input);
+                void open({
+                    multiple: false,
+                    directory: false,
+                    filters: [{ name: "Media", extensions: MEDIA_EXTENSIONS }],
+                }).then((selected) => {
+                    // `null` when the user cancels.
+                    if (typeof selected === "string") {
+                        props.onFileSelect(selected);
                     }
-                };
-
-                input.addEventListener(
-                    "change",
-                    (event) => {
-                        const files = (event.target as HTMLInputElement).files;
-                        if (files?.[0]) {
-                            props.onFileSelect(files[0]);
-                        }
-                        cleanup();
-                    },
-                    { once: true },
-                );
-                input.addEventListener("cancel", cleanup, { once: true });
-
-                input.click();
+                });
             }}
         />
     );

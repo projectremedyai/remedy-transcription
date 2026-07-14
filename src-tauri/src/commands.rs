@@ -1,8 +1,10 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_shell::process::CommandEvent;
 
@@ -114,9 +116,6 @@ static REQUIRED_MODEL_IDS: Lazy<Vec<String>> = Lazy::new(|| {
 static YOUTUBE_ID_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[A-Za-z0-9_-]{11}$").expect("valid regex"));
 
-static FILE_HASH_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[0-9a-f]{64}$").expect("valid regex"));
-
 #[derive(Debug, Deserialize)]
 pub struct YouTubeJobRequest {
     pub url: String,
@@ -129,9 +128,15 @@ pub struct YouTubeJobRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct FileJobRequest {
-    pub file_hash: String,
-    pub filename: String,
-    pub size_bytes: i64,
+    /// A real filesystem path.
+    ///
+    /// This used to be a `file_hash` + `filename` + `size_bytes` triple, because
+    /// the webview held a browser `File` — which has no path — read it into an
+    /// `ArrayBuffer`, hashed THAT, and decoded the audio itself. Rust never saw
+    /// the file, so a Rust-side diarizer had no audio for it. Local files now
+    /// arrive as a path (from the Tauri dialog or a file drop) and Rust derives
+    /// the name, the size and the content hash itself.
+    pub path: String,
     pub model_id: String,
     #[serde(default = "default_task")]
     pub task: TaskType,
@@ -242,6 +247,95 @@ fn audio_dir(app: &AppHandle) -> Result<PathBuf, String> {
 fn downloads_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(dir.join("downloads"))
+}
+
+/// Where the ONE canonical audio artifact for a source lives, inside `audio_dir`.
+///
+/// Every job — YouTube or local file — has one of these, and it is always a
+/// 16 kHz mono `pcm_s16le` WAV (see `ffmpeg_canonical_wav_args`). That invariant
+/// is what lets anything on the Rust side (diarization, in particular) assume
+/// there is audio on disk for ANY job, rather than only for the YouTube ones.
+///
+/// The `youtube-{id}.wav` shape is the one the YouTube path already used, so
+/// WAVs already sitting in a user's cache keep resolving; `file-{sha256}.wav` is
+/// the new twin. Prefixing by source type also keeps the two key spaces from
+/// ever colliding.
+fn prepared_audio_filename(source_type: SourceType, source_key: &str) -> String {
+    format!("{}-{}.wav", source_type.as_str(), source_key)
+}
+
+/// The source key for a local file is a hash of its CONTENTS, not of its path.
+///
+/// That is what the webview's old `sha256Hex(await file.arrayBuffer())` gave us,
+/// and the transcript cache is keyed on it: renaming or moving a file must still
+/// hit its existing transcript, and two copies of the same recording must not be
+/// transcribed twice. Streamed in chunks rather than read whole, because not
+/// pulling entire media files into memory is half the point of this change.
+fn hash_file(path: &Path) -> Result<String, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The ffmpeg invocation that DEFINES "canonical audio" for this app.
+///
+/// 16 kHz, mono, signed 16-bit PCM: exactly what sherpa-onnx wants for
+/// diarization, and exactly what the webview's `AudioContext({sampleRate:
+/// 16000})` decodes without resampling. Both source types go through this one
+/// argument list on purpose — a second ffmpeg invocation elsewhere is a second
+/// thing to drift, and a drifted sample rate is a silent wrong-answer bug in the
+/// diarizer, not a crash.
+fn ffmpeg_canonical_wav_args<'a>(input: &'a str, output: &'a str) -> Vec<&'a str> {
+    vec![
+        "-i", input, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", output,
+    ]
+}
+
+/// Any media file in, the canonical WAV out — the step both source types share.
+///
+/// ffmpeg writes to `scratch` and the result is renamed into `destination`, so a
+/// crashed or half-finished extraction never leaves a TRUNCATED WAV sitting at
+/// the path `get_prepared_audio_path` hands out. The rename is what makes the
+/// destination's existence mean "this is complete", which is the check both the
+/// audio cache and the transcriber rely on.
+async fn produce_canonical_wav(
+    app: &AppHandle,
+    input: &Path,
+    scratch: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    run_ffmpeg_extract(app, input, scratch).await?;
+    std::fs::rename(scratch, destination).map_err(|e| format!("rename audio failed: {}", e))
+}
+
+/// Mark a job failed and tell the frontend. Both `prepare_*` paths end here when
+/// something goes wrong; without the publish, the UI waits on `Ready` forever.
+fn fail_job(state: &AppState, job_id: &str, message: String) {
+    let _ = state.store.update_job(
+        job_id,
+        JobUpdate {
+            status: Some(JobStatus::Failed),
+            error: Some(message),
+            ..Default::default()
+        },
+    );
+    if let Ok(Some(j)) = state.store.get_job(job_id) {
+        state.events.publish(&j);
+    }
 }
 
 #[tauri::command]
@@ -378,7 +472,8 @@ async fn prepare_youtube_audio(
     let _ = std::fs::create_dir_all(&downloads_root);
 
     let temp_audio = audio_root.join(format!("{}.wav", job_id));
-    let cached_audio = audio_root.join(format!("youtube-{}.wav", source_key));
+    let cached_audio =
+        audio_root.join(prepared_audio_filename(SourceType::Youtube, &source_key));
     let download_template = downloads_root.join(format!("{}.%(ext)s", job_id));
 
     let result: Result<(), String> = async {
@@ -435,10 +530,7 @@ async fn prepare_youtube_audio(
             state.events.publish(&j);
         }
 
-        run_ffmpeg_extract(&app, &downloaded, &temp_audio).await?;
-        if let Err(e) = std::fs::rename(&temp_audio, &cached_audio) {
-            return Err(format!("rename audio failed: {}", e));
-        }
+        produce_canonical_wav(&app, &downloaded, &temp_audio, &cached_audio).await?;
         let _ = std::fs::remove_file(&downloaded);
 
         let _ = state.store.update_source_audio(
@@ -466,21 +558,92 @@ async fn prepare_youtube_audio(
     .await;
 
     if let Err(message) = result {
+        fail_job(&state, &job_id, message);
+    }
+
+    let _ = std::fs::remove_file(&temp_audio);
+    state.events.track_download_end();
+}
+
+/// The local-file twin of `prepare_youtube_audio`.
+///
+/// Same `tauri::async_runtime::spawn`, same `JobEvents` publishing, same audio
+/// cache directory, same canonical WAV. The ONLY difference is where the input
+/// comes from: a path the user picked, rather than one yt-dlp downloaded. Local
+/// files used to skip all of this — the webview decoded them with `AudioContext`
+/// and posted the PCM straight to the worker, so no WAV ever hit the disk and
+/// Rust never saw the audio at all.
+async fn prepare_file_audio(
+    app: AppHandle,
+    job_id: String,
+    source_id: i64,
+    source_key: String,
+    input: PathBuf,
+) {
+    let state = app.state::<AppState>();
+
+    // The same concurrency bound the YouTube path respects. ffmpeg is the
+    // expensive step in both, and it is the step being shared here.
+    let _permit = match state.download_semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let audio_root = match audio_dir(&app) {
+        Ok(p) => p,
+        Err(e) => {
+            fail_job(&state, &job_id, e);
+            return;
+        }
+    };
+    let _ = std::fs::create_dir_all(&audio_root);
+
+    let scratch = audio_root.join(format!("{}.wav", job_id));
+    let destination = audio_root.join(prepared_audio_filename(SourceType::File, &source_key));
+
+    let result: Result<(), String> = async {
         let _ = state.store.update_job(
             &job_id,
             JobUpdate {
-                status: Some(JobStatus::Failed),
-                error: Some(message),
+                status: Some(JobStatus::Extracting),
+                progress: Some(0.1),
                 ..Default::default()
             },
         );
         if let Ok(Some(j)) = state.store.get_job(&job_id) {
             state.events.publish(&j);
         }
+
+        produce_canonical_wav(&app, &input, &scratch, &destination).await?;
+
+        let _ = state.store.update_source_audio(
+            source_id,
+            destination.to_string_lossy().as_ref(),
+            "audio/wav",
+            None,
+        );
+        let _ = state.store.update_job(
+            &job_id,
+            JobUpdate {
+                status: Some(JobStatus::Ready),
+                progress: Some(1.0),
+                audio_mime_type: Some("audio/wav".to_string()),
+                ..Default::default()
+            },
+        );
+        if let Ok(Some(j)) = state.store.get_job(&job_id) {
+            state.events.publish(&j);
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(message) = result {
+        fail_job(&state, &job_id, message);
     }
 
-    let _ = std::fs::remove_file(&temp_audio);
-    state.events.track_download_end();
+    let _ = std::fs::remove_file(&scratch);
 }
 
 async fn run_yt_dlp_dump_json(app: &AppHandle, url: &str) -> Result<serde_json::Value, String> {
@@ -528,19 +691,7 @@ async fn run_ffmpeg_extract(
     let handle = spawn_sidecar(
         app,
         "ffmpeg",
-        &[
-            "-i",
-            &input_str,
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-y",
-            &output_str,
-        ],
+        &ffmpeg_canonical_wav_args(&input_str, &output_str),
         None,
     )
     .map_err(|e| e.to_string())?;
@@ -629,24 +780,50 @@ fn find_downloaded_file(downloads_dir: &Path, stem: &str) -> Option<PathBuf> {
     None
 }
 
+/// A local file now takes exactly the same route as a YouTube video: a job, an
+/// ffmpeg pass into the canonical WAV, `Ready`, and the frontend fetching that
+/// WAV back. It used to return `Ready` immediately without touching the audio,
+/// because the webview did the decoding — which left Rust with no audio on disk
+/// for the one source type users are most likely to diarize.
 #[tauri::command]
 pub async fn create_file_job(
     request: FileJobRequest,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Job, String> {
-    if !FILE_HASH_RE.is_match(&request.file_hash) {
-        return Err("Invalid file hash".to_string());
+    let audio_root = audio_dir(&app)?;
+    state
+        .store
+        .cleanup_expired_audio(crate::paths::PREPARED_AUDIO_TTL_HOURS, &audio_root);
+
+    let input = PathBuf::from(&request.path);
+    if !input.is_file() {
+        return Err(format!("File not found: {}", request.path));
     }
+
+    let filename = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio")
+        .to_string();
+    let size_bytes = std::fs::metadata(&input).map(|m| m.len() as i64).ok();
     let language = normalize_language(&request.language);
+
+    // Hashing a multi-gigabyte file is not something to do on an async worker
+    // thread; the whole runtime stalls behind it.
+    let hash_input = input.clone();
+    let source_key = tauri::async_runtime::spawn_blocking(move || hash_file(&hash_input))
+        .await
+        .map_err(|e| e.to_string())??;
 
     let source = state
         .store
         .get_or_create_source(
             SourceType::File,
-            &request.file_hash,
-            None,
-            Some(&request.filename),
-            Some(request.size_bytes),
+            &source_key,
+            Some(&request.path),
+            Some(&filename),
+            size_bytes,
         )
         .map_err(|e| e.to_string())?;
 
@@ -660,9 +837,9 @@ pub async fn create_file_job(
             .create_job_from_cache(
                 source.id,
                 SourceType::File,
-                &request.file_hash,
-                Some(&request.filename),
-                None,
+                &source_key,
+                Some(&filename),
+                source.audio_mime_type.as_deref(),
                 &request.model_id,
                 request.task,
                 &language,
@@ -672,20 +849,60 @@ pub async fn create_file_job(
             .map_err(|e| e.to_string());
     }
 
-    state
+    // The canonical WAV may already be on disk from an earlier job for this same
+    // file — the same audio-cache short circuit the YouTube path takes. The WAV
+    // is content-addressed, so this hits even if the user moved or renamed the
+    // file since.
+    if let Some(audio_path) = source.audio_path.as_deref() {
+        if Path::new(audio_path).exists() {
+            state
+                .store
+                .touch_source(source.id)
+                .map_err(|e| e.to_string())?;
+            return state
+                .store
+                .create_pending_job(
+                    source.id,
+                    SourceType::File,
+                    &source_key,
+                    JobStatus::Ready,
+                    Some(&filename),
+                    source.audio_mime_type.as_deref(),
+                    &request.model_id,
+                    request.task,
+                    &language,
+                )
+                .map_err(|e| e.to_string());
+        }
+    }
+
+    let job = state
         .store
         .create_pending_job(
             source.id,
             SourceType::File,
-            &request.file_hash,
-            JobStatus::Ready,
-            Some(&request.filename),
+            &source_key,
+            JobStatus::Extracting,
+            Some(&filename),
             None,
             &request.model_id,
             request.task,
             &language,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    state.events.publish(&job);
+
+    let job_id = job.id.clone();
+    let source_id = source.id;
+    let key = source_key.clone();
+    let app_clone = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        prepare_file_audio(app_clone, job_id, source_id, key, input).await;
+    });
+
+    Ok(job)
 }
 
 #[tauri::command]
@@ -697,6 +914,13 @@ pub async fn get_job(job_id: String, state: State<'_, AppState>) -> Result<Job, 
         .ok_or_else(|| "Job not found".to_string())
 }
 
+/// Answers for EVERY job, not just the YouTube ones.
+///
+/// This used to reject anything that was not a YouTube job — "This job does not
+/// have prepared audio" — which was true at the time: local files were decoded
+/// in the webview and no WAV was ever written for them. Now both source types
+/// produce one, so both can be fetched back, and anything Rust-side that wants
+/// audio for a job (diarization) can rely on this.
 #[tauri::command]
 pub async fn get_prepared_audio_path(
     job_id: String,
@@ -709,12 +933,8 @@ pub async fn get_prepared_audio_path(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Job not found".to_string())?;
 
-    if !matches!(job.source_type, SourceType::Youtube) {
-        return Err("This job does not have prepared audio".to_string());
-    }
-
     let audio_root = audio_dir(&app)?;
-    let audio_path = audio_root.join(format!("youtube-{}.wav", job.source_key));
+    let audio_path = audio_root.join(prepared_audio_filename(job.source_type, &job.source_key));
     if !audio_path.exists() {
         return Err("Prepared audio not found".to_string());
     }
@@ -881,5 +1101,123 @@ mod tests {
                 "{id:?} is not a _timestamped export — word timestamps will throw at runtime"
             );
         }
+    }
+
+    /// The format contract, pinned.
+    ///
+    /// sherpa-onnx's diarization expects 16 kHz mono 16-bit PCM. ffmpeg will
+    /// happily produce something else if these flags drift, and NOTHING downstream
+    /// would throw: the webview resamples whatever it decodes, so transcription
+    /// would look fine while the diarizer silently reads audio at the wrong rate
+    /// and returns speaker turns at the wrong TIMES. That is a wrong-answer bug,
+    /// not a crash, so the flags are asserted here rather than trusted.
+    #[test]
+    fn the_canonical_wav_is_16khz_mono_pcm_s16le() {
+        let args = ffmpeg_canonical_wav_args("/in.mp4", "/out.wav");
+
+        let flag = |name: &str| -> Option<String> {
+            args.iter()
+                .position(|a| *a == name)
+                .and_then(|i| args.get(i + 1))
+                .map(|v| v.to_string())
+        };
+
+        assert_eq!(flag("-ar").as_deref(), Some("16000"), "sample rate must be 16 kHz");
+        assert_eq!(flag("-ac").as_deref(), Some("1"), "must be mono");
+        assert_eq!(
+            flag("-acodec").as_deref(),
+            Some("pcm_s16le"),
+            "must be signed 16-bit little-endian PCM"
+        );
+        assert_eq!(flag("-i").as_deref(), Some("/in.mp4"));
+        assert!(args.contains(&"-vn"), "video streams must be dropped");
+        assert_eq!(
+            args.last().copied(),
+            Some("/out.wav"),
+            "ffmpeg takes the output path last"
+        );
+    }
+
+    /// Both source types get a prepared WAV, and they cannot collide.
+    ///
+    /// The `youtube-{id}.wav` shape is load-bearing beyond neatness: it is the
+    /// name the YouTube path has always written, so changing it would orphan
+    /// every WAV already in a user's audio cache.
+    #[test]
+    fn every_source_type_has_a_prepared_wav_path() {
+        assert_eq!(
+            prepared_audio_filename(SourceType::Youtube, "dQw4w9WgXcQ"),
+            "youtube-dQw4w9WgXcQ.wav"
+        );
+        assert_eq!(
+            prepared_audio_filename(SourceType::File, "abc123"),
+            "file-abc123.wav"
+        );
+
+        // The two key spaces are independent, so the prefix is what keeps a file
+        // hash from ever shadowing a video id.
+        assert_ne!(
+            prepared_audio_filename(SourceType::File, "collide"),
+            prepared_audio_filename(SourceType::Youtube, "collide")
+        );
+    }
+
+    /// The source key for a local file is a SHA-256 of its BYTES.
+    ///
+    /// Keying on the path instead would re-transcribe a file the moment the user
+    /// renamed it, and would treat two copies of the same recording as two
+    /// sources. The webview's old `sha256Hex(await file.arrayBuffer())` was
+    /// content-addressed, and the transcript cache is keyed on its output — so the
+    /// Rust replacement must be content-addressed over the same bytes with the
+    /// same algorithm, or every transcript users already made becomes unreachable.
+    /// (That exact class of bug — a changed cache key orphaning existing
+    /// transcripts — is what the `model_id_alias` machinery in `store.rs` exists to
+    /// clean up after.)
+    #[test]
+    fn a_local_file_is_keyed_by_a_sha256_of_its_contents_not_its_path() {
+        let dir = std::env::temp_dir().join(format!("remedy-hash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let original = dir.join("lecture.mp3");
+        let renamed = dir.join("lecture-final-v2.mp3");
+        let different = dir.join("other.mp3");
+
+        std::fs::write(&original, b"the same bytes").expect("write");
+        std::fs::write(&renamed, b"the same bytes").expect("write");
+        std::fs::write(&different, b"different bytes").expect("write");
+
+        let key = hash_file(&original).expect("hash");
+
+        assert_eq!(key.len(), 64, "a SHA-256 is 64 hex characters");
+        assert!(
+            key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "must be lowercase hex, like the webview's sha256Hex: {key}"
+        );
+
+        assert_eq!(
+            key,
+            hash_file(&renamed).expect("hash"),
+            "the same bytes under a different name must be the SAME source — \
+             otherwise renaming a file silently re-transcribes it"
+        );
+        assert_ne!(
+            key,
+            hash_file(&different).expect("hash"),
+            "different bytes must be different sources"
+        );
+
+        // It is really SHA-256, and not merely *a* stable digest: pinned against
+        // the standard empty-input vector. This is what guarantees the Rust hash
+        // and the webview's `crypto.subtle.digest("SHA-256", ...)` agree, so
+        // transcripts cached under the old frontend-computed key still hit.
+        let empty = dir.join("empty.mp3");
+        std::fs::write(&empty, b"").expect("write");
+        assert_eq!(
+            hash_file(&empty).expect("hash"),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "not SHA-256 — every transcript cached under the old key would be orphaned"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

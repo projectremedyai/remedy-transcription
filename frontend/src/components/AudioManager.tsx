@@ -242,24 +242,33 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 }`}
             >
                 {/*
-                 * Both entry points are gated on `isBusy`, and this gate is a UX
-                 * choice, not a safety mechanism: the app models exactly ONE
-                 * transcript at a time — one `jobId`, one output — so a second run
-                 * started mid-flight could not be shown, only substituted.
+                 * Both entry points are gated on `isBusy`.
                  *
-                 * The safety is in the hook, and it is checked by test: an overlap
-                 * is safe because `startFromFile` / `startFromYouTube` call
-                 * `cancelPendingWait()` synchronously, before their first `await`
-                 * (see `useTranscriber.ts`), and a superseded run's continuations
-                 * are dropped by its run token. "supersedes a run whose createJob
-                 * is still in flight" in `useTranscriber.test.ts` drives exactly
-                 * that overlap with this gate out of the picture, and it fails
-                 * against the pre-fix hook.
+                 * WHAT THE GATE IS NOT: it is no longer the thing that keeps an
+                 * overlap safe. It used to be — remove it before the current fix
+                 * and a second run could be started over a live one, whose worker
+                 * kept running, whose `complete` then resolved the NEW run's
+                 * promise with the OLD run's transcript, which was persisted under
+                 * the new run's job and content-cached forever. That is now closed
+                 * in the hook and pinned by tests that drive the overlap directly,
+                 * with this gate out of the picture (`useTranscriber.test.ts`,
+                 * "under an overlap the worker cannot stop" — all three fail against
+                 * the pre-fix hook): a new run terminates the previous worker, and
+                 * every worker message carries the id of the run that asked for it,
+                 * so a message that outlives its run is dropped rather than
+                 * misattributed.
                  *
-                 * So this gate can be removed for a queue, or a second panel, or
-                 * whatever else, without re-opening the spurious-transcription bug.
-                 * Removing it does mean the app is once again startable into a
-                 * substitution the user did not ask for — which is why it is here.
+                 * WHAT STILL DEPENDS ON IT, and would need answering before this
+                 * gate comes off for a queue or a second panel:
+                 *   - The app models exactly ONE transcript — one `jobId`, one
+                 *     `output`, one `status`. A second run cannot be SHOWN, only
+                 *     substituted, so without the gate a user can silently lose the
+                 *     run they were watching. This is the UX reason it exists.
+                 *   - `cancel()` / supersede do NOT cancel the BACKEND (there is no
+                 *     `cancel_job` command). The abandoned job's ffmpeg or yt-dlp
+                 *     runs to completion holding a `download_semaphore` permit and
+                 *     an active-download count, so without the gate a user can stack
+                 *     up abandoned backend work that later runs queue behind.
                  */}
                 <div className='flex flex-row space-x-2 py-2 w-full px-2'>
                     <YouTubeTile

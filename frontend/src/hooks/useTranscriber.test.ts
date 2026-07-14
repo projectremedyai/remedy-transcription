@@ -16,6 +16,8 @@ import type { Job } from "../services/api";
 
 const mocks = vi.hoisted(() => ({
     postMessage: vi.fn(),
+    /** `useWorker`'s `restart` — i.e. `worker.terminate()` + a fresh worker. */
+    restartWorker: vi.fn(),
     createFileJob: vi.fn(),
     createYouTubeJob: vi.fn(),
     getJob: vi.fn(),
@@ -26,8 +28,20 @@ const mocks = vi.hoisted(() => ({
     unsubscribe: vi.fn(),
 }));
 
+/**
+ * The live worker message handler. Holding it is what lets a test post a message
+ * FROM the worker — which is the only way to reproduce the real bug, because the
+ * real worker keeps running (and keeps posting) after the app has abandoned it.
+ */
+const workerHandler = vi.hoisted(() => ({
+    current: null as ((event: { data: unknown }) => void) | null,
+}));
+
 vi.mock("./useWorker", () => ({
-    useWorker: () => ({ postMessage: mocks.postMessage }),
+    useWorker: (handler: (event: { data: unknown }) => void) => {
+        workerHandler.current = handler;
+        return { postMessage: mocks.postMessage, restart: mocks.restartWorker };
+    },
 }));
 
 vi.mock("../services/api", () => ({
@@ -93,6 +107,39 @@ async function renderTranscriber() {
     const rendered = renderHook(() => useTranscriber());
     await settle();
     return rendered;
+}
+
+/** Deliver a message from the worker, exactly as the real one would. */
+async function emitFromWorker(data: unknown) {
+    await act(async () => {
+        workerHandler.current?.({ data });
+        await Promise.resolve();
+    });
+    await settle();
+}
+
+/**
+ * The `runId` the hook stamped on the Nth `transcribe` message it posted.
+ *
+ * Read rather than hardcoded: the token is bumped by every start AND by every
+ * cancel, so "run 2" is not id 2. Reading it back is also the point — a build
+ * that does not stamp one returns `undefined` here, and every message this test
+ * then emits is unattributable, which is precisely the bug.
+ */
+function postedRunId(callIndex: number): unknown {
+    return mocks.postMessage.mock.calls[callIndex]?.[0]?.runId;
+}
+
+function workerComplete(runId: unknown, text: string) {
+    return {
+        status: "complete",
+        runId,
+        data: {
+            text,
+            chunks: [],
+            words: [{ text, start: 0, end: 5 }],
+        },
+    };
 }
 
 beforeEach(() => {
@@ -478,5 +525,234 @@ describe("useTranscriber's wait for prepared audio", () => {
 
         expect(mocks.getJob.mock.calls.length).toBe(pollsBeforeUnmount);
         expect(mocks.unsubscribe).toHaveBeenCalled();
+    });
+});
+
+/**
+ * The worker is a SINGLE object that outlives every run, its message handler is
+ * `async`, and `terminate()` cannot recall a message already posted. So the app
+ * can be handed output from a run it abandoned minutes ago. These tests post those
+ * messages.
+ *
+ * Nothing in the suite did that before, which is why three rounds of guards on
+ * `pendingWorkerRef` passed every test while the bug walked downstream: a boolean
+ * "is anyone waiting?" cannot answer "is this the run I am waiting for?", and only
+ * a test that posts a DEAD run's message can tell the two apart.
+ */
+describe("useTranscriber under an overlap the worker cannot stop", () => {
+    const RUN_ONE_TEXT =
+        "the long lecture, transcribed by the run we abandoned";
+    const RUN_TWO_TEXT =
+        "the short interview, which is what the user asked for";
+
+    /** Both files ready the moment they are asked for; the worker is the slow part. */
+    function twoReadyFiles() {
+        mocks.createFileJob.mockImplementation(async ({ path }) =>
+            makeJob({
+                id: path.includes("lecture") ? "job-1" : "job-2",
+                status: "ready",
+                progress: 1,
+                filename: path.includes("lecture")
+                    ? "lecture.mp3"
+                    : "interview.mp3",
+            }),
+        );
+        mocks.getJob.mockImplementation(async (jobId: string) =>
+            makeJob({ id: jobId, status: "ready", progress: 1 }),
+        );
+    }
+
+    /**
+     * THE CRITICAL REPRO — the wrong transcript, persisted under the wrong job,
+     * and permanently cached. Reachable in the shipped app with the Cancel button.
+     *
+     *   1. Run 1 starts on a long file. Whisper begins grinding.
+     *   2. The user hits Cancel. The app goes idle — but the worker does NOT stop;
+     *      nothing can stop it except terminating it.
+     *   3. The user starts run 2 on a DIFFERENT file. A second `transcribe` is
+     *      posted; the old handler is still awaiting inside the same worker.
+     *   4. Run 1's `complete` lands. `pendingWorkerRef` is truthy (it holds RUN 2),
+     *      so the old `if (!pendingWorkerRef.current)` guard PASSED — and resolved
+     *      RUN 2's promise with RUN 1's transcript.
+     *   5. Run 2 persists run 1's text under job 2. The cache is content-keyed, so
+     *      that wrong transcript is now the permanent cache hit for file 2: no
+     *      recompute, no error, no way for the user to know.
+     *
+     * The fix is both halves. Cancel TERMINATES the worker (asserted below), which
+     * is the only thing that actually stops transformers.js. And every message
+     * carries the id of the run that asked for it, so a message that outlives its
+     * run — a terminate cannot recall what is already in the queue — is dropped
+     * instead of being mistaken for the live run's.
+     */
+    it("does not resolve a live run with an abandoned run's transcript", async () => {
+        twoReadyFiles();
+        const { result } = await renderTranscriber();
+
+        // Run 1: the long file. It reaches the worker and Whisper starts.
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        expect(result.current.status).toBe("transcribing");
+        expect(postedRunId(0)).toEqual(expect.any(Number));
+
+        // The user cancels. The worker must be TERMINATED — ignoring its messages
+        // is not stopping it, and it will otherwise pin every core for minutes.
+        await act(async () => {
+            result.current.cancel();
+        });
+        expect(mocks.restartWorker).toHaveBeenCalledTimes(1);
+        expect(result.current.isBusy).toBe(false);
+
+        // Run 2: a DIFFERENT file.
+        await act(async () => {
+            result.current.start("/tmp/interview.mp3");
+        });
+        await settle();
+        expect(result.current.status).toBe("transcribing");
+        expect(result.current.jobId).toBe("job-2");
+        expect(mocks.postMessage).toHaveBeenCalledTimes(2);
+
+        // Run 1's `complete` arrives anyway — it started minutes earlier and was
+        // already in flight when the terminate landed.
+        await emitFromWorker(workerComplete(postedRunId(0), RUN_ONE_TEXT));
+
+        // It must be dropped whole. Run 2's promise is NOT settled by it...
+        expect(result.current.status).toBe("transcribing");
+        expect(result.current.isBusy).toBe(true);
+        // ...it is not painted under run 2's filename...
+        expect(result.current.output?.text ?? "").not.toContain("lecture");
+        // ...and above all it is not written to the store.
+        expect(mocks.persistTranscript).not.toHaveBeenCalled();
+
+        // Run 2's own `complete` — the real one — still works, and is what gets
+        // persisted, under run 2's job.
+        await emitFromWorker(workerComplete(postedRunId(1), RUN_TWO_TEXT));
+
+        expect(mocks.persistTranscript).toHaveBeenCalledTimes(1);
+        const [persistedJobId, payload] = mocks.persistTranscript.mock.calls[0];
+        expect(persistedJobId).toBe("job-2");
+        expect(payload.full_text).toBe(RUN_TWO_TEXT);
+        // The assertion the whole bug reduces to.
+        expect(payload.full_text).not.toBe(RUN_ONE_TEXT);
+        expect(result.current.status).toBe("completed");
+    });
+
+    /**
+     * The variant that goes the other way. Run 2 picks a different preset/device,
+     * so `PipelineFactory.getInstance` calls `dispose()` on the instance run 1 is
+     * mid-inference on; run 1 throws and posts `error`. With one unkeyed slot that
+     * `error` REJECTED RUN 2's promise, and blew run 1's message and `isBusy:
+     * false` over a run that was transcribing perfectly well.
+     */
+    it("does not fail a live run with an abandoned run's error", async () => {
+        twoReadyFiles();
+        const { result } = await renderTranscriber();
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        // Superseded WITHOUT a cancel: straight into a second run.
+        await act(async () => {
+            result.current.start("/tmp/interview.mp3");
+        });
+        await settle();
+        expect(result.current.status).toBe("transcribing");
+        expect(mocks.restartWorker).toHaveBeenCalledTimes(1);
+
+        await emitFromWorker({
+            status: "error",
+            runId: postedRunId(0),
+            data: { message: "Session already released" },
+        });
+
+        expect(result.current.error).toBeNull();
+        expect(result.current.status).toBe("transcribing");
+        expect(result.current.isBusy).toBe(true);
+
+        await emitFromWorker(workerComplete(postedRunId(1), RUN_TWO_TEXT));
+
+        expect(mocks.persistTranscript).toHaveBeenCalledTimes(1);
+        expect(mocks.persistTranscript.mock.calls[0][1].full_text).toBe(
+            RUN_TWO_TEXT,
+        );
+        expect(result.current.status).toBe("completed");
+    });
+
+    /**
+     * `teardown()` did not set `settled`.
+     *
+     * `clearInterval` stops the NEXT poll; it cannot recall the `getJob` already in
+     * flight — which is exactly why `settled` exists. `finish()` set it; the
+     * cancel/supersede path (`cancelPendingWait` → `teardown`) did not. So a
+     * superseded run's in-flight `getJob` sailed through the guard and handed a
+     * DEAD job to `handleBackendJobUpdate`: its id, its progress, its status, and —
+     * a failed job — its `setError` and `setIsBusy(false)`, all over a live run.
+     *
+     * The existing suite could not catch this: its `getJob` mock settles in a
+     * microtask, so no `getJob` is ever in flight across a teardown. This one makes
+     * the poll genuinely slow.
+     */
+    it("ignores a getJob still in flight when a supersede tears the wait down", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "extracting", progress: 0.1 }),
+        );
+        // 500 ms to answer — and it answers with a job that FAILED.
+        mocks.getJob.mockImplementation(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            return makeJob({
+                id: "job-1",
+                status: "failed",
+                progress: 0.1,
+                error: "ffmpeg exited with code Some(1)",
+            });
+        });
+        mocks.createYouTubeJob.mockResolvedValue(
+            makeJob({
+                id: "job-2",
+                source_type: "youtube",
+                status: "completed",
+                progress: 1,
+                cache_hit: true,
+                full_text: "the cached transcript",
+                filename: "A cached video",
+            }),
+        );
+
+        const { result } = await renderTranscriber();
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+
+        // t=300: the poll fires. Its `getJob` is now in flight and will not answer
+        // until t=800.
+        await tick(300);
+        expect(mocks.getJob).toHaveBeenCalledTimes(1);
+
+        // t=400: superseded by a cached YouTube transcript. The wait is torn down —
+        // but that in-flight `getJob` is still coming.
+        await tick(100);
+        await act(async () => {
+            result.current.startFromYouTube(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            );
+        });
+        await settle();
+        expect(result.current.status).toBe("completed");
+        expect(result.current.jobId).toBe("job-2");
+
+        // t=900: the dead job answers. Nothing of it may reach the UI, and it must
+        // not settle anything.
+        await tick(500);
+
+        expect(result.current.status).toBe("completed");
+        expect(result.current.jobId).toBe("job-2");
+        expect(result.current.error).toBeNull();
+        expect(result.current.output?.text).toBe("the cached transcript");
+        expect(mocks.getAudioUrl).not.toHaveBeenCalled();
+        expect(mocks.postMessage).not.toHaveBeenCalled();
     });
 });

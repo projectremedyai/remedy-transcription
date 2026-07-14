@@ -24,6 +24,26 @@ const LARGE_TURBO_MODEL_ID: string = modelIdForPreset("quality");
 
 type WorkerRequest = {
     type: "transcribe";
+    /**
+     * Which run asked for this. Echoed back on EVERY message this request
+     * produces — `initiate`/`progress`/`done`/`ready`, `update`, `complete`,
+     * `error` — so the hook can tell whose output it is holding.
+     *
+     * This handler is `async`: a second `transcribe` posted while the first is
+     * still awaiting `transcriber(...)` does not queue behind it, it starts a
+     * SECOND handler that runs concurrently against the same shared
+     * `PipelineFactory.instance`. Both then post `update`s and a `complete` at
+     * the same unlabelled receiver. Without this id the receiver cannot answer
+     * the only question that matters — "is this the run I am waiting for?" — and
+     * will happily resolve run 2's promise with run 1's transcript, which is then
+     * persisted under run 2's job and content-cached against run 2's file
+     * forever.
+     *
+     * The app also terminates the worker when it abandons a run, which is what
+     * actually stops the inference. The id is what makes the receiver correct
+     * even so, because `terminate()` cannot recall a message already in flight.
+     */
+    runId: number;
     audio: Float32Array;
     modelId: string;
     device: "webgpu" | "wasm";
@@ -81,21 +101,27 @@ class PipelineFactory {
     }
 }
 
-function postMessageSafe(data: unknown) {
-    self.postMessage(data);
-}
-
 self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
     const message = event.data;
     if (message.type !== "transcribe") {
         return;
     }
 
+    /**
+     * Every message this request emits is stamped with the run that asked for it.
+     * There is no unlabelled path out of this handler — the stamp is applied here,
+     * once, rather than at each of the five call sites, so a new message type
+     * cannot forget it.
+     */
+    const post = (data: object) => {
+        self.postMessage({ ...data, runId: message.runId });
+    };
+
     try {
         const transcriber: any = await PipelineFactory.getInstance(
             message.modelId,
             message.device,
-            (progress) => postMessageSafe(progress),
+            (progress) => post(progress as object),
         );
 
         const timePrecision =
@@ -172,7 +198,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             callback_function: (text: string) => {
                 openWindowChunk();
                 chunks[chunks.length - 1].text += text;
-                postMessageSafe({
+                post({
                     status: "update",
                     data: {
                         text: "",
@@ -235,7 +261,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
                 end: chunk.timestamp[1] as number,
             }));
 
-        postMessageSafe({
+        post({
             status: "complete",
             data: {
                 text: output.text,
@@ -253,7 +279,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             error instanceof Error
                 ? error.message
                 : "Unknown transcription error";
-        postMessageSafe({
+        post({
             status: "error",
             data: { message: messageText },
         });

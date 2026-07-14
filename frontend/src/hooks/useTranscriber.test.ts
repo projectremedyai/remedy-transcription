@@ -682,6 +682,172 @@ describe("useTranscriber under an overlap the worker cannot stop", () => {
     });
 
     /**
+     * `api.persistTranscript` is a Tauri IPC round-trip that writes one row per
+     * segment — thousands of them for a lecture. It is SLOW, and the app sits
+     * inside it with `status: "persisting"` and `isBusy: true`, which is to say
+     * with the Cancel button on screen. So make it slow here: a persist that
+     * settles in a microtask cannot reproduce anything, because no user event can
+     * land inside a microtask.
+     *
+     * The persisted job echoes the text it was given, exactly as Rust does — a
+     * mock that returned a fixed job would hide WHOSE transcript came back.
+     */
+    function slowPersist(ms: number) {
+        mocks.persistTranscript.mockImplementation(
+            async (jobId: string, payload: { full_text: string }) => {
+                await new Promise((resolve) => setTimeout(resolve, ms));
+                return makeJob({
+                    id: jobId,
+                    status: "completed",
+                    progress: 1,
+                    full_text: payload.full_text,
+                    filename: "lecture.mp3",
+                });
+            },
+        );
+    }
+
+    /**
+     * THE LAST UNGUARDED AWAIT. Cancel is the trigger, and nothing holds the
+     * persist.
+     *
+     *   1. Run 1 (a long lecture) finishes in the worker. `transcribePreparedJob`
+     *      resumes and calls `persistWorkerTranscript`; the app is `persisting`,
+     *      `isBusy`, so the Cancel button is on screen.
+     *   2. It parks inside `await api.persistTranscript`.
+     *   3. The user hits Cancel. `claimRun()` bumps the token — but the worker is
+     *      idle so nothing is terminated, and nothing is rejected. NOTHING IS
+     *      HOLDING THE PERSIST.
+     *   4. The user starts run 2, a cached YouTube URL. It completes and paints.
+     *   5. Run 1's persist resolves and calls `applyCompletedJob` — `setJobId`,
+     *      `setTranscript`, `setStatus("completed")`, `setIsBusy(false)` — for a
+     *      run that has been dead since step 3.
+     *
+     * The user asked for a YouTube video, watched it complete, and is left looking
+     * at the transcript they cancelled, under the WRONG jobId. Every jobId-keyed
+     * action downstream — export, and Task 8's diarizer — then targets job 1.
+     *
+     * The persist itself must still COMPLETE: writing run 1's transcript under run
+     * 1's job is correct, and the content-keyed cache keeps the work. It simply
+     * must not repaint a UI it no longer owns.
+     */
+    it("does not repaint a finished run with a dead run's persist", async () => {
+        twoReadyFiles();
+        slowPersist(1000);
+        mocks.createYouTubeJob.mockResolvedValue(
+            makeJob({
+                id: "job-2",
+                source_type: "youtube",
+                status: "completed",
+                progress: 1,
+                cache_hit: true,
+                full_text: "the cached transcript",
+                filename: "A cached video",
+            }),
+        );
+
+        const { result } = await renderTranscriber();
+
+        // Run 1: the long lecture. Whisper finishes; the persist begins.
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), RUN_ONE_TEXT));
+
+        expect(result.current.status).toBe("persisting");
+        expect(result.current.isBusy).toBe(true);
+        expect(mocks.persistTranscript).toHaveBeenCalledTimes(1);
+
+        // The user cancels while the persist is still in flight.
+        await act(async () => {
+            result.current.cancel();
+        });
+        expect(result.current.isBusy).toBe(false);
+
+        // Run 2: a cached YouTube URL. It completes and paints immediately.
+        await act(async () => {
+            result.current.startFromYouTube(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            );
+        });
+        await settle();
+        expect(result.current.jobId).toBe("job-2");
+        expect(result.current.output?.text).toBe("the cached transcript");
+
+        // Run 1's persist lands.
+        await tick(1000);
+
+        // It wrote its OWN job — that is the feature, and it must not regress into
+        // "the fix is to skip the persist".
+        expect(mocks.persistTranscript.mock.calls[0][0]).toBe("job-1");
+        expect(mocks.persistTranscript.mock.calls[0][1].full_text).toBe(
+            RUN_ONE_TEXT,
+        );
+
+        // And it touched nothing the user is looking at.
+        expect(result.current.jobId).toBe("job-2");
+        expect(result.current.status).toBe("completed");
+        expect(result.current.output?.text).toBe("the cached transcript");
+        expect(result.current.output?.filename).toBe("A cached video");
+        expect(result.current.isBusy).toBe(false);
+    });
+
+    /**
+     * The same hole, under a LIVE run 2 rather than a finished one, and it is the
+     * uglier half: `applyCompletedJob` ends with `setIsBusy(false)`, so a dead
+     * run's persist RELEASES THE BUSY GATE while run 2's Whisper is still grinding.
+     * The busy panel disappears, the Cancel button with it, the tiles unlock, and
+     * run 1's transcript is on screen under run 1's job while run 2 runs.
+     */
+    it("does not release the busy gate under a live run when a dead run persists", async () => {
+        twoReadyFiles();
+        slowPersist(1000);
+
+        const { result } = await renderTranscriber();
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), RUN_ONE_TEXT));
+        expect(result.current.status).toBe("persisting");
+
+        await act(async () => {
+            result.current.cancel();
+        });
+
+        // Run 2: a different file, and its Whisper is still running when run 1's
+        // persist lands.
+        await act(async () => {
+            result.current.start("/tmp/interview.mp3");
+        });
+        await settle();
+        expect(result.current.status).toBe("transcribing");
+        expect(result.current.isBusy).toBe(true);
+        expect(result.current.jobId).toBe("job-2");
+
+        await tick(1000);
+
+        // The gate is what keeps the Cancel button — the only exit from a run —
+        // on screen. A dead run may not open it.
+        expect(result.current.isBusy).toBe(true);
+        expect(result.current.status).toBe("transcribing");
+        expect(result.current.jobId).toBe("job-2");
+        expect(result.current.output?.text ?? "").not.toContain("lecture");
+
+        // Run 2 then completes and persists normally, under its own job.
+        await emitFromWorker(workerComplete(postedRunId(1), RUN_TWO_TEXT));
+        await tick(1000);
+
+        expect(mocks.persistTranscript).toHaveBeenCalledTimes(2);
+        expect(mocks.persistTranscript.mock.calls[1][0]).toBe("job-2");
+        expect(result.current.jobId).toBe("job-2");
+        expect(result.current.status).toBe("completed");
+        expect(result.current.output?.text).toBe(RUN_TWO_TEXT);
+    });
+
+    /**
      * `teardown()` did not set `settled`.
      *
      * `clearInterval` stops the NEXT poll; it cannot recall the `getJob` already in

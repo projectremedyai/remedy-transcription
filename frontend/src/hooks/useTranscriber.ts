@@ -85,9 +85,19 @@ export interface Transcriber {
     startFromYouTube: (url: string) => void;
     /**
      * Abandon the run in flight and return the app to idle: the wait dies, the
-     * worker is terminated, and nothing still in flight can touch the UI. The only
-     * exit from a run that never terminates, since both entry points are locked
-     * while busy. It does NOT cancel the backend — see `cancel` below.
+     * worker is terminated, and the run token is bumped so that nothing still in
+     * flight can PAINT the UI — every point at which a dead run can resume
+     * re-checks the token before it writes, and every worker message carries the
+     * id of the run that asked for it.
+     *
+     * It does not stop work already started. The backend's ffmpeg/yt-dlp runs to
+     * completion (there is no `cancel_job` — see `cancel` below), and a
+     * `persistTranscript` already in flight still lands, writing the transcript
+     * under its own job: correct, and the content-keyed cache keeps it. Those
+     * writes just cannot reach the screen.
+     *
+     * The only exit from a run that never terminates, since both entry points are
+     * locked while busy.
      */
     cancel: () => void;
     output?: TranscriberData;
@@ -235,13 +245,21 @@ export function useTranscriber(): Transcriber {
         // Model-loading traffic (`initiate`/`progress`/`done`/`ready`) is not tied
         // to a pending promise, so it is keyed against the run token directly. A
         // superseded run's download bar must not be painted over the live run's.
+        //
+        // FAIL CLOSED: this processes a message only if it is CURRENT. It used to
+        // drop one only if it was STAMPED AND STALE (`runId !== undefined &&
+        // runId !== current`), which is the weaker polarity — an UNSTAMPED message
+        // sailed through. Nothing emits one today (the worker's `post()` stamps
+        // every message from one place), but "no unstamped message exists" is a
+        // property of a file this one does not own, and the cost of the strong
+        // polarity is nil: an unstamped `runId` is `undefined`, which never equals
+        // a number, so it is dropped.
         if (
-            message.runId !== undefined &&
-            message.runId !== runIdRef.current &&
             (message.status === "progress" ||
                 message.status === "initiate" ||
                 message.status === "done" ||
-                message.status === "ready")
+                message.status === "ready") &&
+            message.runId !== runIdRef.current
         ) {
             return;
         }
@@ -485,6 +503,19 @@ export function useTranscriber(): Transcriber {
      * `startFromFile`/`startFromYouTube` sees it no longer owns the UI and returns
      * without calling `failRun`, so no error is shown for a run the user
      * abandoned.
+     *
+     * THE INVARIANT THAT MAKES THE ORDERING WORK, since it is load-bearing and was
+     * unwritten: this function is entirely SYNCHRONOUS. `cancelPendingWait()`
+     * rejects before the bump lexically, and `worker.restart()`'s rejection also
+     * runs before the `return` — but a rejection does not run its `catch` inline,
+     * it QUEUES a microtask, and no microtask can run until this function (and the
+     * event handler that called it) returns. So every abandoned continuation
+     * observes the bumped token, whatever order the rejections appear in here. The
+     * same invariant, read the other way, is why the token cannot move across an
+     * `await` whose promise is resolved synchronously from a message handler —
+     * which is what makes the pre-persist guard in `transcribePreparedJob` dead
+     * and the post-persist one live. Introduce an `await` into this function and
+     * both facts stop holding.
      */
     const claimRun = useCallback(() => {
         cancelPendingWait();
@@ -678,13 +709,47 @@ export function useTranscriber(): Transcriber {
         [worker],
     );
 
+    /**
+     * Write the transcript, then — and ONLY then — decide whether this run is
+     * still allowed to paint it.
+     *
+     * `api.persistTranscript` is a Tauri IPC round-trip that writes one row per
+     * segment: thousands of rows for a lecture, and slow. The app sits inside it
+     * with `status: "persisting"` and `isBusy: true` — which is to say with the
+     * Cancel button on screen — and NOTHING HOLDS IT. `claimRun` bumps the token,
+     * abandons the wait and terminates the worker, but the worker is already idle
+     * by now and this promise is not one of the ones it settles. So a cancel (or
+     * a supersede, if the `isBusy` gate ever comes off) lands squarely inside this
+     * await, the run dies, and the persist resolves into a UI it no longer owns.
+     *
+     * Unguarded, `applyCompletedJob` then wrote `setJobId`, `setTranscript`,
+     * `setStatus("completed")` and `setIsBusy(false)` for that dead run: the user
+     * is left looking at the transcript they cancelled, under the wrong job id
+     * (which every jobId-keyed action downstream — export, the diarizer — then
+     * targets), and under a LIVE second run the `setIsBusy(false)` takes the busy
+     * panel and the Cancel button off the screen while Whisper is still grinding.
+     *
+     * THE PERSIST ITSELF STILL COMPLETES, deliberately. The transcript is written
+     * under ITS OWN job, which is correct, and the cache is content-keyed, so the
+     * work the user already paid for is kept and a re-run of that file is a cache
+     * hit. Cancelling a run means "stop showing me this", not "throw the compute
+     * away". What it may not do is repaint.
+     *
+     * Pinned by `useTranscriber.test.ts`: "does not repaint a finished run with a
+     * dead run's persist" and "does not release the busy gate under a live run
+     * when a dead run persists". Delete the guard below and both fail.
+     */
     const persistWorkerTranscript = useCallback(
         async (
             job: Job,
             config: ResolvedModelConfig,
             workerTranscript: WorkerTranscript,
             audioDuration: number,
+            runId: number,
         ) => {
+            // Safe unguarded: the only caller reaches here in the microtask that
+            // follows the worker's `complete`, and the token cannot move inside a
+            // microtask (see `claimRun`).
             setStatus("persisting");
             setIsBusy(true);
             const payload: PersistTranscriptRequest = {
@@ -699,6 +764,13 @@ export function useTranscriber(): Transcriber {
             };
 
             const persistedJob = await api.persistTranscript(job.id, payload);
+
+            // THE LAST GATE, and the last await in the run. Everything above this
+            // line has already happened on disk; everything below it is UI.
+            if (runIdRef.current !== runId) {
+                return;
+            }
+
             applyCompletedJob(persistedJob, config.presetLabel);
         },
         [applyCompletedJob],
@@ -828,23 +900,28 @@ export function useTranscriber(): Transcriber {
                 readyJob.filename || undefined,
             );
 
-            // The last gate before the transcript becomes PERMANENT. `persist`
-            // writes it under `readyJob.id`, and the cache is content-keyed, so a
-            // transcript persisted under the wrong job is the wrong transcript
-            // returned for that file for ever after — a cache hit, no recompute,
-            // no way for the user to tell. The message that produced
-            // `workerTranscript` is already run-keyed, so it cannot be another
-            // run's text; this checks the other direction, that THIS run is still
-            // the one the user is looking at.
-            if (runIdRef.current !== runId) {
-                return;
-            }
-
+            // NO GUARD HERE, deliberately, and this is the fourth round of that
+            // decision so it is worth writing down. One used to sit on this line,
+            // commented "the last gate before the transcript becomes PERMANENT".
+            // It was PROVABLY DEAD: `pending.resolve()` is called synchronously
+            // inside the worker's message handler, so the continuation of the
+            // `await` above is a microtask, microtasks drain before any task, and
+            // no click can bump the token in that window. The condition could
+            // never be false. Worse, it LOOKED like protection — and that is what
+            // hid the live hole ten lines below it, inside `persistWorkerTranscript`,
+            // for three rounds. The real gate is there, after the persist's own
+            // await, which is the one place a cancel can actually land.
+            //
+            // If a future change makes the resolve asynchronous (a `setTimeout`,
+            // a `queueMicrotask` chain that yields, an `await` before the resolve
+            // in the handler), this line becomes reachable and a guard belongs
+            // here again.
             await persistWorkerTranscript(
                 readyJob,
                 config,
                 workerTranscript,
                 audioBuffer.duration,
+                runId,
             );
         },
         [
@@ -923,6 +1000,19 @@ export function useTranscriber(): Transcriber {
      * settles the abandoned promises so their frames unwind, and bumps the run
      * token so anything still in flight lands on a run that no longer owns the UI.
      *
+     * WHAT THE TOKEN BUYS, precisely — a dead run may still FINISH, but it may not
+     * PAINT. Every point at which one can resume re-checks the token before it
+     * writes to the UI: after `beginRun`, after `create*Job`, after `waitForReady`,
+     * after `decodeAudio`, and — the one that was missing for three rounds — after
+     * `api.persistTranscript`. Worker messages are keyed the same way, by the run
+     * that posted them. Driven directly by the tests in "under an overlap the
+     * worker cannot stop".
+     *
+     * Two things are deliberately NOT guarded, and both are correct: the persist
+     * still writes (below), and `setBrowserCaps` inside `ensureBrowserCaps` writes
+     * unconditionally, because the machine's GPU is a property of the machine and
+     * is the same answer for every run.
+     *
      * WHAT THIS DOES NOT DO: cancel the BACKEND. There is no `cancel_job` command;
      * Rust owns the ffmpeg/yt-dlp child and nothing tells it to stop. So after a
      * cancel the download or the extraction runs to completion, still holding its
@@ -930,6 +1020,13 @@ export function useTranscriber(): Transcriber {
      * means `health()` and `queue_status` keep counting it, and the next YouTube
      * run can queue behind a job the user has already abandoned. It eventually
      * clears itself when the child exits. The UI is idle; the machine is not.
+     *
+     * Nor does it stop a `persistTranscript` already in flight — and cancelling
+     * inside that window is exactly how the last bug was reached, because the app
+     * is `isBusy` while persisting, so the Cancel button is on screen. The persist
+     * is allowed to finish (it writes under its OWN job; the compute is kept and
+     * the content-keyed cache will hit on a re-run) and is stopped only from
+     * repainting. See `persistWorkerTranscript`.
      */
     const cancel = useCallback(() => {
         claimRun();

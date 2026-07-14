@@ -269,6 +269,19 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                  *     runs to completion holding a `download_semaphore` permit and
                  *     an active-download count, so without the gate a user can stack
                  *     up abandoned backend work that later runs queue behind.
+                 *   - A finished run sits in `persisting` while `persistTranscript`
+                 *     writes one row per segment over IPC — thousands of them for a
+                 *     lecture, and slow. With the gate ON, only Cancel can start a
+                 *     second run inside that window; with it OFF, a plain supersede
+                 *     does, with no Cancel needed. The UI half of that race is
+                 *     closed in the hook — the persist re-checks the run token
+                 *     after its own await and will not repaint a UI it no longer
+                 *     owns (`useTranscriber.test.ts`: "does not repaint a finished
+                 *     run with a dead run's persist" and "does not release the busy
+                 *     gate under a live run when a dead run persists", both of which
+                 *     drive the overlap with this gate out of the picture) — but the
+                 *     WRITE still happens by design, so without the gate a supersede
+                 *     stacks DB writes the same way it stacks abandoned ffmpeg work.
                  */}
                 <div className='flex flex-row space-x-2 py-2 w-full px-2'>
                     <YouTubeTile

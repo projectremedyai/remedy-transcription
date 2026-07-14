@@ -264,11 +264,14 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                  *     `output`, one `status`. A second run cannot be SHOWN, only
                  *     substituted, so without the gate a user can silently lose the
                  *     run they were watching. This is the UX reason it exists.
-                 *   - `cancel()` / supersede do NOT cancel the BACKEND (there is no
-                 *     `cancel_job` command). The abandoned job's ffmpeg or yt-dlp
-                 *     runs to completion holding a `download_semaphore` permit and
-                 *     an active-download count, so without the gate a user can stack
-                 *     up abandoned backend work that later runs queue behind.
+                 *   - `cancel()` / supersede do NOT stop the backend's ffmpeg or
+                 *     yt-dlp (there is no `cancel_job` command). The abandoned job's
+                 *     child runs to completion holding a `download_semaphore` permit
+                 *     and an active-download count, so without the gate a user can
+                 *     stack up abandoned backend work that later runs queue behind.
+                 *     (`cancel()` DOES kill the diarization sidecar — see
+                 *     `cancel_diarization`. It is the one child that would otherwise
+                 *     burn a core for half an hour rather than finish on its own.)
                  *   - A finished run sits in `persisting` while `persistTranscript`
                  *     writes one row per segment over IPC — thousands of them for a
                  *     lecture, and slow. With the gate ON, only Cancel can start a

@@ -207,9 +207,15 @@ esac
 
 BIN_TMP="$(mktemp -d)"
 
+# `u+w` and not just `+x`: the macOS ffmpeg/ffprobe zips unpack as mode 555, and
+# `tauri build` runs `xattr -cr` over the finished .app to strip quarantine
+# attributes. Clearing an extended attribute needs WRITE permission on the file
+# -- even for its owner -- so a read-only sidecar makes the bundler fail with a
+# bare "failed to run xattr" that names no file and no reason. Belongs here, on
+# the way in, rather than on three copies of it later.
 echo "Fetching yt-dlp -> $DEST/yt-dlp-${TRIPLE}${ext}"
 curl -fsSL --output "$DEST/yt-dlp-${TRIPLE}${ext}" "$ytdlp_url"
-chmod +x "$DEST/yt-dlp-${TRIPLE}${ext}"
+chmod u+wx "$DEST/yt-dlp-${TRIPLE}${ext}"
 
 if [[ -n "$ffmpeg_url" ]]; then
     echo "Fetching ffmpeg -> $DEST/ffmpeg-${TRIPLE}${ext}"
@@ -220,7 +226,7 @@ if [[ -n "$ffmpeg_url" ]]; then
     else
         curl -fsSL -o "$DEST/ffmpeg-${TRIPLE}${ext}" "$ffmpeg_url"
     fi
-    chmod +x "$DEST/ffmpeg-${TRIPLE}${ext}"
+    chmod u+wx "$DEST/ffmpeg-${TRIPLE}${ext}"
 fi
 
 if [[ -n "$ffprobe_url" ]]; then
@@ -232,7 +238,7 @@ if [[ -n "$ffprobe_url" ]]; then
     else
         curl -fsSL -o "$DEST/ffprobe-${TRIPLE}${ext}" "$ffprobe_url"
     fi
-    chmod +x "$DEST/ffprobe-${TRIPLE}${ext}"
+    chmod u+wx "$DEST/ffprobe-${TRIPLE}${ext}"
 fi
 
 echo

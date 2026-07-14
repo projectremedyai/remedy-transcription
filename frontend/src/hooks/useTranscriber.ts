@@ -1013,13 +1013,22 @@ export function useTranscriber(): Transcriber {
      * unconditionally, because the machine's GPU is a property of the machine and
      * is the same answer for every run.
      *
-     * WHAT THIS DOES NOT DO: cancel the BACKEND. There is no `cancel_job` command;
-     * Rust owns the ffmpeg/yt-dlp child and nothing tells it to stop. So after a
-     * cancel the download or the extraction runs to completion, still holding its
-     * `download_semaphore` permit and its `track_download_start()` count — which
-     * means `health()` and `queue_status` keep counting it, and the next YouTube
-     * run can queue behind a job the user has already abandoned. It eventually
-     * clears itself when the child exits. The UI is idle; the machine is not.
+     * WHAT THIS DOES NOT DO: stop the ffmpeg/yt-dlp child. There is no
+     * `cancel_job` command; Rust owns those and nothing tells them to stop. So
+     * after a cancel the download or the extraction runs to completion, still
+     * holding its `download_semaphore` permit and its `track_download_start()`
+     * count — which means `health()` and `queue_status` keep counting it, and the
+     * next YouTube run can queue behind a job the user has already abandoned. It
+     * eventually clears itself when the child exits. The UI is idle; the machine
+     * is not. That is tolerable ONLY because an abandoned ffmpeg finishes on its
+     * own, in seconds to a minute.
+     *
+     * The diarization sidecar is NOT like that, which is why it is the one child
+     * this does kill: it is a CPU-bound ONNX process with a 30-minute backstop
+     * timeout, so leaving it to "finish on its own" means pinning a core for up to
+     * half an hour behind an idle-looking app. `cancel_diarization` is a no-op for
+     * a job that is not diarizing, and it is fire-and-forget: a cancel that cannot
+     * reach the backend must still clear the UI.
      *
      * Nor does it stop a `persistTranscript` already in flight — and cancelling
      * inside that window is exactly how the last bug was reached, because the app
@@ -1030,6 +1039,12 @@ export function useTranscriber(): Transcriber {
      */
     const cancel = useCallback(() => {
         claimRun();
+        if (jobId) {
+            void api.cancelDiarization(jobId).catch(() => {
+                // Best effort. The UI is being torn down either way, and there is
+                // nothing a user could do with "the cancel request failed".
+            });
+        }
         setTranscript((previous) =>
             previous ? { ...previous, isBusy: false } : previous,
         );
@@ -1039,7 +1054,7 @@ export function useTranscriber(): Transcriber {
         setProgress(0);
         setStatus("idle");
         setError(null);
-    }, [claimRun]);
+    }, [claimRun, jobId]);
 
     const onInputChange = useCallback(() => {
         setTranscript(undefined);

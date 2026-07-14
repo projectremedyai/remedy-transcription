@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
     getModelStatus: vi.fn(),
     subscribeToProgress: vi.fn(),
     unsubscribe: vi.fn(),
+    cancelDiarization: vi.fn(),
 }));
 
 /**
@@ -53,6 +54,7 @@ vi.mock("../services/api", () => ({
         persistTranscript: mocks.persistTranscript,
         getModelStatus: mocks.getModelStatus,
         subscribeToProgress: mocks.subscribeToProgress,
+        cancelDiarization: mocks.cancelDiarization,
     },
 }));
 
@@ -158,6 +160,7 @@ beforeEach(() => {
         })),
     });
     mocks.getAudioUrl.mockResolvedValue("asset://localhost/audio.wav");
+    mocks.cancelDiarization.mockResolvedValue(false);
     mocks.persistTranscript.mockImplementation(async (jobId: string) =>
         makeJob({ id: jobId, status: "completed", progress: 1 }),
     );
@@ -500,6 +503,66 @@ describe("useTranscriber's wait for prepared audio", () => {
         expect(mocks.postMessage).not.toHaveBeenCalled();
         expect(result.current.isBusy).toBe(false);
         expect(result.current.status).toBe("idle");
+    });
+
+    /**
+     * Cancel has to REAP the diarization sidecar, not merely abandon it.
+     *
+     * Abandoning the backend is survivable for ffmpeg and yt-dlp — they finish on
+     * their own in seconds. The diarizer is a CPU-bound ONNX child with a
+     * 30-minute backstop timeout, so "the UI is idle" and "the machine is idle"
+     * come apart badly: a cancelled run with nobody killing it pins a core for up
+     * to half an hour. `cancel_diarization` is what closes that, and it needs the
+     * job id of the run being cancelled — which is exactly the thing a stale
+     * closure would get wrong.
+     */
+    it("cancel kills the diarization sidecar for the run it is cancelling", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-7", status: "extracting", progress: 0.1 }),
+        );
+        mocks.getJob.mockResolvedValue(
+            makeJob({ id: "job-7", status: "extracting", progress: 0.1 }),
+        );
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await tick(900);
+
+        await act(async () => {
+            result.current.cancel();
+        });
+
+        expect(mocks.cancelDiarization).toHaveBeenCalledWith("job-7");
+        expect(result.current.isBusy).toBe(false);
+    });
+
+    it("cancel still clears the UI when the backend cannot be reached", async () => {
+        // Fire-and-forget: a rejected cancel must not leave the app stuck busy,
+        // and must not surface an error the user can do nothing about.
+        mocks.cancelDiarization.mockRejectedValue(new Error("IPC is gone"));
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-7", status: "extracting", progress: 0.1 }),
+        );
+        mocks.getJob.mockResolvedValue(
+            makeJob({ id: "job-7", status: "extracting", progress: 0.1 }),
+        );
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await tick(900);
+
+        await act(async () => {
+            result.current.cancel();
+        });
+        await tick(0);
+
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.status).toBe("idle");
+        expect(result.current.error).toBeNull();
     });
 
     it("clears the poll and the listener on unmount", async () => {

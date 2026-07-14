@@ -16,6 +16,12 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub events: Arc<JobEvents>,
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
+    /// The kill handle of every diarization currently running, keyed by job.
+    ///
+    /// `cancel_diarization` reaches into this; without it, Cancel would leave a
+    /// CPU-bound ONNX child running for up to its 30-minute timeout while the app
+    /// showed idle. See `commands::DiarizationRegistry`.
+    pub diarizations: commands::DiarizationRegistry,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -39,6 +45,7 @@ pub fn run() {
                 store,
                 events,
                 download_semaphore,
+                diarizations: Default::default(),
             });
 
             Ok(())
@@ -54,6 +61,8 @@ pub fn run() {
             commands::list_models,
             commands::resolve_models_dir,
             commands::export_transcript,
+            commands::diarize_job,
+            commands::cancel_diarization,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -119,6 +119,21 @@ class TauriApiClient {
     }
 
     /**
+     * Kill the diarization sidecar for a job, if one is running.
+     *
+     * Abandoning a backend child is normally harmless — an orphaned ffmpeg just
+     * finishes. Diarization is not like that: it is a CPU-bound ONNX child with
+     * a 30-minute backstop timeout, so a cancelled run with nobody killing it
+     * would pin a core for up to half an hour while the app sat there idle.
+     *
+     * Resolves `false` when the job was not diarizing, which is the common case
+     * and is not an error.
+     */
+    async cancelDiarization(jobId: string): Promise<boolean> {
+        return invoke<boolean>("cancel_diarization", { jobId });
+    }
+
+    /**
      * `captions` must be the output of `consolidateSegments` — the very cues on
      * screen. The `ConsolidatedSegment` brand makes that a compile-time
      * requirement: raw model segments will not typecheck here.

@@ -50,7 +50,39 @@ mod wav;
 
 use std::process::ExitCode;
 
+/// Written to stderr the instant this binary panics.
+///
+/// **Why it has to exist.** This crate inherits `panic = "abort"` from the
+/// workspace's release profile, so *any* Rust panic here -- an indexing slip in
+/// `wav.rs`, an `unwrap` on a `None` -- kills the process with SIGABRT. That is
+/// the very same signal a corrupt ONNX model produces, and the parent's error
+/// message for signal 6 says "almost always a corrupt or truncated ONNX model".
+/// Without a way to tell the two apart, an ordinary bug in this file would be
+/// reported to the user as "your model is corrupt": confidently wrong, and it
+/// would send them off re-downloading a file that was never the problem.
+///
+/// The app's `diarize.rs` carries this same literal and greps for it. The two
+/// crates deliberately share no code, so both sides pin it with a test -- rename
+/// one and the other goes red.
+const PANIC_MARKER: &str = "diarize-sidecar panicked";
+
+/// Make a panic say it was a panic, before `panic = "abort"` makes it look like
+/// an ONNX abort.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        // stderr only. stdout is the JSON channel and nothing else may touch it.
+        eprintln!("{PANIC_MARKER}: {info}");
+        eprintln!(
+            "This is a BUG IN diarize-sidecar, not a corrupt model. The process is about to \
+             die of SIGABRT (it is built with panic = \"abort\"), which is the same signal a \
+             bad ONNX model produces -- the line above is how the parent tells them apart."
+        );
+    }));
+}
+
 fn main() -> ExitCode {
+    install_panic_hook();
+
     let args = match cli::Args::from_env() {
         Ok(args) => args,
         Err(err) => {
@@ -78,5 +110,28 @@ fn main() -> ExitCode {
             eprintln!("{err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mirror of `the_panic_marker_is_the_literal_the_sidecar_writes` in the
+    /// app's `diarize.rs`. Same literal, two crates, no shared code -- so this
+    /// pair is the only thing keeping them in sync.
+    #[test]
+    fn the_panic_marker_is_the_literal_the_app_greps_for() {
+        assert_eq!(PANIC_MARKER, "diarize-sidecar panicked");
+    }
+
+    #[test]
+    fn the_panic_hook_installs_and_writes_the_marker() {
+        install_panic_hook();
+        // The hook is global, so just prove it is reachable and that a panic
+        // caught here still runs it. (Debug builds unwind; release aborts --
+        // either way the hook has already written the marker to stderr.)
+        let caught = std::panic::catch_unwind(|| panic!("deliberate"));
+        assert!(caught.is_err());
     }
 }

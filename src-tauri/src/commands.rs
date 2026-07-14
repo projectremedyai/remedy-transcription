@@ -1212,7 +1212,7 @@ mod tests {
     #[test]
     fn the_mock_diarizer_is_reachable_from_the_command_tests() {
         use crate::diarize::mock::MockDiarizer;
-        use crate::diarize::{DiarizeOptions, Diarizer, SpeakerTurn};
+        use crate::diarize::{CancelToken, DiarizeOptions, Diarizer, SpeakerTurn, CANCELLED};
 
         let d: Box<dyn Diarizer> = Box::new(MockDiarizer::returning(vec![SpeakerTurn {
             start: 0.0,
@@ -1220,17 +1220,34 @@ mod tests {
             speaker: 0,
         }]));
         assert_eq!(
-            d.diarize(Path::new("x.wav"), &DiarizeOptions::default())
-                .unwrap()
-                .len(),
+            d.diarize(
+                Path::new("x.wav"),
+                &DiarizeOptions::default(),
+                &CancelToken::new()
+            )
+            .unwrap()
+            .len(),
             1
         );
 
         // The case the commands actually have to survive: diarization degraded.
         let broken: Box<dyn Diarizer> = Box::new(MockDiarizer::failing("sidecar killed by SIGABRT"));
         assert!(broken
-            .diarize(Path::new("x.wav"), &DiarizeOptions::default())
+            .diarize(
+                Path::new("x.wav"),
+                &DiarizeOptions::default(),
+                &CancelToken::new()
+            )
             .is_err());
+
+        // And the mock honours the kill handle, so a command test can exercise the
+        // cancel path without spawning anything.
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let err = d
+            .diarize(Path::new("x.wav"), &DiarizeOptions::default(), &cancel)
+            .expect_err("a cancelled run is not a success");
+        assert!(err.to_string().contains(CANCELLED), "{err}");
     }
 
     /// The guard on the bug that killed the whole app.

@@ -27,6 +27,21 @@ pub struct Args {
 /// contract tests on both sides of the process boundary.
 const DEFAULT_CLUSTER_THRESHOLD: f32 = 0.5;
 
+/// The largest speaker count we accept. Mirrors `MAX_SPEAKERS` in the app's
+/// `diarize.rs`, which rejects the same values before it even spawns us.
+///
+/// The bound is not fussiness, it is what makes the `i32` conversion below
+/// **total**. sherpa's `num_clusters` is an `i32`, and `u32 as i32` fails in the
+/// worst possible way -- silently, and into a *meaningful* value:
+///
+/// - `--num-speakers 4294967295` casts to `-1`, which sherpa reads as
+///   "auto-detect". The flag is silently ignored and the caller gets a
+///   confident, plausible answer to a question they did not ask.
+/// - `--num-speakers 1000000` collapses the file to a single speaker.
+///
+/// Both measured against the real models. Rejected here rather than cast.
+pub const MAX_SPEAKERS: u32 = 64;
+
 impl Args {
     pub fn from_env() -> Result<Self, String> {
         Self::parse(std::env::args().skip(1))
@@ -50,10 +65,18 @@ impl Args {
                 "--embedding-model" => embedding_model = Some(PathBuf::from(next()?)),
                 "--num-speakers" => {
                     let raw = next()?;
-                    num_speakers = Some(
-                        raw.parse::<u32>()
-                            .map_err(|_| format!("--num-speakers must be a non-negative integer, got {raw:?}"))?,
-                    );
+                    let n = raw
+                        .parse::<u32>()
+                        .map_err(|_| format!("--num-speakers must be a non-negative integer, got {raw:?}"))?;
+                    if n > MAX_SPEAKERS {
+                        return Err(format!(
+                            "--num-speakers must be between 0 and {MAX_SPEAKERS} (0 means \
+                             auto-detect), got {n}. Larger values are refused rather than cast \
+                             into sherpa's i32, where they would silently become -1 \
+                             ('auto-detect') or collapse the file to one speaker."
+                        ));
+                    }
+                    num_speakers = Some(n);
                 }
                 "--cluster-threshold" => {
                     let raw = next()?;
@@ -86,7 +109,12 @@ impl Args {
     /// silently empty result.
     pub fn clustering(&self) -> (i32, f32) {
         match self.num_speakers {
-            Some(n) if n > 0 => (n as i32, self.cluster_threshold),
+            // `min` rather than a bare cast. `parse` already bounds this at
+            // MAX_SPEAKERS, so the clamp is unreachable -- it is here so that the
+            // conversion is *provably* total at the point of use, and cannot
+            // start wrapping to a negative "auto-detect" if the bound above is
+            // ever loosened by someone who does not read this comment.
+            Some(n) if n > 0 => (n.min(MAX_SPEAKERS) as i32, self.cluster_threshold),
             _ => (-1, self.cluster_threshold),
         }
     }
@@ -154,5 +182,35 @@ mod tests {
         assert!(args(&["--cluster-threshold", "-0.5"]).is_err());
         assert!(args(&["--wat"]).is_err());
         assert!(args(&["--num-speakers"]).is_err(), "a dangling flag must not be silently ignored");
+    }
+
+    /// The lossy `u32 as i32` cast, pinned shut.
+    ///
+    /// This is the nastiest class of bug in the file, because the wrong answer
+    /// looks right: `4294967295 as i32` is `-1`, and sherpa reads `-1` as
+    /// "auto-detect". So the old code took an absurd request, silently discarded
+    /// it, and returned a perfectly plausible auto-detected result. `1000000`
+    /// collapsed the file to one speaker. Neither errored.
+    #[test]
+    fn an_absurd_speaker_count_is_rejected_not_cast_into_auto_detect() {
+        for absurd in ["4294967295", "1000000", "65"] {
+            let err = args(&["--num-speakers", absurd])
+                .expect_err("{absurd} speakers must be rejected, not cast");
+            assert!(err.contains("64"), "should name the bound: {err}");
+        }
+
+        // The bound itself still works, and still reaches sherpa as itself.
+        assert_eq!(args(&["--num-speakers", "64"]).unwrap().clustering().0, 64);
+
+        // The property that actually matters: whatever survives parsing maps to a
+        // non-negative i32, so it can never be mistaken for "auto-detect".
+        for n in ["0", "1", "2", "64"] {
+            let k = args(&["--num-speakers", n]).unwrap().clustering().0;
+            assert!(
+                k == -1 || k > 0,
+                "--num-speakers {n} produced num_clusters {k}; a value that is neither an \
+                 explicit -1 (auto-detect) nor a real count means a cast went wrong"
+            );
+        }
     }
 }

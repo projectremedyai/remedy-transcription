@@ -25,21 +25,38 @@ Why "local-first": YouTube blocks data-center IPs, so a self-hosted (VPS) versio
 ## Run from source
 
 ```bash
-# 1. Fetch yt-dlp / ffmpeg / ffprobe sidecars into src-tauri/binaries/.
+# 1. Fetch the downloaded sidecars (yt-dlp / ffmpeg / ffprobe) into
+#    src-tauri/binaries/, plus the speaker-diarization models into models/.
 ./scripts/fetch-sidecars.sh
 
-# 2. Install root and frontend JS deps from lockfiles.
+# 2. Compile the diarization sidecar into src-tauri/binaries/.
+#    This one is ours, so it is compiled rather than downloaded.
+./scripts/build-diarize-sidecar.sh
+
+# 3. Install root and frontend JS deps from lockfiles.
 npm ci
 npm --prefix frontend ci
 
-# 3. Run the dev build (Vite + Tauri, hot reload).
+# 4. Run the dev build (Vite + Tauri, hot reload).
 npm run dev
 ```
+
+> **Step 2 is not optional, and it must come before any `cargo` command.**
+> `diarize-sidecar` is registered as a Tauri `externalBin`, and `tauri-build`
+> checks that every `externalBin` exists — so if it is missing, even a bare
+> `cargo check` fails, with an opaque error that never mentions diarization:
+>
+> ```
+> error: failed to run custom build command for `remedy-transcription`
+> ```
+>
+> If you see that, you skipped step 2.
 
 ## Build an installer
 
 ```bash
 ./scripts/fetch-sidecars.sh
+./scripts/build-diarize-sidecar.sh
 npm ci
 npm --prefix frontend ci
 npm run build
@@ -56,12 +73,25 @@ npm ci
 npm --prefix frontend ci
 npm run frontend:build
 npm --prefix frontend run lint
-./scripts/fetch-sidecars.sh
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
+npm --prefix frontend test
+
+# --skip-models: the diarization models are 34 MB and only the #[ignore]d
+# real-model tests touch them, so CI would be downloading them for nothing.
+./scripts/fetch-sidecars.sh --skip-models
+
+# --debug: CI never bundles, so it only needs the binary to exist (for
+# tauri-build) and to be spawnable (for the crash-isolation tests).
+./scripts/build-diarize-sidecar.sh --debug
+
+cargo check --workspace --manifest-path src-tauri/Cargo.toml
+cargo test  --workspace --manifest-path src-tauri/Cargo.toml
 ```
 
-`scripts/fetch-sidecars.sh` runs in CI, not only during release packaging, because Tauri validates the configured `externalBin` sidecars during `cargo check` and `cargo test`. Release jobs should still run it for the target being packaged before `npm run build`; Windows ffmpeg/ffprobe setup remains manual as noted by the script.
+Both sidecar steps run in CI, not only during release packaging, because Tauri validates the configured `externalBin` entries during `cargo check` and `cargo test` — a missing sidecar fails the build before a single test runs.
+
+`--workspace` matters: `diarize-sidecar` is a separate workspace member, and the app's crash-isolation tests spawn the real binary. Without it, those tests have nothing to point at.
+
+Release jobs still need the models and a release-profile sidecar for the target being packaged. Windows ffmpeg/ffprobe setup remains manual, as the script notes.
 
 ## Where your data lives
 
@@ -97,9 +127,13 @@ React webview ←─Tauri IPC─→ Rust core ──spawn──> yt-dlp + ffmpeg
 |------|------|
 | `frontend/src/` | React app, services, worker, caption formatter, SRT generator |
 | `src-tauri/src/` | Rust commands, SQLite store, sidecar wrappers, event emitter |
-| `src-tauri/binaries/` | Bundled `yt-dlp` / `ffmpeg` / `ffprobe` per target triple |
+| `src-tauri/diarize-sidecar/` | Speaker diarization (sherpa-onnx). A separate binary on purpose — see below |
+| `src-tauri/binaries/` | Bundled `yt-dlp` / `ffmpeg` / `ffprobe` / `diarize-sidecar` per target triple |
+| `models/diarization/` | Diarization ONNX models — fetched by script, never committed |
 | `src-tauri/icons/` | Generated app icons |
 | `src-tauri/tauri.conf.json` | Bundle config, sidecar registration, permissions |
+
+Diarization runs in its own process because ONNX Runtime does not report a corrupt or truncated model as an error — it throws a C++ exception that nothing catches, and the C++ runtime aborts the process (`SIGABRT`). In-process, one bad byte in a model file would take transcription down with it. Out of process, it is a dead child and an error, and the transcript simply arrives without speaker labels.
 
 ## License
 

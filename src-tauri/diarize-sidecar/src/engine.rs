@@ -125,15 +125,30 @@ pub fn run(args: &Args) -> Result<Vec<Turn>, String> {
         .ok_or_else(|| format!("diarization failed on {}", args.wav.display()))?;
 
     // An empty result is a legitimate outcome: silence has no speaker turns.
-    Ok(result
+    result
         .sort_by_start_time()
         .into_iter()
-        .map(|s| Turn {
-            start: s.start,
-            end: s.end,
-            speaker: s.speaker.max(0) as u32,
-        })
-        .collect())
+        .map(|s| to_turn(s.start, s.end, s.speaker))
+        .collect()
+}
+
+/// sherpa's speaker label is an `i32`. Ours is a `u32`.
+///
+/// This used to be `s.speaker.max(0) as u32`, which folds a **negative** label
+/// into speaker 0 -- silently merging a segment the clusterer refused to assign
+/// with a real speaker's turns. That is exactly the quiet wrongness this whole
+/// crate is written to avoid, so it fails loudly instead. A negative label has
+/// never been observed; if one ever appears, that is a fact worth learning
+/// rather than averaging away.
+fn to_turn(start: f32, end: f32, speaker: i32) -> Result<Turn, String> {
+    let speaker = u32::try_from(speaker).map_err(|_| {
+        format!(
+            "the clusterer returned a negative speaker label ({speaker}) for the turn at \
+             {start:.2}s-{end:.2}s. That means the segment was not assigned to any speaker; \
+             folding it into speaker 0 would silently merge it with a real one."
+        )
+    })?;
+    Ok(Turn { start, end, speaker })
 }
 
 /// sherpa takes `String`, so a non-UTF-8 path would be mangled rather than
@@ -172,5 +187,30 @@ mod tests {
             serde_json::to_string(&Output { turns: vec![] }).unwrap(),
             r#"{"turns":[]}"#
         );
+    }
+
+    #[test]
+    fn ordinary_speaker_labels_pass_straight_through() {
+        assert_eq!(
+            to_turn(1.5, 2.25, 3).unwrap(),
+            Turn {
+                start: 1.5,
+                end: 2.25,
+                speaker: 3
+            }
+        );
+        assert_eq!(to_turn(0.0, 1.0, 0).unwrap().speaker, 0);
+    }
+
+    /// A negative label means "this segment belongs to no speaker". The old code
+    /// said `.max(0) as u32` and so quietly filed it under speaker 0 -- merging
+    /// an unassigned segment into a real speaker's turns, in a file that is
+    /// otherwise scrupulous about never being quietly wrong.
+    #[test]
+    fn a_negative_speaker_label_fails_loudly_instead_of_becoming_speaker_zero() {
+        let err = to_turn(4.0, 5.0, -1).expect_err("a negative label must not become speaker 0");
+        assert!(err.contains("negative speaker label"), "{err}");
+        assert!(err.contains("-1"), "should quote the label: {err}");
+        assert!(err.contains("merge"), "should say what the harm is: {err}");
     }
 }

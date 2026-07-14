@@ -22,6 +22,38 @@ interface WordToken {
     end: number;
 }
 
+/**
+ * A caption cue: the output of `consolidateSegments`, and the ONLY thing the
+ * serializers in `lib/srtGenerator.ts` accept.
+ *
+ * The brand exists because `consolidateSegments` is not idempotent and silently
+ * DELETES words when run on its own output (see the characterization test in
+ * captionFormatter.test.ts). A cue is structurally identical to a raw
+ * `TranscriptionSegment`, so without the brand `consolidateSegments(cues)` and
+ * `generateSrt(rawSegments)` both typecheck and both are wrong. With it, the
+ * compiler rejects them: consolidation consumes raw segments and produces cues,
+ * and there is no way back.
+ */
+export type ConsolidatedSegment = TranscriptionSegment & {
+    readonly __consolidated: unique symbol;
+};
+
+/**
+ * A segment that has NOT been through the formatter — the only thing
+ * `consolidateSegments` accepts.
+ *
+ * The optional-`never` property is what makes double-consolidation a COMPILE
+ * ERROR. A brand alone is not enough: `ConsolidatedSegment` is an intersection,
+ * hence a subtype of `TranscriptionSegment`, so a plain
+ * `consolidateSegments(segments: TranscriptionSegment[])` would happily accept
+ * its own output. Declaring the input as "has no `__consolidated` property"
+ * rejects it: a raw segment (property absent) is assignable, a cue (property
+ * present, typed `unique symbol`) is not.
+ */
+export type RawSegment = TranscriptionSegment & {
+    readonly __consolidated?: never;
+};
+
 export function cleanCaptionText(text: string): string {
     let cleaned = text.trim().replace(WHITESPACE_RE, " ");
     cleaned = cleaned.replace(SPACE_BEFORE_PUNCT_RE, "$1");
@@ -127,6 +159,14 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
         // would delete words the speaker said. Whisper's chunk timestamps are
         // real (only the *word* times are synthesized), so this test is
         // trustworthy.
+        //
+        // The test is PAIRWISE — this segment against the one immediately before
+        // it. A running max over all previous ends would be more permissive: one
+        // long segment would mark every later segment that starts inside its span
+        // as "overlapping", enabling 1-word dedup between segments that are
+        // actually sequential, and so deleting words the speaker said. Sliding
+        // windows only ever overlap their immediate neighbour, so pairwise is
+        // both the intent and sufficient.
         const chunksOverlapInTime =
             previousEnd !== null && segment.start < previousEnd;
         const minOverlapSize = chunksOverlapInTime ? 1 : 3;
@@ -135,10 +175,7 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
             allWords,
             minOverlapSize,
         );
-        previousEnd =
-            previousEnd === null
-                ? segmentEnd
-                : Math.max(previousEnd, segmentEnd);
+        previousEnd = segmentEnd;
 
         // Weight the stripped overlap by characters, not word count — the
         // tokenizer distributes time by character length everywhere else, and
@@ -159,8 +196,18 @@ function tokensFromSegments(segments: TranscriptionSegment[]): WordToken[] {
         const lastEmittedEnd = tokens[tokens.length - 1]?.end ?? offsetStart;
         const start = Math.max(offsetStart, lastEmittedEnd);
 
+        // The monotonic clamp can push `start` at or past this segment's own end
+        // (a later chunk can begin before an earlier, longer one finished). Then
+        // `segmentEnd - start` is zero or negative, and flooring the DURATION at
+        // 0.01s crushes the whole segment into a 6ms cue that displaces seconds
+        // of speech. Floor the SPAN instead: the words still have to be spoken,
+        // so give them a nominal speaking rate's worth of time.
+        const usableEnd = Math.max(
+            segmentEnd,
+            start + words.length * NOMINAL_WORD_DURATION,
+        );
         const survivingWeight = totalWeight - strippedWeight;
-        const usableDuration = Math.max(segmentEnd - start, 0.01);
+        const usableDuration = usableEnd - start;
         let elapsed = 0;
 
         for (const word of words) {
@@ -405,12 +452,15 @@ function wrapCaptionText(text: string): string {
  * `captionFormatter.test.ts` pins a two-segment counterexample where a second
  * pass moves a word to the previous cue and shifts the boundary by 1.46s.
  *
- * Consequence: never call this on its own output. `lib/srtGenerator.ts` is a set
- * of pure serializers precisely so that the export path cannot re-format.
+ * Consequence: never call this on its own output. That is enforced by the type
+ * system, not by convention: it consumes raw `TranscriptionSegment[]` and
+ * produces branded `ConsolidatedSegment[]`, which it will not accept back.
+ * `lib/srtGenerator.ts` is a set of pure serializers over `ConsolidatedSegment[]`
+ * precisely so that the export path cannot re-format.
  */
 export function consolidateSegments(
-    segments: TranscriptionSegment[],
-): TranscriptionSegment[] {
+    segments: RawSegment[],
+): ConsolidatedSegment[] {
     const tokens = tokensFromSegments(segments);
     if (tokens.length === 0) {
         return [];
@@ -431,5 +481,9 @@ export function consolidateSegments(
         captions.push(captionFromTokens(current));
     }
 
-    return normalizeCaptionStarts(mergeShortCaptions(captions));
+    // The single site that mints the brand. Everything above this line works in
+    // plain TranscriptionSegments; everything downstream of it is a cue.
+    return normalizeCaptionStarts(
+        mergeShortCaptions(captions),
+    ) as ConsolidatedSegment[];
 }

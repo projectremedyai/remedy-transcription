@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { consolidateSegments } from "./captionFormatter";
+import { ConsolidatedSegment, consolidateSegments } from "./captionFormatter";
 import type { TranscriptionSegment } from "../services/types";
 
 const flat = (segs: TranscriptionSegment[]) =>
@@ -142,6 +142,34 @@ describe("BUG 1: chunk-boundary overlap dedup", () => {
         ).toBe(3);
     });
 
+    it("does NOT strip a repeat just because an EARLIER, longer segment is still open", () => {
+        // The time-overlap test that unlocks 1-word dedup must be PAIRWISE
+        // (this segment vs. the one immediately before it). A running max over
+        // all previous ends is more permissive: seg1 runs to 30, so every later
+        // segment starting before 30 would count as "overlapping" — including
+        // seg3, which is strictly sequential with its actual neighbour seg2
+        // (28 -> 29, then 29.5). Under a running max the honest repeat of
+        // "right" is deleted; pairwise, it is kept.
+        const segs: TranscriptionSegment[] = [
+            {
+                start: 0,
+                end: 30,
+                text: "a long opening segment that runs for a good while and covers plenty of ground.",
+            },
+            { start: 28, end: 29, text: "is that right?" },
+            {
+                start: 29.5,
+                end: 33,
+                text: "right so let us move on to the next topic",
+            },
+        ];
+        expect(
+            flat(consolidateSegments(segs))
+                .toLowerCase()
+                .match(/\bright\b/g)?.length,
+        ).toBe(2);
+    });
+
     it("never emits cues that overlap in time", () => {
         // A two-segment toy fixture does NOT surface this: it produces one cue per
         // segment and they happen not to collide. It takes the real sliding-window
@@ -209,50 +237,103 @@ describe("BUG 3: the final chunk must not be swallowed", () => {
     });
 });
 
-/**
- * The Task 3 plan claimed `consolidateSegments` was self-idempotent, which is what
- * made the export path's second consolidation "near-harmless". IT IS NOT, and the
- * cost is real: display shows `consolidate(raw)` while the export used to write
- * `consolidate(consolidate(raw))` — a different cut of the same words.
- */
-describe("consolidateSegments is NOT idempotent", () => {
-    // Two clean, strictly sequential segments. No time overlap, no zero-duration
-    // chunk, no dedup — none of the degenerate cases. The non-idempotence is
-    // intrinsic to the timing math, not an artifact of bad input.
-    const CLEAN_SEQUENTIAL: TranscriptionSegment[] = [
-        { start: 0, end: 6.66, text: "photons which the energy stores." },
-        { start: 6.66, end: 10, text: "the sugar converts." },
-    ];
+describe("characterization", () => {
+    /**
+     * Re-consolidating requires deliberately defeating the type system —
+     * `consolidateSegments` takes `RawSegment[]` and returns branded
+     * `ConsolidatedSegment[]`, so production code CANNOT do this by accident.
+     * Only a characterization test has any business doing it.
+     */
+    const reconsolidate = (cues: ConsolidatedSegment[]) =>
+        consolidateSegments(cues as unknown as TranscriptionSegment[]);
 
-    it("moves a word between cues on a second pass", () => {
-        const once = consolidateSegments(CLEAN_SEQUENTIAL);
-        const twice = consolidateSegments(once);
+    it("consolidateSegments is NOT idempotent (characterization). If this test fails because consolidateSegments became idempotent, that is an IMPROVEMENT — delete this test, do not restore the old behavior.", () => {
+        // This test asserts nothing about what SHOULD happen. It records what
+        // DOES happen today, so the reason the export path must never re-format
+        // (lib/srtGenerator.ts) cannot decay into folklore.
+        //
+        // Cause: word times inside a cue are interpolated from the raw segment
+        // that produced them. Once cues exist that provenance is gone, and a
+        // second pass re-interpolates each word evenly across ITS CUE's span.
+        // Task 4 (real word timestamps) is the change that would fix this.
 
-        // Pass 1 breaks on duration: adding "stores." would push the cue past
-        // MAX_CAPTION_DURATION, so it starts a new cue before it.
+        // (a) Words migrate between cues, and the boundary moves by SECONDS.
+        // Two clean, strictly sequential segments: no time overlap, no
+        // zero-duration chunk, no dedup. The non-idempotence is intrinsic to the
+        // timing math, not an artifact of degenerate input.
+        const once = consolidateSegments([
+            { start: 0, end: 6.66, text: "photons which the energy stores." },
+            { start: 6.66, end: 10, text: "the sugar converts." },
+        ]);
+        const twice = reconsolidate(once);
+
         expect(once.map((c) => c.text)).toEqual([
             "Photons which the energy",
             "stores. the sugar converts.",
         ]);
-
-        // Pass 2 re-interpolates each word evenly across its CUE's span, losing the
-        // raw segment's word times. The duration rule no longer fires, so the
-        // sentence-end rule wins instead and "stores." lands in the first cue.
         expect(twice.map((c) => c.text)).toEqual([
             "Photons which the energy stores.",
             "The sugar converts.",
         ]);
-
-        expect(twice).not.toEqual(once);
         // Not a rounding wobble: the cue boundary moves by ~1.46 SECONDS.
         expect(Math.abs(twice[0].end - once[0].end)).toBeGreaterThan(1.4);
-    });
 
-    it("is stable on the realistic sliding-window fixture (which is why this went unnoticed)", () => {
-        // Idempotence DOES hold here. That is exactly why the double consolidation
-        // looked safe. It is a property of this fixture, not of the function.
-        const once = consolidateSegments(WHISPER_WINDOW_SEGMENTS);
-        expect(consolidateSegments(once)).toEqual(once);
+        // (b) The dangerous one: a second pass DELETES words the speaker said.
+        // The formatter correctly keeps both copies of a phrase a speaker
+        // repeated inside one chunk, then breaks the cue between them. A second
+        // pass mistakes that CUE boundary for a CHUNK boundary and strips it.
+        const kept = consolidateSegments([
+            {
+                start: 0,
+                end: 11.79,
+                text: "really chlorophyll absorbs photons chlorophyll absorbs photons you.",
+            },
+        ]);
+        const repeated = /chlorophyll absorbs photons/gi;
+
+        expect(flat(kept).match(repeated)?.length).toBe(2);
+        expect(flat(reconsolidate(kept)).match(repeated)?.length).toBe(1);
+    });
+});
+
+describe("the monotonic clamp must not crush a segment into a sliver", () => {
+    // The clamp keeps word times monotonic by starting a segment no earlier than
+    // the last word already emitted. But nothing stopped `start` being clamped
+    // PAST the segment's own end, at which point `Math.max(segmentEnd - start,
+    // 0.01)` collapsed the entire segment into a 0.01s cue.
+
+    it("gives a cue that is clamped past its own segment end a real duration", () => {
+        // seg2 begins BEFORE seg1 ends but carries different words (no overlap to
+        // strip), so its start is clamped forward to 30.0 — past its own end of
+        // 28.4. Before the fix this emitted an 11-word cue lasting 6 MILLISECONDS
+        // (30.000 -> 30.006), displacing 2.6s of speech by 4+ seconds.
+        const cues = consolidateSegments([
+            {
+                start: 20.0,
+                end: 30.0,
+                text: "and that is how the calvin cycle fixes carbon into sugar.",
+            },
+            {
+                start: 25.8,
+                end: 28.4,
+                text: "an entirely different long sentence that the second window transcribed here",
+            },
+        ]);
+
+        const clamped = findCue(cues, /entirely different/i);
+        expect(clamped).toBeDefined();
+
+        // The words still have to be spoken: floor the SPAN at a nominal speaking
+        // rate rather than flooring the duration at 0.01s.
+        expect(clamped!.end - clamped!.start).toBeGreaterThan(3);
+
+        // And no cue anywhere in the output is a sliver.
+        const durations = cues.map((c) => c.end - c.start);
+        expect(Math.min(...durations)).toBeGreaterThanOrEqual(1.0);
+
+        // The clamp itself still holds — cues never run backwards.
+        const overlaps = cues.slice(1).filter((c, i) => c.start < cues[i].end);
+        expect(overlaps).toEqual([]);
     });
 });
 

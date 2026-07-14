@@ -1,19 +1,23 @@
-import { TranscriptionSegment } from "../services/types";
-import { cleanCaptionText, endsSentence } from "./captionFormatter";
+import {
+    ConsolidatedSegment,
+    cleanCaptionText,
+    endsSentence,
+} from "./captionFormatter";
 
 /**
  * Serializers for already-consolidated captions.
  *
- * PRECONDITION: every function here takes the output of `consolidateSegments`.
- * They are pure serializers — they format cues into SRT/VTT/TXT/JSON text and
- * MUST NOT re-run the formatter.
+ * PRECONDITION, enforced by the type system: every function here takes
+ * `ConsolidatedSegment[]` — the output of `consolidateSegments`, which is the
+ * only thing that can produce that brand. They are pure serializers: they format
+ * cues into SRT/VTT/TXT/JSON text and MUST NOT re-run the formatter.
  *
  * `consolidateSegments` is NOT idempotent (see captionFormatter.test.ts):
  * consolidating a second time re-interpolates word times inside each cue's span,
- * which moves the caption break points and can shift words from one cue to the
- * next. Calling it here as well as on the display path would therefore export
- * captions that do not match the transcript on screen. Consolidation happens
- * exactly once, when raw model segments are read (`useTranscriber`).
+ * which moves the caption break points and can DELETE words the speaker said.
+ * Calling it here as well as on the display path would therefore export captions
+ * that do not match the transcript on screen. Consolidation happens exactly once,
+ * when raw model segments are read (`useTranscriber`).
  */
 
 function formatTimestamp(seconds: number, separator: "," | "." = ","): string {
@@ -35,7 +39,7 @@ function pad3(value: number): string {
 }
 
 function cueLines(
-    captions: TranscriptionSegment[],
+    captions: ConsolidatedSegment[],
     separator: "," | ".",
 ): string[] {
     const lines: string[] = [];
@@ -55,15 +59,15 @@ function cueLines(
     return lines;
 }
 
-export function generateSrt(captions: TranscriptionSegment[]): string {
+export function generateSrt(captions: ConsolidatedSegment[]): string {
     return cueLines(captions, ",").join("\n");
 }
 
-export function generateVtt(captions: TranscriptionSegment[]): string {
+export function generateVtt(captions: ConsolidatedSegment[]): string {
     return ["WEBVTT", "", ...cueLines(captions, ".")].join("\n");
 }
 
-export function generateTxt(captions: TranscriptionSegment[]): string {
+export function generateTxt(captions: ConsolidatedSegment[]): string {
     // Unwrap the two-line caption layout back into flowing prose. The cue text is
     // already cleaned, deduped and sentence-cased by the formatter, so this only
     // joins and fixes up sentence starts — a sentence can end mid-cue (the
@@ -83,7 +87,7 @@ export function generateTxt(captions: TranscriptionSegment[]): string {
     return endsSentence(capitalized) ? capitalized : `${capitalized}.`;
 }
 
-export function generateJson(captions: TranscriptionSegment[]): string {
+export function generateJson(captions: ConsolidatedSegment[]): string {
     return JSON.stringify(
         captions.map((caption) => ({
             start: caption.start,

@@ -3,24 +3,23 @@ import { useEffect, useRef } from "react";
 import { TranscriberData } from "../hooks/useTranscriber";
 import { formatAudioTimestamp } from "../utils/AudioUtils";
 import { api } from "../services/api";
-import { TranscriptionSegment } from "../services/types";
+import { ConsolidatedSegment } from "../lib/captionFormatter";
 
 interface Props {
     transcribedData: TranscriberData | undefined;
     jobId?: string | null;
 }
 
-function chunksToSegments(
+/**
+ * Filter only — no rebuilding. The cues are already cleaned and wrapped by the
+ * formatter, and reconstructing them here would strip the `ConsolidatedSegment`
+ * brand, which is what stops the exporters from being handed unformatted text.
+ */
+function exportableCues(
     chunks: TranscriberData["chunks"] | undefined,
-): TranscriptionSegment[] {
+): ConsolidatedSegment[] {
     if (!chunks) return [];
-    return chunks
-        .map((chunk) => ({
-            start: chunk.start,
-            end: chunk.end,
-            text: chunk.text.trim(),
-        }))
-        .filter((s) => s.text.length > 0);
+    return chunks.filter((chunk) => chunk.text.trim().length > 0);
 }
 
 export default function Transcript({ transcribedData, jobId }: Props) {
@@ -32,13 +31,13 @@ export default function Transcript({ transcribedData, jobId }: Props) {
     };
 
     const runExport = async (format: "srt" | "vtt" | "txt" | "json") => {
-        const segments = chunksToSegments(transcribedData?.chunks);
-        if (segments.length === 0) return;
+        const cues = exportableCues(transcribedData?.chunks);
+        if (cues.length === 0) return;
         try {
             await api.exportTranscript(
                 jobId ?? "local",
                 format,
-                segments,
+                cues,
                 getBaseName(),
             );
         } catch (err) {

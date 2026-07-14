@@ -2,6 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 
+import { ConsolidatedSegment } from "../lib/captionFormatter";
 import {
     generateJson,
     generateSrt,
@@ -117,10 +118,15 @@ class TauriApiClient {
         return convertFileSrc(path);
     }
 
+    /**
+     * `captions` must be the output of `consolidateSegments` — the very cues on
+     * screen. The `ConsolidatedSegment` brand makes that a compile-time
+     * requirement: raw model segments will not typecheck here.
+     */
     async exportTranscript(
         jobId: string,
         format: "srt" | "vtt" | "txt" | "json",
-        segments: import("./types").TranscriptionSegment[],
+        captions: ConsolidatedSegment[],
         suggestedName: string,
     ): Promise<string | null> {
         const filters = {
@@ -144,7 +150,7 @@ class TauriApiClient {
             txt: generateTxt,
             json: generateJson,
         };
-        const content = generators[format](segments);
+        const content = generators[format](captions);
 
         await invoke("export_transcript", {
             request: {

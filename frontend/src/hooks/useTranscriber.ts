@@ -11,13 +11,21 @@ import {
 } from "../config/transcription";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
-import { consolidateSegments } from "../lib/captionFormatter";
+import {
+    ConsolidatedSegment,
+    consolidateSegments,
+} from "../lib/captionFormatter";
+import {
+    WorkerChunk,
+    WorkerTranscript,
+    consolidateWorkerTranscript,
+    segmentsFromWorkerChunks,
+} from "../lib/workerTranscript";
 import {
     api,
     Job,
     ModelStatusResponse,
     PersistTranscriptRequest,
-    TranscriptionSegment,
 } from "../services/api";
 
 interface ProgressItem {
@@ -27,16 +35,6 @@ interface ProgressItem {
     total: number;
     name: string;
     status: string;
-}
-
-interface WorkerChunk {
-    text: string;
-    timestamp: [number, number | null];
-}
-
-interface WorkerTranscript {
-    text: string;
-    chunks: WorkerChunk[];
 }
 
 interface WorkerUpdateData {
@@ -59,7 +57,12 @@ interface WorkerProgressMessage {
 export interface TranscriberData {
     isBusy: boolean;
     text: string;
-    chunks: TranscriptionSegment[];
+    /**
+     * Display cues, already through the formatter. Branded so that neither the
+     * exporters nor a second `consolidateSegments` call can be handed raw
+     * segments (or these cues re-consolidated) without a compile error.
+     */
+    chunks: ConsolidatedSegment[];
     filename?: string;
     persisted: boolean;
     modelLabel?: string;
@@ -103,55 +106,6 @@ type PendingWorker = {
     modelLabel?: string;
     audioDuration: number;
 };
-
-/**
- * Whisper leaves the final chunk's end timestamp null. Persisting or rendering
- * it as `end := start` gives the segment zero duration, which the formatter then
- * treats as a runt and glues onto the previous cue — silently dropping the last
- * seconds of every transcript. Fall back to the next chunk's start, then to the
- * true audio duration, and only then to a guess.
- */
-function segmentsFromWorkerChunks(
-    chunks: WorkerChunk[],
-    audioDuration: number | null,
-): TranscriptionSegment[] {
-    return chunks.map((chunk, index) => ({
-        start: chunk.timestamp[0],
-        end:
-            chunk.timestamp[1] ??
-            chunks[index + 1]?.timestamp[0] ??
-            audioDuration ??
-            chunk.timestamp[0] + 2,
-        text: chunk.text,
-    }));
-}
-
-function wordCount(text: string): number {
-    return text.replace(/\n/g, " ").trim().split(/\s+/).filter(Boolean).length;
-}
-
-function consolidateWorkerTranscript(
-    workerTranscript: WorkerTranscript,
-    audioDuration: number | null,
-    options: { hideTrailingShortCaption?: boolean } = {},
-): { text: string; chunks: TranscriptionSegment[] } {
-    const chunks = consolidateSegments(
-        segmentsFromWorkerChunks(workerTranscript.chunks, audioDuration),
-    );
-    const displayChunks =
-        options.hideTrailingShortCaption &&
-        chunks.length > 0 &&
-        wordCount(chunks[chunks.length - 1].text) < 3
-            ? chunks.slice(0, -1)
-            : chunks;
-    const text =
-        displayChunks
-            .map((chunk) => chunk.text.replace(/\n/g, " "))
-            .join(" ")
-            .trim() || workerTranscript.text;
-
-    return { text, chunks: displayChunks };
-}
 
 async function sha256Hex(arrayBuffer: ArrayBuffer): Promise<string> {
     const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);

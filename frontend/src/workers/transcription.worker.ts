@@ -2,7 +2,7 @@
 
 import { env, pipeline, WhisperTextStreamer } from "@huggingface/transformers";
 
-import { MODEL_PRESETS } from "../config/transcription";
+import { modelIdForPreset } from "../config/transcription";
 
 env.allowRemoteModels = true;
 env.allowLocalModels = false;
@@ -13,10 +13,14 @@ env.allowLocalModels = false;
  * silently the first time the models were renamed — the override simply stopped
  * applying and large-v3-turbo loaded an fp32 encoder on WebGPU. Read it from the
  * config instead.
+ *
+ * `modelIdForPreset` rather than `find(...)?.modelId`: the optional chain returns
+ * `undefined` if the `"quality"` preset ever goes away, `modelId === undefined` is
+ * never true, and the override silently stops applying all over again. Now the id
+ * is a compile error if the preset is gone (`ModelPresetId` is derived from
+ * `MODEL_PRESETS`) and a throw if it is somehow still reached.
  */
-const LARGE_TURBO_MODEL_ID = MODEL_PRESETS.find(
-    (preset) => preset.id === "quality",
-)?.modelId;
+const LARGE_TURBO_MODEL_ID: string = modelIdForPreset("quality");
 
 type WorkerRequest = {
     type: "transcribe";
@@ -140,7 +144,15 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             if (chunks.length > chunkCount) {
                 return;
             }
-            const chunkOffset = (chunkLength - strideLength) * chunkCount;
+            // TWO strides, not one. transformers.js advances its decoding window
+            // by `jump = window - 2 * stride` (pipelines.js: `const jump = window
+            // - 2 * stride; ... offset += jump;`) — the window overlaps its
+            // neighbour on BOTH sides, so consecutive windows start 19s apart for
+            // (29, 5) and 14s apart for distil's (20, 3). Subtracting one stride
+            // put window k five seconds late per window, compounding linearly: on
+            // a five-minute file the preview claimed cue times about a minute past
+            // the end of the audio.
+            const chunkOffset = (chunkLength - 2 * strideLength) * chunkCount;
             chunks.push({
                 text: "",
                 timestamp: [chunkOffset, chunkOffset + chunkLength],
@@ -201,6 +213,16 @@ self.addEventListener("message", async (event: MessageEvent<WorkerRequest>) => {
             timestamp: [number | null, number | null];
         }> = output.chunks ?? [];
 
+        // A word whose DTW timestamp came back null cannot be placed on a cue, so
+        // it is dropped from `words`. NOTE the consequence: `output.text` — which
+        // is persisted as `full_text` and is what the plain-text export writes —
+        // still CONTAINS that word, so a dropped word makes the cues disagree with
+        // full_text by exactly the words that had no time. That is the right
+        // trade (a word with an invented time corrupts the timeline and, in Task
+        // 6, the speaker attribution; a word missing from the cues does not), but
+        // it is a real divergence and not an invariant. In practice the filter
+        // removes nothing: transformers.js only leaves a null when the token has
+        // no aligned frame at all.
         const words = wordChunks
             .filter(
                 (chunk) =>

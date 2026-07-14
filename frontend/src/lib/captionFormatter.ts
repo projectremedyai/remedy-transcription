@@ -47,10 +47,7 @@ const LETTER_RE = /[A-Za-z]/;
  * compatibility), fullwidth/halfwidth forms, Thai, Lao, Myanmar. Hangul is
  * deliberately absent — Korean is space-separated and takes the normal path.
  */
-const NO_SPACE_SCRIPT_CHARS = [
-    "\\u0e00-\\u0e7f", // Thai
-    "\\u0e80-\\u0eff", // Lao
-    "\\u1000-\\u109f", // Myanmar
+const CJK_SCRIPT_CHARS = [
     "\\u3000-\\u303f", // CJK symbols and punctuation
     "\\u3040-\\u30ff", // Hiragana and Katakana
     "\\u3400-\\u4dbf", // CJK unified ideographs extension A
@@ -58,9 +55,26 @@ const NO_SPACE_SCRIPT_CHARS = [
     "\\uf900-\\ufaff", // CJK compatibility ideographs
     "\\uff00-\\uffef", // Halfwidth and fullwidth forms
 ].join("");
+const SEA_SCRIPT_CHARS = [
+    "\\u0e00-\\u0e7f", // Thai
+    "\\u0e80-\\u0eff", // Lao
+    "\\u1000-\\u109f", // Myanmar
+].join("");
+const NO_SPACE_SCRIPT_CHARS = `${SEA_SCRIPT_CHARS}${CJK_SCRIPT_CHARS}`;
+
 const STARTS_NO_SPACE_SCRIPT_RE = new RegExp(`^[${NO_SPACE_SCRIPT_CHARS}]`);
 const ENDS_NO_SPACE_SCRIPT_RE = new RegExp(`[${NO_SPACE_SCRIPT_CHARS}]$`);
 const NO_SPACE_SCRIPT_GLOBAL_RE = new RegExp(`[${NO_SPACE_SCRIPT_CHARS}]`, "g");
+const IS_NO_SPACE_SCRIPT_RE = new RegExp(`^[${NO_SPACE_SCRIPT_CHARS}]$`);
+const ENDS_CJK_RE = new RegExp(`[${CJK_SCRIPT_CHARS}]$`);
+
+/**
+ * Characters that may not START a line. A line break before a CJK closing mark
+ * strands the comma or full stop at the head of line two, which is precisely the
+ * thing CJK typesetting rules (kinsoku) forbid. Cheap to honour: the break
+ * candidate is simply not offered.
+ */
+const NO_LINE_START_RE = /[、，。．！？：；）〕】》」』〉’”…・]/;
 
 /**
  * One word with its own start and end. When these come from the model
@@ -295,14 +309,27 @@ function effectiveEnd(
  *      audio, one database row holding everything. Both languages are offered in
  *      the UI and auto-detect reaches them. So a token that STARTS with a
  *      no-space-script character opens a new word.
- *   2. Clamp monotonically. The model's words are already ordered and
+ *   2. Split a token that `cleanCaptionText` will turn into TWO. Whisper emits
+ *      "Hello,world" as ONE word chunk, and the formatter — rightly — puts the
+ *      missing space back. But the database stores one word per row, and a reload
+ *      re-derives the tokens by splitting each row's CLEANED text on spaces: the
+ *      row persisted as one token comes back as two, so the reload sees a
+ *      different token stream than the live render did, and "Hello," ends a
+ *      clause where it did not before. Split it HERE, in the single funnel both
+ *      the live render and the persisted rows pass through, and the two streams
+ *      are identical by construction. Its span is shared out by character length,
+ *      the same weighting the fabricating path uses.
+ *   3. Clamp monotonically. The model's words are already ordered and
  *      non-overlapping in practice, but a cue whose start ran backwards would
  *      produce invalid SRT, so do not take that on trust.
- *   3. Floor each word's duration. DTW does emit `end === start`; see
+ *   4. Floor each word's duration. DTW does emit `end === start`; see
  *      MIN_WORD_DURATION.
+ *
+ * Steps 3 and 4 run LAST, over the already-split tokens, so a split cannot
+ * introduce a backwards or zero-length token of its own.
  */
 export function normalizeWordTokens(words: readonly WordToken[]): WordToken[] {
-    const tokens: WordToken[] = [];
+    const folded: WordToken[] = [];
 
     for (const word of words) {
         const continuesPreviousWord =
@@ -311,28 +338,58 @@ export function normalizeWordTokens(words: readonly WordToken[]): WordToken[] {
         const text = word.text.trim();
         if (text.length === 0) continue;
 
-        const previous = tokens[tokens.length - 1];
+        const previous = folded[folded.length - 1];
         if (continuesPreviousWord && previous) {
             previous.text += text;
-            previous.end = Math.max(
-                previous.end,
-                word.end,
-                previous.start + MIN_WORD_DURATION,
-            );
+            previous.end = Math.max(previous.end, word.end);
             continue;
         }
 
-        const start = previous
-            ? Math.max(word.start, previous.end)
-            : word.start;
-        tokens.push({
-            text,
-            start,
-            end: Math.max(word.end, start + MIN_WORD_DURATION),
-        });
+        folded.push({ text, start: word.start, end: word.end });
+    }
+
+    const tokens: WordToken[] = [];
+    for (const word of folded) {
+        for (const piece of splitGluedToken(word)) {
+            const previous = tokens[tokens.length - 1];
+            const start = previous
+                ? Math.max(piece.start, previous.end)
+                : piece.start;
+            tokens.push({
+                text: piece.text,
+                start,
+                end: Math.max(piece.end, start + MIN_WORD_DURATION),
+            });
+        }
     }
 
     return tokens;
+}
+
+/**
+ * One model word -> the token(s) it renders as, sharing the word's span out by
+ * character length. Almost always exactly one; more only when `cleanCaptionText`
+ * inserts a space the model did not emit ("Hello,world"). Storing the CLEANED
+ * text is what makes the persisted row round-trip: `tokensFromSegments` re-cleans
+ * and re-splits it on reload and must get back this same single token.
+ */
+function splitGluedToken(word: WordToken): WordToken[] {
+    const parts = splitWords(word.text);
+    if (parts.length === 0) return [];
+    if (parts.length === 1) {
+        return [{ text: parts[0], start: word.start, end: word.end }];
+    }
+
+    const totalWeight = charWeightOf(parts);
+    const duration = Math.max(word.end - word.start, 0);
+    let elapsed = 0;
+
+    return parts.map((part) => {
+        const start = word.start + (elapsed / totalWeight) * duration;
+        elapsed += charWeight(part);
+        const end = word.start + (elapsed / totalWeight) * duration;
+        return { text: part, start, end };
+    });
 }
 
 /**
@@ -608,14 +665,73 @@ function normalizeCaptionStarts(
         )
     ) {
         const final = normalized.pop()!;
+        const terminator = sentenceTerminatorFor(final.text);
         normalized.push({
             start: final.start,
             end: final.end,
-            text: `${final.text}.`,
+            text: `${final.text}${terminator}`,
         });
     }
 
     return normalized;
+}
+
+/**
+ * The full stop to close an unterminated final cue with.
+ *
+ * An ASCII "." on a Chinese or Japanese cue is simply the wrong character —
+ * "光合作用." — and these cues are reachable now that C2 made CJK work. Use the
+ * ideographic full stop. Thai, Lao and Myanmar get nothing: those scripts do not
+ * end a sentence with a period at all (Thai marks it with a space), so any
+ * terminator would be an invented mark. `endsSentence` already recognises 。, so
+ * the cue this produces is terminated.
+ */
+function sentenceTerminatorFor(text: string): string {
+    const stripped = text.replace(/\n/g, " ").trimEnd();
+    if (ENDS_CJK_RE.test(stripped)) return "。";
+    if (ENDS_NO_SPACE_SCRIPT_RE.test(stripped)) return "";
+    return ".";
+}
+
+/**
+ * Every place this text is ALLOWED to break, as the two lines it would produce.
+ *
+ * Splitting on `" "` — which is all this used to do — offers no break at all in a
+ * script that has no spaces, so a Chinese or Japanese cue came back as one line
+ * however long and `MAX_LINE_CHARS` was silently violated on the exact cues C2
+ * made reachable. Two kinds of break point:
+ *
+ *   - at a space, which is consumed by the break (English);
+ *   - between two adjacent no-space-script characters, which are both kept (CJK,
+ *     Thai, Lao, Myanmar) — minus the positions kinsoku forbids, so a line never
+ *     opens with 。 or 、.
+ *
+ * For space-separated text this yields exactly the old word-boundary candidates.
+ */
+function lineBreakCandidates(cleaned: string): Array<[string, string]> {
+    const breaks: Array<[string, string]> = [];
+
+    for (let i = 1; i < cleaned.length; i++) {
+        const previous = cleaned[i - 1];
+        const current = cleaned[i];
+
+        if (current === " ") continue;
+
+        if (previous === " ") {
+            breaks.push([cleaned.slice(0, i - 1), cleaned.slice(i)]);
+            continue;
+        }
+
+        if (
+            IS_NO_SPACE_SCRIPT_RE.test(previous) &&
+            IS_NO_SPACE_SCRIPT_RE.test(current) &&
+            !NO_LINE_START_RE.test(current)
+        ) {
+            breaks.push([cleaned.slice(0, i), cleaned.slice(i)]);
+        }
+    }
+
+    return breaks;
 }
 
 function wrapCaptionText(text: string): string {
@@ -624,7 +740,6 @@ function wrapCaptionText(text: string): string {
         return cleaned;
     }
 
-    const words = cleaned.split(" ");
     type Candidate = {
         overflow: number;
         orphanPenalty: number;
@@ -633,14 +748,15 @@ function wrapCaptionText(text: string): string {
     };
     const candidates: Candidate[] = [];
 
-    for (let i = 1; i < words.length; i++) {
-        const first = words.slice(0, i).join(" ");
-        const second = words.slice(i).join(" ");
+    for (const [first, second] of lineBreakCandidates(cleaned)) {
         const overflow =
             Math.max(0, first.length - MAX_LINE_CHARS) +
             Math.max(0, second.length - MAX_LINE_CHARS);
+        // `countCaptionWords`, not `split(" ").length`: a Chinese line is one
+        // whitespace-token however long, so the space-counting version called
+        // every CJK line an orphan and the penalty stopped discriminating.
         const orphanPenalty =
-            first.split(" ").length === 1 || second.split(" ").length === 1
+            countCaptionWords(first) === 1 || countCaptionWords(second) === 1
                 ? 1
                 : 0;
         const balance = Math.abs(first.length - second.length);

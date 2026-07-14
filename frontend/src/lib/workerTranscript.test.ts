@@ -7,6 +7,7 @@ import {
     segmentsFromWorkerChunks,
 } from "./workerTranscript";
 import { consolidateSegments } from "./captionFormatter";
+import type { TranscriptionSegment } from "../services/types";
 
 /**
  * Whisper leaves the final chunk's end timestamp NULL. Rendering or persisting
@@ -134,8 +135,17 @@ describe("the open decoding window must carry a provisional end", () => {
     });
 
     it("times the SECOND window from its own stride offset, not from zero", () => {
+        // transformers.js overlaps each decoding window with its neighbour on BOTH
+        // sides: `const jump = window - 2 * stride` (pipelines.js), so window k
+        // begins at `k * (chunk_length_s - 2 * stride_length_s)` — 19s for (29, 5),
+        // NOT 24s. This test used to pin 24/53, which is the worker's old
+        // one-stride formula, and the error grows by 5s per window: on a
+        // five-minute file the preview showed cue times a minute past the end of
+        // the audio. Verified against the library source, not against arithmetic.
         const strideLength = 5;
-        const secondOffset = CHUNK_LENGTH - strideLength;
+        const secondOffset = CHUNK_LENGTH - 2 * strideLength;
+        expect(secondOffset).toBe(19);
+
         const segments = segmentsFromWorkerChunks(
             [
                 { text: " first window", timestamp: [0, CHUNK_LENGTH] },
@@ -146,8 +156,8 @@ describe("the open decoding window must carry a provisional end", () => {
             ],
             null,
         );
-        expect(segments[1].start).toBe(24);
-        expect(segments[1].end).toBe(53);
+        expect(segments[1].start).toBe(19);
+        expect(segments[1].end).toBe(48);
     });
 });
 
@@ -325,5 +335,74 @@ describe("segmentsForPersistence: the database keeps the REAL word times", () =>
         expect(
             segmentsForPersistence({ text: "Hello there.", chunks }, 10),
         ).toEqual(segmentsFromWorkerChunks(chunks, 10));
+    });
+});
+
+describe("a LEGACY transcript, cached under the pre-rename model id, still renders", () => {
+    // The transcript cache now maps `onnx-community/whisper-base` ->
+    // `onnx-community/whisper-base_timestamped` on lookup (store.rs::find_transcript),
+    // so renaming the four models to their `_timestamped` exports no longer orphans
+    // every transcript a user had already made. That is only SAFE because the old
+    // rows — sentence-granular, no word timings — still render through the
+    // formatter's no-words path. If this test ever fails, the mapping in
+    // find_transcript is serving rows the frontend can no longer draw, and it must
+    // go back to being a cache miss.
+    const legacyRows: TranscriptionSegment[] = [
+        {
+            start: 0,
+            end: 5.52,
+            text: " The quick brown fox jumps over the lazy dog.",
+        },
+        { start: 5.52, end: 7.52, text: " This sentence is used for testing." },
+        {
+            start: 7.52,
+            end: 12.24,
+            text: " Word-level timestamps are extracted using DTW.",
+        },
+    ];
+
+    it("consolidates sentence-granular rows into cues, with no `words` anywhere", () => {
+        const { text, chunks } = consolidateWorkerTranscript(
+            {
+                text: "",
+                chunks: legacyRows.map((row) => ({
+                    text: row.text,
+                    timestamp: [row.start, row.end] as [number, number],
+                })),
+                // NO `words`: that is exactly what a pre-rename row has.
+            },
+            12.24,
+        );
+
+        expect(chunks.length).toBeGreaterThan(0);
+        expect(text).toContain("quick brown fox");
+        expect(text).toContain("Word-level timestamps");
+
+        // Cues are ordered, non-overlapping and inside the audio — i.e. usable.
+        expect(chunks[0].start).toBeGreaterThanOrEqual(0);
+        for (let i = 0; i < chunks.length; i++) {
+            expect(chunks[i].end).toBeGreaterThan(chunks[i].start);
+            if (i > 0) {
+                expect(chunks[i].start).toBeGreaterThanOrEqual(
+                    chunks[i - 1].end,
+                );
+            }
+        }
+        expect(chunks.at(-1)!.end).toBeLessThanOrEqual(12.24);
+    });
+
+    it("agrees with consolidateSegments' no-words path (the same rows read straight from SQLite)", () => {
+        expect(consolidateSegments(legacyRows)).toEqual(
+            consolidateWorkerTranscript(
+                {
+                    text: "",
+                    chunks: legacyRows.map((row) => ({
+                        text: row.text,
+                        timestamp: [row.start, row.end] as [number, number],
+                    })),
+                },
+                12.24,
+            ).chunks,
+        );
     });
 });

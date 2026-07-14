@@ -692,3 +692,132 @@ describe("a segment that knows its own end is not stretched past it", () => {
         expect(second.end).toBeLessThanOrEqual(6.0);
     });
 });
+
+describe("CJK captions must obey the line-length limit", () => {
+    // `wrapCaptionText` split on `" "` and nothing else, so a Chinese cue offered
+    // NO break point: it came back as one line however long, and MAX_LINE_CHARS
+    // (42) was silently violated on exactly the cues C2 made reachable.
+    const MAX_LINE_CHARS = 42;
+
+    /** One long Chinese sentence, one word (= one character) every 0.1s. */
+    const sentence =
+        "光合作用是植物利用阳光把二氧化碳和水转化为葡萄糖并且释放氧气的一个非常重要的生物化学过程。";
+    const longChineseWords: WordToken[] = Array.from(sentence).map(
+        (char, index) => ({
+            text: char,
+            start: index * 0.1,
+            end: (index + 1) * 0.1,
+        }),
+    );
+
+    it("wraps a long Chinese cue instead of emitting one over-long line", () => {
+        const cues = consolidateSegments([], longChineseWords);
+
+        const overLong = cues
+            .flatMap((cue) => cue.text.split("\n"))
+            .filter((line) => line.length > MAX_LINE_CHARS);
+        expect(overLong).toEqual([]);
+
+        // It really is long enough to have needed wrapping.
+        const wrapped = cues.find((cue) => cue.text.includes("\n"));
+        expect(wrapped).toBeDefined();
+    });
+
+    it("wraps without inventing spaces or losing a character", () => {
+        const cues = consolidateSegments([], longChineseWords);
+        const rendered = cues
+            .map((cue) => cue.text.replace(/\n/g, ""))
+            .join("");
+
+        expect(rendered).toBe(sentence);
+        expect(rendered).not.toMatch(/\s/);
+    });
+
+    it("never opens a line with a CJK closing mark", () => {
+        const cues = consolidateSegments([], longChineseWords);
+        for (const cue of cues) {
+            for (const line of cue.text.split("\n")) {
+                expect(line[0]).not.toMatch(/[、，。！？：；）」』]/);
+            }
+        }
+    });
+
+    it("wraps English exactly as before (the CJK break points did not disturb it)", () => {
+        const cues = consolidateSegments([
+            {
+                start: 0,
+                end: 5,
+                text: "The quick brown fox jumps over the lazy dog while nobody watches it at all.",
+            },
+        ]);
+        for (const cue of cues) {
+            for (const line of cue.text.split("\n")) {
+                expect(line.length).toBeLessThanOrEqual(MAX_LINE_CHARS);
+                // Breaks only ever fall on a space: no word was cut in half.
+                expect(line).toBe(line.trim());
+            }
+        }
+        expect(flat(cues)).toContain("quick brown fox");
+    });
+
+    it("closes an unterminated CJK cue with 。, not an ASCII period", () => {
+        // `normalizeCaptionStarts` appended "." unconditionally — "叶绿素吸收光子."
+        const cues = consolidateSegments(
+            [],
+            Array.from("叶绿素吸收光子").map((char, index) => ({
+                text: char,
+                start: index * 0.3,
+                end: (index + 1) * 0.3,
+            })),
+        );
+        const last = cues.at(-1)!.text;
+        expect(last.endsWith("。")).toBe(true);
+        expect(last.endsWith(".")).toBe(false);
+    });
+
+    it("still closes an unterminated English cue with an ASCII period", () => {
+        const cues = consolidateSegments([
+            { start: 0, end: 2, text: "no full stop here" },
+        ]);
+        expect(cues.at(-1)!.text.endsWith(".")).toBe(true);
+    });
+});
+
+describe("I3: one persisted row must re-derive as exactly ONE token", () => {
+    // Whisper emits "Hello,world" as a SINGLE word chunk. `cleanCaptionText` puts
+    // the missing space back — so that one persisted row re-derived as TWO tokens
+    // on reload, and the reload saw a token stream the live render never had.
+    // Enforced by construction now: `normalizeWordTokens` does the split itself,
+    // so both paths start from the same tokens.
+    const words: WordToken[] = [
+        { text: " Hello,world", start: 0, end: 0.8 },
+        { text: " again", start: 0.8, end: 1.2 },
+    ];
+
+    it("splits the glued token on the way in, sharing its span by character length", () => {
+        const tokens = normalizeWordTokens(words);
+        expect(tokens.map((t) => t.text)).toEqual(["Hello,", "world", "again"]);
+
+        // The pieces tile the original word's span exactly: no time invented, none lost.
+        expect(tokens[0].start).toBe(0);
+        expect(tokens[1].end).toBe(0.8);
+        expect(tokens[0].end).toBe(tokens[1].start);
+    });
+
+    it("renders identically live and on reload", () => {
+        const live = consolidateSegments([], words);
+        const persisted = normalizeWordTokens(words).map((word) => ({
+            start: word.start,
+            end: word.end,
+            text: word.text,
+        }));
+
+        // The invariant itself: every persisted row is ONE token when re-split.
+        for (const row of persisted) {
+            expect(cleanCaptionText(row.text).split(" ")).toHaveLength(1);
+        }
+
+        expect(consolidateSegments(persisted)).toEqual(live);
+        expect(flat(live)).toContain("Hello, world");
+    });
+});

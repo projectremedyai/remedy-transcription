@@ -32,11 +32,31 @@ static MODEL_ID_RE: Lazy<Regex> =
 /// of truth above. `"__auto__"` is a sentinel the frontend resolves to one of the
 /// real presets, not a model.
 static REQUIRED_MODEL_IDS: Lazy<Vec<String>> = Lazy::new(|| {
-    MODEL_ID_RE
+    let ids: Vec<String> = MODEL_ID_RE
         .captures_iter(TRANSCRIPTION_CONFIG_TS)
         .map(|caps| caps[1].to_string())
         .filter(|id| id != "__auto__")
-        .collect()
+        .collect();
+
+    // Fail LOUDLY, in the running app and not only under `cargo test`.
+    //
+    // A parse miss yields a short or empty Vec, `list_models` answers with fewer
+    // models than the frontend offers, and the frontend — which gates the
+    // Transcribe button on an exact id match against that answer — goes dead with
+    // no error anywhere. That is the exact bug this derivation exists to prevent,
+    // and leaving it to a test means it comes back silently for anyone who builds
+    // without running the suite. A panic here is a crash on startup with a message
+    // that names the cause; a dead button is a bug report six weeks later.
+    assert!(
+        !ids.is_empty(),
+        "MODEL_ID_RE matched no models in frontend/src/config/transcription.ts. \
+         list_models would answer with an EMPTY list and the frontend would disable \
+         every entry point to transcription with no error. The config's format has \
+         changed (quoting? a rename? moved file?) — fix MODEL_ID_RE. Do NOT retype \
+         the model list here: that is how it drifted last time."
+    );
+
+    ids
 });
 
 static YOUTUBE_ID_RE: Lazy<Regex> =
@@ -754,9 +774,15 @@ mod tests {
                  TRANSCRIPTION_CONFIG_TS is pointing at the wrong file",
             );
         let rest = &TRANSCRIPTION_CONFIG_TS[start..];
+        // `\n]` and not `\n];`: the array closes with
+        // `] as const satisfies readonly ModelPreset[];` — the `as const` is what
+        // derives `ModelPresetId` from the array, so a deleted preset is a compile
+        // error at every site that names it. A locator pinned to `];` silently ran
+        // PAST the array into the rest of the file and counted the `"__auto__"`
+        // comparisons in `modelIdForPreset` as if they were presets.
         let end = rest
-            .find("\n];")
-            .expect("MODEL_PRESETS array is not terminated by `];`");
+            .find("\n]")
+            .expect("MODEL_PRESETS array is not terminated by a closing bracket");
         &rest[..end]
     }
 

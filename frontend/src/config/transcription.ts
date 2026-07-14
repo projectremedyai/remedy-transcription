@@ -1,11 +1,5 @@
 export type TaskMode = "transcribe" | "translate";
 export type DeviceMode = "webgpu" | "wasm";
-export type ModelPresetId =
-    | "auto"
-    | "fast"
-    | "balanced"
-    | "quality"
-    | "fast_en";
 
 export interface BrowserCaps {
     secureContext: boolean;
@@ -15,10 +9,19 @@ export interface BrowserCaps {
     logicalCores: number;
 }
 
+/**
+ * The SHAPE of a preset — the contract `MODEL_PRESETS` is checked against.
+ *
+ * `id` is a plain `string` here on purpose: `ModelPresetId` is derived FROM
+ * `MODEL_PRESETS`, so typing it as `ModelPresetId` would make the array's type
+ * reference itself. The strict union lives on `ModelPresetId`; this exists only to
+ * catch a malformed entry.
+ */
 export interface ModelPreset {
-    id: ModelPresetId;
+    id: string;
     label: string;
-    modelId: string | "__auto__";
+    /** A HuggingFace repo id, or the `"__auto__"` sentinel. */
+    modelId: string;
     description: string;
     webgpuOnly: boolean;
     englishOnly: boolean;
@@ -33,7 +36,21 @@ export interface ResolvedModelConfig {
     language: string;
 }
 
-export const MODEL_PRESETS: ModelPreset[] = [
+/**
+ * The single source of truth for which models exist. The Rust backend parses the
+ * `modelId:` lines of this very array at compile time (`commands.rs`,
+ * `include_str!`), so this list and `list_models` cannot hold different models.
+ *
+ * `as const satisfies` is load-bearing, not style. `ModelPresetId` is DERIVED from
+ * it below, so deleting or renaming a preset here is a COMPILE ERROR at every site
+ * that names it — including the worker's WebGPU dtype override, which is keyed on
+ * the `"quality"` preset. Written as a hand-maintained union, the id could outlive
+ * the preset: the lookup would quietly return `undefined`, the dtype override
+ * would stop applying, and large-v3-turbo would load an fp32 encoder on WebGPU
+ * with nothing to say so — the same silent-drift class as the dead Transcribe
+ * button, one level over.
+ */
+export const MODEL_PRESETS = [
     {
         id: "auto",
         label: "Auto (Recommended)",
@@ -74,7 +91,33 @@ export const MODEL_PRESETS: ModelPreset[] = [
         webgpuOnly: false,
         englishOnly: true,
     },
-];
+] as const satisfies readonly ModelPreset[];
+
+export type ModelPresetId = (typeof MODEL_PRESETS)[number]["id"];
+
+/** A preset that names a real model, as opposed to the `__auto__` sentinel. */
+export type ConcreteModelPresetId = Exclude<ModelPresetId, "auto">;
+
+/**
+ * The model id a preset resolves to — or a throw.
+ *
+ * The worker keys its WebGPU dtype override on a preset id, and a bare
+ * `MODEL_PRESETS.find(...)?.modelId` hands back `undefined` if the preset is ever
+ * gone: the override silently stops applying. The derived `ModelPresetId` above
+ * makes that a compile error, and this makes it a loud runtime one as well, for
+ * anything that reaches the lookup with an id the type system did not check
+ * (a persisted preference, a `select` value). Never return `undefined`.
+ */
+export function modelIdForPreset(presetId: ConcreteModelPresetId): string {
+    const preset = MODEL_PRESETS.find((item) => item.id === presetId);
+    if (!preset || preset.modelId === "__auto__") {
+        throw new Error(
+            `No model preset "${presetId}" in MODEL_PRESETS — a preset was removed ` +
+                `or renamed without updating the code that reads it.`,
+        );
+    }
+    return preset.modelId;
+}
 
 export const LANGUAGE_OPTIONS = [
     { value: "auto", label: "Auto detect" },

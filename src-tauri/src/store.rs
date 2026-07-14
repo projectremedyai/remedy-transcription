@@ -131,6 +131,29 @@ pub struct CachedTranscript {
     pub segments: Vec<TranscriptionSegment>,
 }
 
+/// The suffix the four Whisper exports gained when they moved to their
+/// word-timestamp builds.
+const TIMESTAMPED_SUFFIX: &str = "_timestamped";
+
+/// The OTHER id a transcript for `model_id` may be stored under.
+///
+/// The rename was purely a suffix: `onnx-community/whisper-tiny` became
+/// `onnx-community/whisper-tiny_timestamped`, and the same for whisper-base,
+/// whisper-large-v3-turbo and distil-small.en. So the alias is mechanical rather
+/// than a hand-maintained table — a table would be a second copy of the model
+/// list, which is precisely the duplication that killed the app once already.
+///
+/// The mapping is symmetric: a `_timestamped` id also finds a row written under
+/// the legacy id, and a legacy id finds a row written under the `_timestamped`
+/// one. An id with no plausible counterpart maps to `None`.
+fn model_id_alias(model_id: &str) -> Option<String> {
+    match model_id.strip_suffix(TIMESTAMPED_SUFFIX) {
+        Some(legacy) if !legacy.is_empty() => Some(legacy.to_string()),
+        Some(_) => None,
+        None => Some(format!("{model_id}{TIMESTAMPED_SUFFIX}")),
+    }
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -244,20 +267,23 @@ impl Store {
     }
 
     /// The transcript cache is keyed on `model_id`, so RENAMING a model orphans
-    /// every transcript made under its old id. That happened when the four models
-    /// moved to their `_timestamped` exports, and it is a DELIBERATE choice, not
-    /// an oversight: the old rows hold sentence-granular segments whose word times
-    /// were fabricated by spreading a chunk's span across its words (measured: off
-    /// by up to 1.3s), while the new ids produce real DTW word times. Serving the
-    /// old rows under the new ids would hand back exactly the data this release
-    /// exists to replace, and — for Task 6 — would hand a diarizer word times
-    /// nobody measured.
+    /// every transcript made under its old id — which is exactly what happened
+    /// when the four models moved to their `_timestamped` exports
+    /// (`onnx-community/whisper-tiny` -> `onnx-community/whisper-tiny_timestamped`,
+    /// and likewise for whisper-base, whisper-large-v3-turbo and distil-small.en).
+    /// Every transcript a user had already made became unreachable.
     ///
-    /// The orphaned rows are not corrupt: a transcript opened from one of the old
-    /// jobs still renders, via the formatter's no-words path. They are simply
-    /// never used as a cache HIT for a run under the new ids, so the first
-    /// transcription of an already-seen source re-runs the model once. That is the
-    /// price of the upgrade, paid once per source.
+    /// So the lookup accepts the LEGACY id too, via `model_id_lookup_aliases`. The
+    /// rows are not corrupt, merely coarser: they hold sentence-granular segments
+    /// with no word timings, and the formatter's no-words path
+    /// (`consolidateSegments` with `words` absent -> `tokensFromSegments`) renders
+    /// them correctly — that is the whole reason serving them is safe. What a user
+    /// gets back from an old row is the transcript they already had; what they
+    /// avoid is re-running the model on every source they have ever transcribed.
+    ///
+    /// An exact match wins over an alias match (`ORDER BY`), so once a source is
+    /// re-transcribed under the new id, the new row — with real DTW word times —
+    /// is the one served.
     pub fn find_transcript(
         &self,
         source_id: i64,
@@ -266,11 +292,17 @@ impl Store {
         language: &str,
     ) -> anyhow::Result<Option<CachedTranscript>> {
         let conn = self.conn.lock().unwrap();
+        // Falls back to `model_id` itself when there is no alias, which makes the
+        // `IN (?2, ?3)` an exact match — the pre-rename behaviour.
+        let alias = model_id_alias(model_id).unwrap_or_else(|| model_id.to_string());
+
         let row: Option<(String, String)> = conn
             .query_row(
                 "SELECT full_text, segments_json FROM transcripts
-                 WHERE source_id = ?1 AND model_id = ?2 AND task = ?3 AND language = ?4",
-                params![source_id, model_id, task.as_str(), language],
+                 WHERE source_id = ?1 AND model_id IN (?2, ?3) AND task = ?4 AND language = ?5
+                 ORDER BY (model_id = ?2) DESC
+                 LIMIT 1",
+                params![source_id, model_id, alias, task.as_str(), language],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -707,4 +739,182 @@ ON jobs(source_id);
 #[allow(dead_code)]
 pub fn parse_iso(text: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text).ok().map(|dt| dt.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempStore {
+        store: Store,
+        path: PathBuf,
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn temp_store() -> TempStore {
+        let path = std::env::temp_dir().join(format!("remedy-store-{}.sqlite", Uuid::new_v4()));
+        let store = Store::open(&path).expect("open a fresh store");
+        TempStore { store, path }
+    }
+
+    /// A store with one source in it — the source every test below transcribes.
+    fn store_with_source() -> (TempStore, i64) {
+        let temp = temp_store();
+        let source = temp
+            .store
+            .get_or_create_source(
+                SourceType::File,
+                "sha256",
+                None,
+                Some("lecture.mp3"),
+                Some(1),
+            )
+            .expect("create source");
+        let source_id = source.id;
+        (temp, source_id)
+    }
+
+    /// Write a transcript the way the app does: a job, then `persist_transcript`
+    /// against that job's own recipe.
+    fn write_transcript(store: &Store, source_id: i64, model_id: &str, full_text: &str) {
+        let job = store
+            .create_pending_job(
+                source_id,
+                SourceType::File,
+                "sha256",
+                JobStatus::Ready,
+                Some("lecture.mp3"),
+                Some("audio/mpeg"),
+                model_id,
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("create job");
+
+        store
+            .persist_transcript(
+                &job.id,
+                model_id,
+                TaskType::Transcribe,
+                "english",
+                full_text,
+                &[TranscriptionSegment {
+                    start: 0.0,
+                    end: 2.5,
+                    text: " Hello there.".to_string(),
+                }],
+            )
+            .expect("persist transcript");
+    }
+
+    /// The rename to the `_timestamped` exports changed the cache key, which made
+    /// every transcript a user had already made unreachable. The lookup now
+    /// accepts the legacy id, so they keep them.
+    #[test]
+    fn a_transcript_written_under_the_legacy_model_id_is_found_under_the_new_one() {
+        let (temp, source_id) = store_with_source();
+
+        write_transcript(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base",
+            "legacy transcript",
+        );
+
+        let found = temp
+            .store
+            .find_transcript(
+                source_id,
+                "onnx-community/whisper-base_timestamped",
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("query")
+            .expect("the legacy row must be reachable under the renamed model id");
+
+        assert_eq!(found.full_text, "legacy transcript");
+        assert_eq!(found.segments.len(), 1);
+    }
+
+    /// The exact match wins, so re-transcribing under the new id gives the user
+    /// the real word times rather than the coarse legacy row forever.
+    #[test]
+    fn an_exact_match_beats_the_legacy_alias() {
+        let (temp, source_id) = store_with_source();
+
+        write_transcript(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base",
+            "legacy transcript",
+        );
+        write_transcript(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base_timestamped",
+            "word-timed transcript",
+        );
+
+        let found = temp
+            .store
+            .find_transcript(
+                source_id,
+                "onnx-community/whisper-base_timestamped",
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("query")
+            .expect("row");
+
+        assert_eq!(found.full_text, "word-timed transcript");
+    }
+
+    /// A miss is still a miss: the alias must not turn an unrelated model, task or
+    /// language into a false cache hit.
+    #[test]
+    fn the_alias_does_not_widen_the_key_beyond_the_rename() {
+        let (temp, source_id) = store_with_source();
+
+        write_transcript(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base",
+            "legacy transcript",
+        );
+
+        const TINY: &str = "onnx-community/whisper-tiny_timestamped";
+        const BASE: &str = "onnx-community/whisper-base_timestamped";
+
+        for (model_id, task, language) in [
+            (TINY, TaskType::Transcribe, "english"),
+            (BASE, TaskType::Translate, "english"),
+            (BASE, TaskType::Transcribe, "spanish"),
+        ] {
+            assert!(
+                temp.store
+                    .find_transcript(source_id, model_id, task, language)
+                    .expect("query")
+                    .is_none(),
+                "{model_id}/{task:?}/{language} must not hit the whisper-base legacy row"
+            );
+        }
+    }
+
+    #[test]
+    fn model_id_aliases_map_both_ways() {
+        assert_eq!(
+            model_id_alias("onnx-community/distil-small.en").as_deref(),
+            Some("onnx-community/distil-small.en_timestamped")
+        );
+        assert_eq!(
+            model_id_alias("onnx-community/whisper-large-v3-turbo_timestamped").as_deref(),
+            Some("onnx-community/whisper-large-v3-turbo")
+        );
+        assert_eq!(model_id_alias("_timestamped"), None);
+    }
 }

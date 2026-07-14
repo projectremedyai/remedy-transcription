@@ -1196,6 +1196,43 @@ pub async fn export_transcript(request: ExportRequest) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A compile-proof, not a behaviour test.
+    ///
+    /// `MockDiarizer` used to live in a *private* `#[cfg(test)] mod tests` inside
+    /// `diarize.rs`. `commands` is a sibling module, so it could not name it at
+    /// all -- `error[E0603]: module tests is private`. The diarization command
+    /// tests that need it therefore could not be written. It now lives in
+    /// `#[cfg(test)] pub mod diarize::mock`, and this test exists to fail loudly
+    /// if it is ever moved back somewhere unreachable.
+    ///
+    /// Note for whoever writes those command tests: `#[cfg(test)]` items are
+    /// invisible to integration tests in `src-tauri/tests/`, which compile as a
+    /// separate crate against the public library. Command tests that use this
+    /// mock must be **in-crate unit tests**, right here, not files under `tests/`.
+    #[test]
+    fn the_mock_diarizer_is_reachable_from_the_command_tests() {
+        use crate::diarize::mock::MockDiarizer;
+        use crate::diarize::{DiarizeOptions, Diarizer, SpeakerTurn};
+
+        let d: Box<dyn Diarizer> = Box::new(MockDiarizer::returning(vec![SpeakerTurn {
+            start: 0.0,
+            end: 1.0,
+            speaker: 0,
+        }]));
+        assert_eq!(
+            d.diarize(Path::new("x.wav"), &DiarizeOptions::default())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The case the commands actually have to survive: diarization degraded.
+        let broken: Box<dyn Diarizer> = Box::new(MockDiarizer::failing("sidecar killed by SIGABRT"));
+        assert!(broken
+            .diarize(Path::new("x.wav"), &DiarizeOptions::default())
+            .is_err());
+    }
+
     /// The guard on the bug that killed the whole app.
     ///
     /// `REQUIRED_MODEL_IDS` is now DERIVED from the frontend's config, so the two

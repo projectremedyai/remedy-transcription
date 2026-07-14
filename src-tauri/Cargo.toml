@@ -1,3 +1,16 @@
+# The app is the workspace root. `diarize-sidecar` is a member, NOT a
+# dependency: it is a standalone executable shipped as a Tauri `externalBin`.
+#
+# That separation is load-bearing, not tidiness. ONNX Runtime aborts the whole
+# process (C++ `terminate` -> SIGABRT) on a corrupt or truncated model. Rust
+# cannot catch that: `catch_unwind` is powerless against a foreign abort, and
+# `panic = "abort"` is set below anyway. In-process, one bad model file would
+# take transcription down with it. Out-of-process, it is a dead child and an
+# `Err`. Keep sherpa-onnx OUT of this package's dependency graph -- verify with:
+#     cargo tree -p remedy-transcription | grep sherpa   # must print nothing
+[workspace]
+members = ["diarize-sidecar"]
+
 [package]
 name = "remedy-transcription"
 version = "1.0.0"
@@ -31,10 +44,9 @@ anyhow = "1"
 thiserror = "1"
 once_cell = "1"
 chrono = { version = "0.4", features = ["serde"] }
-# Speaker diarization. Official k2-fsa crate (Apache-2.0). Default `static`
-# feature: the build script downloads a prebuilt sherpa-onnx + ONNX Runtime
-# static archive from the project's own GitHub releases and links it in.
-sherpa-onnx = "1.13"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 panic = "abort"

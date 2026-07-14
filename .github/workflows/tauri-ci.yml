@@ -43,11 +43,25 @@ jobs:
       - name: Frontend tests
         run: npm --prefix frontend test
 
+      # --skip-models: the 34 MB of diarization models are only touched by the
+      # #[ignore]d real-model tests, and CI does not pass --ignored. Downloading
+      # them here was 34 MB per run for nothing.
       - name: Fetch Tauri sidecars
-        run: ./scripts/fetch-sidecars.sh
+        run: ./scripts/fetch-sidecars.sh --skip-models
+
+      # Must precede every cargo command below: tauri-build's build script checks
+      # that each `externalBin` exists, so a missing diarize-sidecar-<triple>
+      # fails even a bare `cargo check`. --debug because CI never bundles; it
+      # only needs the file to exist and the crash-isolation tests to have
+      # something to spawn.
+      - name: Build the diarization sidecar
+        run: ./scripts/build-diarize-sidecar.sh --debug
 
       - name: Check Rust
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+        run: cargo check --workspace --manifest-path src-tauri/Cargo.toml
 
+      # --workspace, not just the app: it builds `diarize-sidecar`, which the
+      # app's crash-isolation tests spawn. Without it those tests have no
+      # binary to point at and fail.
       - name: Test Rust
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --workspace --manifest-path src-tauri/Cargo.toml

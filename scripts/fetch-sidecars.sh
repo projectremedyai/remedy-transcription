@@ -47,13 +47,26 @@ MODELS="models/diarization"
 SEG_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
 EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM%2B%2B.onnx"
 
+# NEVER curl -o straight to a model's final path.
+#
+# A model file is only ever "present" if it is COMPLETE. Downloading in place
+# means a Ctrl-C, a dropped connection or a full disk leaves a truncated file at
+# the real path -- and the `[[ -f ]]` guards below then cheerfully report it
+# "already present" on every subsequent run, forever. The user's only clue would
+# be the app dying: a truncated ONNX model does not error, it makes ONNX Runtime
+# throw a C++ exception that aborts the process with SIGABRT.
+#
+# So: download to a temp path, and only `mv` into place once curl has said the
+# whole thing arrived. `mv` within the same filesystem is atomic, so the final
+# path only ever holds a complete file or no file.
 fetch_models() {
     local tmp seg_model emb_model
     seg_model="$MODELS/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
     emb_model="$MODELS/wespeaker_en_voxceleb_CAM++.onnx"
 
     mkdir -p "$MODELS"
-    tmp="$(mktemp -d)"
+    # Inside $MODELS, so the mv is a same-filesystem rename.
+    tmp="$(mktemp -d "$MODELS/.fetch.XXXXXX")"
     trap 'rm -rf "$tmp"' RETURN
 
     if [[ -f "$seg_model" ]]; then
@@ -61,16 +74,27 @@ fetch_models() {
     else
         echo "Fetching pyannote segmentation-3.0 (~7 MB) -> $seg_model"
         curl -fL --progress-bar -o "$tmp/seg.tar.bz2" "$SEG_URL"
-        tar -xjf "$tmp/seg.tar.bz2" -C "$MODELS"
-        [[ -f "$seg_model" ]] || { echo "Expected $seg_model after extraction" >&2; exit 1; }
+        # Extraction is its own staging step: a half-unpacked tree is as bad as
+        # a half-downloaded file.
+        mkdir -p "$tmp/seg"
+        tar -xjf "$tmp/seg.tar.bz2" -C "$tmp/seg"
+        [[ -f "$tmp/seg/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" ]] \
+            || { echo "The segmentation archive did not contain model.onnx" >&2; exit 1; }
+        rm -rf "$MODELS/sherpa-onnx-pyannote-segmentation-3-0"
+        mv "$tmp/seg/sherpa-onnx-pyannote-segmentation-3-0" "$MODELS/"
     fi
 
     if [[ -f "$emb_model" ]]; then
         echo "Embedding model already present -> $emb_model"
     else
         echo "Fetching WeSpeaker CAM++ embeddings (~28 MB) -> $emb_model"
-        curl -fL --progress-bar -o "$emb_model" "$EMB_URL"
+        curl -fL --progress-bar -o "$tmp/emb.onnx" "$EMB_URL"
+        mv "$tmp/emb.onnx" "$emb_model"
     fi
+
+    # The RETURN trap would do this anyway; doing it here keeps the staging
+    # directory out of the listing below.
+    rm -rf "$tmp"
 
     echo
     echo "Diarization models in place:"
@@ -153,6 +177,15 @@ ls -la "$DEST"
 if [[ "$WANT_MODELS" -eq 1 ]]; then
     echo
     fetch_models
+fi
+
+if [[ ! -f "$DEST/diarize-sidecar-${TRIPLE}${ext}" ]]; then
+    cat <<'NOTE'
+
+Note: the diarization sidecar is COMPILED, not downloaded, so it is not fetched
+here. `tauri build` and `tauri dev` will both fail until it exists. Build it with:
+    ./scripts/build-diarize-sidecar.sh
+NOTE
 fi
 
 if [[ "$TRIPLE" == *-pc-windows-* ]]; then

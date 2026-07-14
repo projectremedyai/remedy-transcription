@@ -279,6 +279,182 @@ describe("useTranscriber's wait for prepared audio", () => {
         expect(result.current.isBusy).toBe(false);
     });
 
+    /**
+     * THE WINDOW THE FIRST FIX LEFT OPEN.
+     *
+     * Cancelling the previous wait "first, before any early return" inside
+     * `transcribePreparedJob` is NOT early enough. `transcribePreparedJob` runs
+     * only after `beginRun()` and `api.create*Job()` have BOTH resolved — and
+     * `create_file_job` sha256s the entire file before it answers, while
+     * `create_youtube_job` shells out to yt-dlp. Neither is instant.
+     *
+     * Through that window the previous run's poll and listener are still live. If
+     * the previous job reaches `ready` inside it, its wait resolves and its
+     * `transcribePreparedJob` resumes — `getAudioUrl` → `fetch` → `decodeAudio` →
+     * `postMessage`, a whole spurious transcription.
+     *
+     * The cache-hit test above CANNOT catch this: a `mockResolvedValue` settles in
+     * a microtask, before any timer can tick, so the window never opens. This one
+     * makes job creation take a second of fake time and lands job 1's `ready`
+     * inside it. It fails unless the cancel happens synchronously, at the top of
+     * the `start*` entry point, before the first `await`.
+     */
+    it("supersedes a run whose createJob is still in flight", async () => {
+        let firstJobStatus: Job["status"] = "extracting";
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "extracting", progress: 0.1 }),
+        );
+        mocks.getJob.mockImplementation(async (jobId: string) =>
+            makeJob({
+                id: jobId,
+                status: firstJobStatus,
+                progress: firstJobStatus === "ready" ? 1 : 0.1,
+            }),
+        );
+        // yt-dlp is on the other end of this. It takes a while.
+        mocks.createYouTubeJob.mockImplementation(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            return makeJob({
+                id: "job-2",
+                source_type: "youtube",
+                status: "completed",
+                progress: 1,
+                cache_hit: true,
+                full_text: "the cached transcript",
+                filename: "A cached video",
+            });
+        });
+
+        const { result } = await renderTranscriber();
+
+        // Job 1: a local file, still extracting, its poll live.
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await tick(300);
+        expect(result.current.status).toBe("extracting");
+
+        // Job 2 starts — and while its creation is still in flight, job 1's ffmpeg
+        // finishes. This is the collision.
+        await act(async () => {
+            result.current.startFromYouTube(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            );
+        });
+        firstJobStatus = "ready";
+        await tick(1000);
+
+        // Job 1 must be dead: no audio fetched, no transcription started.
+        expect(mocks.getAudioUrl).not.toHaveBeenCalled();
+        expect(mocks.postMessage).not.toHaveBeenCalled();
+
+        expect(result.current.jobId).toBe("job-2");
+        expect(result.current.status).toBe("completed");
+        expect(result.current.output?.text).toBe("the cached transcript");
+        expect(result.current.isBusy).toBe(false);
+    });
+
+    /**
+     * The `settled` guard in `consider`.
+     *
+     * `clearInterval` stops the NEXT poll; it cannot recall the `getJob` already
+     * in flight. That one still resolves — with what was true when it was asked —
+     * after the wait has settled and the run has moved on. Unguarded, it pushes
+     * that stale status and progress straight back into the UI: `transcribing`
+     * flips back to `extracting`, and the progress bar back to 0.1.
+     */
+    it("ignores a poll that was already in flight when the wait settled", async () => {
+        let emit: ((job: Job) => void) | undefined;
+        mocks.subscribeToProgress.mockImplementation((_id, onJob) => {
+            emit = onJob;
+            return mocks.unsubscribe;
+        });
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "extracting", progress: 0.1 }),
+        );
+        // A poll that is slow to answer, and answers stale.
+        mocks.getJob.mockImplementation(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            return makeJob({
+                id: "job-1",
+                status: "extracting",
+                progress: 0.1,
+            });
+        });
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+
+        // The poll fires; its `getJob` is now in flight.
+        await tick(300);
+        expect(mocks.getJob).toHaveBeenCalledTimes(1);
+
+        // The event beats it home. The wait settles and the run moves on.
+        await act(async () => {
+            emit?.(makeJob({ id: "job-1", status: "ready", progress: 1 }));
+        });
+        await tick(0);
+        expect(result.current.status).toBe("transcribing");
+        expect(result.current.progress).toBe(1);
+
+        // Now the stale poll answers. Nothing of it may reach the UI.
+        await tick(500);
+
+        expect(result.current.status).toBe("transcribing");
+        expect(result.current.progress).toBe(1);
+    });
+
+    /**
+     * The escape hatch. Both entry points are locked while busy and drops are
+     * refused, so a run that never terminates — a job stranded with no event ever
+     * coming — leaves quitting the app as the only exit unless `cancel` works.
+     *
+     * "Works" means more than flipping `isBusy`: the poll must stop, and the run
+     * must not be able to come back to life if whatever it was waiting on
+     * eventually answers.
+     */
+    it("cancel stops the poll, clears busy, and disowns the run", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "extracting", progress: 0.1 }),
+        );
+        // The stranded job: it never leaves `extracting`.
+        mocks.getJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "extracting", progress: 0.1 }),
+        );
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await tick(900);
+        expect(result.current.isBusy).toBe(true);
+        const pollsBeforeCancel = mocks.getJob.mock.calls.length;
+        expect(pollsBeforeCancel).toBeGreaterThan(0);
+
+        await act(async () => {
+            result.current.cancel();
+        });
+
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.status).toBe("idle");
+        expect(result.current.error).toBeNull();
+        expect(mocks.unsubscribe).toHaveBeenCalled();
+
+        // The poll is gone, and the job coming good later cannot resurrect the run.
+        mocks.getJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "ready", progress: 1 }),
+        );
+        await tick(3000);
+
+        expect(mocks.getJob.mock.calls.length).toBe(pollsBeforeCancel);
+        expect(mocks.getAudioUrl).not.toHaveBeenCalled();
+        expect(mocks.postMessage).not.toHaveBeenCalled();
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.status).toBe("idle");
+    });
+
     it("clears the poll and the listener on unmount", async () => {
         mocks.createFileJob.mockResolvedValue(
             makeJob({ id: "job-1", status: "extracting", progress: 0.1 }),

@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -54,6 +60,16 @@ export function AudioManager(props: { transcriber: Transcriber }) {
     const { onInputChange } = transcriber;
     const isBusy = transcriber.isBusy;
 
+    // The drop listener reads `isBusy`, but it must not DEPEND on it: Tauri's
+    // `onDragDropEvent()` resolves asynchronously, so re-running the effect on
+    // every busy flip unlistens immediately and re-listens a tick later, leaving
+    // a window in which a drop lands on no listener at all. A ref gives the
+    // listener the current value without re-registering it.
+    const isBusyRef = useRef(isBusy);
+    useEffect(() => {
+        isBusyRef.current = isBusy;
+    }, [isBusy]);
+
     const handleFileSelect = useCallback(
         (path: string) => {
             onInputChange();
@@ -93,7 +109,7 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
                     // A run is already in flight and there is no queue, so taking
                     // the drop would silently supersede it.
-                    if (isBusy) {
+                    if (isBusyRef.current) {
                         setDropNotice(null);
                         setDropError(
                             "A transcription is already running. Wait for it to finish, then drop the file again.",
@@ -139,7 +155,7 @@ export function AudioManager(props: { transcriber: Transcriber }) {
             cancelled = true;
             unlisten?.();
         };
-    }, [handleFileSelect, isBusy]);
+    }, [handleFileSelect]);
 
     const handleYouTubeSubmit = (url: string) => {
         transcriber.onInputChange();
@@ -151,8 +167,21 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
     const handleTranscribe = () => {
         if (selectedPath) {
+            // Clear the drop messages FIRST. `dropError` outranks
+            // `transcriber.error` (it is normally the newer of the two), and it is
+            // set by things the hook never hears about — a rejected `.txt` drop,
+            // say. Left standing, it would sit on top of this run's real failure,
+            // or under its transcript, indefinitely.
+            setDropError(null);
+            setDropNotice(null);
             transcriber.start(selectedPath);
         }
+    };
+
+    const handleCancel = () => {
+        setDropError(null);
+        setDropNotice(null);
+        transcriber.cancel();
     };
 
     const getStatusMessage = () => {
@@ -213,16 +242,24 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 }`}
             >
                 {/*
-                 * Both entry points are gated on `isBusy`. The app models exactly
-                 * ONE transcript at a time — one `jobId`, one output — so a second
-                 * run started mid-flight cannot be shown, only substituted. The
-                 * YouTube tile in particular was startable during a local file's
-                 * extraction, which is the overlap that let a cache-hit YouTube run
-                 * land on top of a still-running file job. The hook now cancels the
-                 * superseded wait unconditionally, so this is defence in depth
-                 * rather than the fix — but there is no legitimate use for
-                 * overlapping runs here, and the `Transcribe` button was already
-                 * hidden while busy, so the two entry points now agree.
+                 * Both entry points are gated on `isBusy`, and this gate is a UX
+                 * choice, not a safety mechanism: the app models exactly ONE
+                 * transcript at a time — one `jobId`, one output — so a second run
+                 * started mid-flight could not be shown, only substituted.
+                 *
+                 * The safety is in the hook, and it is checked by test: an overlap
+                 * is safe because `startFromFile` / `startFromYouTube` call
+                 * `cancelPendingWait()` synchronously, before their first `await`
+                 * (see `useTranscriber.ts`), and a superseded run's continuations
+                 * are dropped by its run token. "supersedes a run whose createJob
+                 * is still in flight" in `useTranscriber.test.ts` drives exactly
+                 * that overlap with this gate out of the picture, and it fails
+                 * against the pre-fix hook.
+                 *
+                 * So this gate can be removed for a queue, or a second panel, or
+                 * whatever else, without re-opening the spurious-transcription bug.
+                 * Removing it does mean the app is once again startable into a
+                 * substitution the user did not ask for — which is why it is here.
                  */}
                 <div className='flex flex-row space-x-2 py-2 w-full px-2'>
                     <YouTubeTile
@@ -302,6 +339,21 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                                 )}
                             </div>
                         )}
+                    {/*
+                     * The escape hatch, and the reason it has to exist: while a run
+                     * is in flight, BOTH tiles are disabled, the `Transcribe` button
+                     * is hidden and drops are refused. A run that never terminates
+                     * therefore had exactly one exit — quitting the app. This is the
+                     * other one.
+                     */}
+                    <div className='mt-3 flex justify-center'>
+                        <button
+                            onClick={handleCancel}
+                            className='text-sm text-slate-500 hover:text-red-600 underline underline-offset-2 transition-colors duration-200'
+                        >
+                            Cancel
+                        </button>
+                    </div>
                 </div>
             )}
 

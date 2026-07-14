@@ -83,6 +83,11 @@ export interface Transcriber {
      */
     start: (path: string) => void;
     startFromYouTube: (url: string) => void;
+    /**
+     * Abandon the run in flight and return the app to idle. The only exit from a
+     * run that never terminates, since both entry points are locked while busy.
+     */
+    cancel: () => void;
     output?: TranscriberData;
     jobId: string | null;
     error: string | null;
@@ -198,6 +203,14 @@ export function useTranscriber(): Transcriber {
                 setIsModelLoading(false);
                 break;
             case "update": {
+                // No pending worker means no run owns this output: the run was
+                // cancelled or superseded while the worker was mid-transcription.
+                // The worker cannot be stopped, but its results can be ignored —
+                // otherwise a cancelled run keeps painting a transcript over an
+                // app the user has already sent back to idle.
+                if (!pendingWorkerRef.current) {
+                    break;
+                }
                 const updateMessage = message as WorkerUpdateData;
                 // Mid-stream the trailing chunk is still open, so its real end is
                 // unknown — do NOT stretch it to the audio duration here.
@@ -220,6 +233,9 @@ export function useTranscriber(): Transcriber {
                 break;
             }
             case "complete": {
+                if (!pendingWorkerRef.current) {
+                    break;
+                }
                 const updateMessage = message as WorkerUpdateData;
                 const nextTranscript: WorkerTranscript = {
                     text: updateMessage.data.text,
@@ -243,6 +259,9 @@ export function useTranscriber(): Transcriber {
                 break;
             }
             case "error": {
+                if (!pendingWorkerRef.current) {
+                    break;
+                }
                 const messageText =
                     message.data?.message ?? "Transcription failed";
                 pendingWorkerRef.current?.reject(new Error(messageText));
@@ -362,19 +381,56 @@ export function useTranscriber(): Transcriber {
     /**
      * Tear down the wait already in flight — BOTH its listener and its poll.
      *
-     * Every new run calls this UNCONDITIONALLY, before it can take any early
-     * return. It used to sit below `waitForReady`'s terminal-status check, and
-     * `transcribePreparedJob` skips `waitForReady` entirely for an
-     * already-`completed` (cache-hit) job — so starting a cached YouTube run
-     * while a local file was still extracting cancelled nothing. The first job's
-     * poll then kept overwriting the cached transcript's status every 300 ms and,
-     * on reaching `ready`, resolved its own wait and ran a whole spurious second
-     * transcription on top of it.
+     * WHERE this is called from is the whole point, and getting it wrong is how
+     * the bug survived one fix already.
+     *
+     * It is called SYNCHRONOUSLY at the top of `startFromFile` and
+     * `startFromYouTube` — i.e. in the turn that calls them, before their first
+     * `await`. Calling it "first, before any early return" is NOT sufficient:
+     * `transcribePreparedJob` is only reached after `beginRun()` and
+     * `api.create*Job()` have both resolved, and `create_file_job` sha256s the
+     * entire file before it answers while `create_youtube_job` shells out to
+     * yt-dlp. Neither is instant. Through that window the previous run's listener
+     * and 300 ms poll were still live, and if the previous job reached `ready`
+     * inside it, its wait resolved and its `transcribePreparedJob` resumed into a
+     * whole spurious second transcription.
+     *
+     * `waitForReady` and `transcribePreparedJob` call it too, but only as belt
+     * and braces for a future caller that forgets; the calls in the two `start*`
+     * entry points are the ones that close the window.
+     *
+     * Cancelling a wait deliberately leaves its promise pending forever. The run
+     * that awaits it is dead, and `runIdRef` (below) is what stops its
+     * continuations — rejecting instead would run the dead run's `catch`, which
+     * would blow its error and `isBusy: false` over the live run's state.
      */
     const cancelPendingWait = useCallback(() => {
         unsubscribeRef.current?.();
         unsubscribeRef.current = null;
     }, []);
+
+    /**
+     * Which run owns the UI. Incremented by every start and by `cancel`.
+     *
+     * `cancelPendingWait` can only kill a wait that has already been ARMED. A run
+     * still inside `api.createFileJob` has armed nothing, so nothing can be torn
+     * down — when that call finally returns, the superseded (or cancelled) run
+     * would carry on into a transcription. Every resumption point therefore
+     * checks that it is still the current run and returns if it is not.
+     */
+    const runIdRef = useRef(0);
+
+    /**
+     * Claim the UI for a new run, killing whatever run held it.
+     *
+     * Synchronous by contract — every caller must invoke it before its first
+     * `await`.
+     */
+    const claimRun = useCallback(() => {
+        cancelPendingWait();
+        runIdRef.current += 1;
+        return runIdRef.current;
+    }, [cancelPendingWait]);
 
     const waitForReady = useCallback(
         (job: Job) => {
@@ -579,11 +635,11 @@ export function useTranscriber(): Transcriber {
      * likely to want diarized. Both sources now run this one already-proven path.
      */
     const transcribePreparedJob = useCallback(
-        async (initialJob: Job, config: ResolvedModelConfig) => {
-            // FIRST, before any early return: this run supersedes whatever run was
-            // in flight, so that run's listener and poll die here. A cache hit
-            // returns below without ever reaching `waitForReady`, so this cannot
-            // be left to `waitForReady` to do.
+        async (initialJob: Job, config: ResolvedModelConfig, runId: number) => {
+            // Belt and braces. The call that actually closes the window is the one
+            // in the `start*` entry point, which ran before `api.create*Job` was
+            // even awaited; by here that job creation has already had all the time
+            // it wanted to let a stale poll tick. See `cancelPendingWait`.
             cancelPendingWait();
 
             if (initialJob.status === "completed") {
@@ -596,6 +652,13 @@ export function useTranscriber(): Transcriber {
 
             if (readyJob.status === "completed") {
                 applyCompletedJob(readyJob, config.presetLabel);
+                return;
+            }
+
+            // The wait can only END for the current run — a superseded run's wait
+            // never settles — but a CANCEL settles nothing either, it just stops
+            // owning the UI. Check before spending anything.
+            if (runIdRef.current !== runId) {
                 return;
             }
 
@@ -619,6 +682,11 @@ export function useTranscriber(): Transcriber {
             const audioBuffer = await decodeAudio(
                 await audioResponse.arrayBuffer(),
             );
+
+            if (runIdRef.current !== runId) {
+                return;
+            }
+
             const workerTranscript = await runWorkerTranscription(
                 audioBuffer,
                 config,
@@ -643,6 +711,10 @@ export function useTranscriber(): Transcriber {
 
     const startFromFile = useCallback(
         async (path: string) => {
+            // Synchronously, before ANY await: this run takes the UI, and the
+            // previous run's listener and poll die now — not after `beginRun` and
+            // a full-file sha256 have had their say. See `cancelPendingWait`.
+            const runId = claimRun();
             try {
                 const config = await beginRun();
                 const job = await api.createFileJob({
@@ -651,17 +723,24 @@ export function useTranscriber(): Transcriber {
                     task: config.task,
                     language: config.language,
                 });
+                if (runIdRef.current !== runId) {
+                    return;
+                }
                 setJobId(job.id);
-                await transcribePreparedJob(job, config);
+                await transcribePreparedJob(job, config, runId);
             } catch (nextError) {
+                if (runIdRef.current !== runId) {
+                    return;
+                }
                 failRun(nextError, "Failed to transcribe file");
             }
         },
-        [beginRun, failRun, transcribePreparedJob],
+        [beginRun, claimRun, failRun, transcribePreparedJob],
     );
 
     const startFromYouTube = useCallback(
         async (url: string) => {
+            const runId = claimRun();
             try {
                 const config = await beginRun();
                 const job = await api.createYouTubeJob({
@@ -670,14 +749,44 @@ export function useTranscriber(): Transcriber {
                     task: config.task,
                     language: config.language,
                 });
+                if (runIdRef.current !== runId) {
+                    return;
+                }
                 setJobId(job.id);
-                await transcribePreparedJob(job, config);
+                await transcribePreparedJob(job, config, runId);
             } catch (nextError) {
+                if (runIdRef.current !== runId) {
+                    return;
+                }
                 failRun(nextError, "YouTube preparation failed");
             }
         },
-        [beginRun, failRun, transcribePreparedJob],
+        [beginRun, claimRun, failRun, transcribePreparedJob],
     );
+
+    /**
+     * The escape hatch. Both entry points are gated on `isBusy` and the
+     * `Transcribe` button is hidden while busy, so a run that never terminates —
+     * a job stranded in `Extracting` with no event coming, say — used to leave
+     * quitting the app as the only way out. Now there is a way out.
+     *
+     * Tears down the wait, disowns the run (`claimRun` bumps the token, so any
+     * `create*Job` or worker result still in flight lands on a run that no longer
+     * owns the UI and is dropped), and returns the app to idle.
+     */
+    const cancel = useCallback(() => {
+        claimRun();
+        pendingWorkerRef.current = null;
+        setTranscript((previous) =>
+            previous ? { ...previous, isBusy: false } : previous,
+        );
+        setIsBusy(false);
+        setIsModelLoading(false);
+        setProgressItems([]);
+        setProgress(0);
+        setStatus("idle");
+        setError(null);
+    }, [claimRun]);
 
     const onInputChange = useCallback(() => {
         setTranscript(undefined);
@@ -703,6 +812,7 @@ export function useTranscriber(): Transcriber {
             progressItems,
             start: startFromFile,
             startFromYouTube,
+            cancel,
             output: transcript,
             jobId,
             error,
@@ -729,6 +839,7 @@ export function useTranscriber(): Transcriber {
         }),
         [
             browserCaps,
+            cancel,
             capabilityLabel,
             effectivePresetLabel,
             error,

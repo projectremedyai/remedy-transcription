@@ -501,23 +501,35 @@ async fn prepare_youtube_audio(
     url: String,
 ) {
     let state = app.state::<AppState>();
+
+    // Every exit from here on MUST resolve the job. Returning without publishing
+    // anything strands it in `Downloading`/`Extracting` with no event ever coming,
+    // and the frontend's 300 ms poll then spins on it forever while both entry
+    // points sit locked behind `isBusy` — a hang with no way out but quitting.
+    // Same rule as `prepare_file_audio`; these three returns were the twin that
+    // never got it.
     let _permit = match state.download_semaphore.clone().acquire_owned().await {
         Ok(p) => p,
-        Err(_) => return,
+        Err(e) => {
+            fail_job(&state, &job_id, format!("Could not queue download: {}", e));
+            return;
+        }
     };
 
     state.events.track_download_start();
 
     let audio_root = match audio_dir(&app) {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
+            fail_job(&state, &job_id, e);
             state.events.track_download_end();
             return;
         }
     };
     let downloads_root = match downloads_dir(&app) {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
+            fail_job(&state, &job_id, e);
             state.events.track_download_end();
             return;
         }

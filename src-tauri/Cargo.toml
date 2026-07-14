@@ -31,6 +31,10 @@ anyhow = "1"
 thiserror = "1"
 once_cell = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# Speaker diarization. Official k2-fsa crate (Apache-2.0). Default `static`
+# feature: the build script downloads a prebuilt sherpa-onnx + ONNX Runtime
+# static archive from the project's own GitHub releases and links it in.
+sherpa-onnx = "1.13"
 
 [profile.release]
 panic = "abort"

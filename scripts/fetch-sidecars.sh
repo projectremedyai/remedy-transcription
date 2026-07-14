@@ -1,18 +1,87 @@
 #!/usr/bin/env bash
 # Fetch yt-dlp / ffmpeg / ffprobe binaries into src-tauri/binaries/
-# with the Tauri target-triple naming convention.
+# with the Tauri target-triple naming convention, plus the speaker-diarization
+# ONNX models into models/diarization/.
 #
 # Usage:
 #   ./scripts/fetch-sidecars.sh                 # detects current host triple
 #   ./scripts/fetch-sidecars.sh aarch64-apple-darwin
 #   ./scripts/fetch-sidecars.sh x86_64-pc-windows-msvc
+#   ./scripts/fetch-sidecars.sh --models-only   # just the diarization models
+#   ./scripts/fetch-sidecars.sh --skip-models   # just the binaries
 
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-TRIPLE="${1:-$(rustc -vV | awk '/host:/ {print $2}')}"
+WANT_BINARIES=1
+WANT_MODELS=1
+TRIPLE=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --models-only) WANT_BINARIES=0 ;;
+        --skip-models) WANT_MODELS=0 ;;
+        -*) echo "Unknown option: $arg" >&2; exit 1 ;;
+        *) TRIPLE="$arg" ;;
+    esac
+done
+
+TRIPLE="${TRIPLE:-$(rustc -vV | awk '/host:/ {print $2}')}"
 DEST="src-tauri/binaries"
+MODELS="models/diarization"
+
+# ---------------------------------------------------------------------------
+# Speaker-diarization models.
+#
+# Two models, both mandatory: pyannote segmentation-3.0 finds the speech turns,
+# WeSpeaker CAM++ embeds them so they can be clustered into speakers.
+#
+# Both are redistributed from sherpa-onnx's OWN GitHub releases, so they are
+# ungated -- no Hugging Face token, no click-through licence. They are platform
+# independent (the same .onnx files serve macOS and Windows).
+#
+# NOTE: "speaker-recongition-models" is misspelled upstream. That typo is the
+# real tag; the correctly spelled URL 404s. Do not "fix" it.
+# ---------------------------------------------------------------------------
+SEG_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM%2B%2B.onnx"
+
+fetch_models() {
+    local tmp seg_model emb_model
+    seg_model="$MODELS/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
+    emb_model="$MODELS/wespeaker_en_voxceleb_CAM++.onnx"
+
+    mkdir -p "$MODELS"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+
+    if [[ -f "$seg_model" ]]; then
+        echo "Segmentation model already present -> $seg_model"
+    else
+        echo "Fetching pyannote segmentation-3.0 (~7 MB) -> $seg_model"
+        curl -fL --progress-bar -o "$tmp/seg.tar.bz2" "$SEG_URL"
+        tar -xjf "$tmp/seg.tar.bz2" -C "$MODELS"
+        [[ -f "$seg_model" ]] || { echo "Expected $seg_model after extraction" >&2; exit 1; }
+    fi
+
+    if [[ -f "$emb_model" ]]; then
+        echo "Embedding model already present -> $emb_model"
+    else
+        echo "Fetching WeSpeaker CAM++ embeddings (~28 MB) -> $emb_model"
+        curl -fL --progress-bar -o "$emb_model" "$EMB_URL"
+    fi
+
+    echo
+    echo "Diarization models in place:"
+    ls -la "$MODELS" "$MODELS/sherpa-onnx-pyannote-segmentation-3-0"
+}
+
+if [[ "$WANT_BINARIES" -eq 0 ]]; then
+    fetch_models
+    exit 0
+fi
+
 mkdir -p "$DEST"
 
 ext=""
@@ -80,6 +149,11 @@ fi
 echo
 echo "Sidecars in place:"
 ls -la "$DEST"
+
+if [[ "$WANT_MODELS" -eq 1 ]]; then
+    echo
+    fetch_models
+fi
 
 if [[ "$TRIPLE" == *-pc-windows-* ]]; then
     cat <<'NOTE'

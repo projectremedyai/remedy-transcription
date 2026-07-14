@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::Manager;
 
 mod commands;
+pub mod diarize;
 mod events;
 mod paths;
 mod sidecar;

@@ -527,9 +527,23 @@ export function useTranscriber(): Transcriber {
      * a failure if swallowed, so it is folded into `"degraded"` for display: the
      * user does not care whether the sidecar crashed or the request that reached
      * it never had a chance to, only that speaker labels did not happen and why.
+     *
+     * `runId` is the caller's token, threaded through the exact same way
+     * `persistWorkerTranscript` gets one — every caller here already has it in
+     * scope. `api.diarizeJob` is an async round-trip, so the run that kicked it
+     * off can be superseded (cancel, or a second file) before it answers. The
+     * KICKOFF may happen for a run that is still current at the time it is
+     * called — that part needs no guard. The `setDiarizationOutcome` WRITE, at
+     * the moment the promise resolves, is the one that must be dropped if the
+     * token has moved on since: `persistWorkerTranscript` guards its own state
+     * write on `runIdRef.current === runId` right where its diarization promise
+     * resolves, and this mirrors that, not a new mechanism.
      */
     const diarizeAudio = useCallback(
-        async (targetJobId: string): Promise<SpeakerTurn[] | undefined> => {
+        async (
+            targetJobId: string,
+            runId: number,
+        ): Promise<SpeakerTurn[] | undefined> => {
             if (!diarizeEnabled) {
                 return undefined;
             }
@@ -538,18 +552,22 @@ export function useTranscriber(): Transcriber {
                     targetJobId,
                     numSpeakersHint,
                 );
-                setDiarizationOutcome(outcome);
+                if (runIdRef.current === runId) {
+                    setDiarizationOutcome(outcome);
+                }
                 return outcome.status === "succeeded"
                     ? outcome.turns
                     : undefined;
             } catch (diarizeError) {
-                setDiarizationOutcome({
-                    status: "degraded",
-                    reason:
-                        diarizeError instanceof Error
-                            ? diarizeError.message
-                            : "Speaker detection could not run",
-                });
+                if (runIdRef.current === runId) {
+                    setDiarizationOutcome({
+                        status: "degraded",
+                        reason:
+                            diarizeError instanceof Error
+                                ? diarizeError.message
+                                : "Speaker detection could not run",
+                    });
+                }
                 return undefined;
             }
         },
@@ -1044,7 +1062,7 @@ export function useTranscriber(): Transcriber {
                 // already-persisted job's rows, so a cache hit's labels are
                 // shown for this session only, from `job.segments` as they
                 // already are. See the report for this task.
-                const turns = await diarizeAudio(initialJob.id);
+                const turns = await diarizeAudio(initialJob.id, runId);
                 if (runIdRef.current !== runId) {
                     return;
                 }
@@ -1068,7 +1086,7 @@ export function useTranscriber(): Transcriber {
             if (readyJob.status === "completed") {
                 // Same cache-hit case as above, reached via the polling path
                 // instead of the immediate one.
-                const turns = await diarizeAudio(readyJob.id);
+                const turns = await diarizeAudio(readyJob.id, runId);
                 if (runIdRef.current !== runId) {
                     return;
                 }
@@ -1084,7 +1102,7 @@ export function useTranscriber(): Transcriber {
             // and sherpa-onnx (Rust sidecar) share no runtime, so there is
             // nothing to gain from serializing them: diarizing a multi-minute
             // file can take longer than transcribing it.
-            const diarizationPromise = diarizeAudio(readyJob.id);
+            const diarizationPromise = diarizeAudio(readyJob.id, runId);
 
             const audioUrl = await api.getAudioUrl(readyJob.id);
             const audioResponse = await fetch(audioUrl);

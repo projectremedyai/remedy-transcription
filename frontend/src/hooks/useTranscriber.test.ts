@@ -12,7 +12,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { MODEL_PRESETS } from "../config/transcription";
-import type { Job } from "../services/api";
+import type { DiarizationOutcome, Job } from "../services/api";
 
 const mocks = vi.hoisted(() => ({
     postMessage: vi.fn(),
@@ -109,6 +109,15 @@ async function tick(ms: number) {
         await vi.advanceTimersByTimeAsync(ms);
     });
     await settle();
+}
+
+/** A promise this test controls the settlement of, from the outside. */
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((res) => {
+        resolve = res;
+    });
+    return { promise, resolve };
 }
 
 async function renderTranscriber() {
@@ -1289,6 +1298,162 @@ describe("useTranscriber's diarization wiring", () => {
         expect(
             result.current.output?.chunks.some(
                 (chunk) => chunk.speaker === "SPEAKER_00",
+            ),
+        ).toBe(true);
+    });
+
+    /**
+     * THE CROSS-RUN LEAK (Task 12).
+     *
+     * `diarizeAudio` is the one resumption point in this hook that used to
+     * write state from an async continuation with no `runIdRef.current ===
+     * runId` check -- every other one (`persistWorkerTranscript`'s
+     * `setTranscript`, the various `applyCompletedJob` call sites) guards the
+     * moment its promise resolves, not just the moment it is kicked off.
+     *
+     * Here run 1's `diarizeJob` is still in flight when run 2 supersedes it.
+     * Run 2 gets its own (different) outcome. Run 1's stale promise then
+     * resolves. Unguarded, that write clobbers run 2's `diarizationOutcome`
+     * with run 1's answer -- a stale "N speakers identified" banner on a
+     * screen that has moved on to a different file.
+     */
+    it("does not let a superseded run's stale diarizeJob outcome overwrite the run that replaced it", async () => {
+        readyFile("job-1");
+        const staleOutcome = deferred<DiarizationOutcome>();
+        mocks.diarizeJob.mockImplementation(async (jobId: string) => {
+            if (jobId === "job-1") {
+                return staleOutcome.promise;
+            }
+            return {
+                status: "succeeded",
+                turns: [{ start: 0, end: 3, speaker: 0 }],
+                speaker_count: 1,
+            };
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+        // Run 1's diarizeJob has not answered yet -- nothing to show.
+        expect(result.current.diarizationOutcome).toBeNull();
+
+        // Run 2 supersedes run 1 before the stale diarizeJob answers.
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-2", status: "ready", progress: 1 }),
+        );
+        await act(async () => {
+            result.current.start("/tmp/other.mp3");
+        });
+        await settle();
+        await settle();
+
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-2", undefined);
+        expect(result.current.jobId).toBe("job-2");
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "succeeded",
+            turns: [{ start: 0, end: 3, speaker: 0 }],
+            speaker_count: 1,
+        });
+
+        // Run 1's diarizeJob finally answers -- stale, and must be dropped.
+        staleOutcome.resolve({
+            status: "succeeded",
+            turns: [{ start: 10, end: 20, speaker: 1 }],
+            speaker_count: 1,
+        });
+        await settle();
+        await settle();
+
+        // Run 2's own legitimate outcome is still what is showing.
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "succeeded",
+            turns: [{ start: 0, end: 3, speaker: 0 }],
+            speaker_count: 1,
+        });
+    });
+
+    /**
+     * The worst case from the task-12 report: run 2 has the toggle OFF, so it
+     * never calls `diarizeJob` at all and starts (correctly) from a `null`
+     * `diarizationOutcome`. Run 1's stale outcome resolving afterward must
+     * not plant a speaker banner over a run whose transcript carries no
+     * speaker labels -- that would violate the "byte-unchanged when the
+     * toggle is off" guarantee on top of the cross-run leak itself.
+     */
+    it("does not let a stale diarizeJob outcome leak onto a superseding run with the toggle off", async () => {
+        readyFile("job-1");
+        const staleOutcome = deferred<DiarizationOutcome>();
+        mocks.diarizeJob.mockImplementation(async (jobId: string) => {
+            if (jobId === "job-1") {
+                return staleOutcome.promise;
+            }
+            throw new Error("run 2 must never call diarizeJob");
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+        expect(result.current.diarizationOutcome).toBeNull();
+
+        // Run 2 supersedes run 1 with the toggle OFF.
+        act(() => {
+            result.current.setDiarizeEnabled(false);
+        });
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-2", status: "ready", progress: 1 }),
+        );
+        await act(async () => {
+            result.current.start("/tmp/other.mp3");
+        });
+        await settle();
+        await settle();
+
+        expect(result.current.jobId).toBe("job-2");
+        expect(mocks.diarizeJob).toHaveBeenCalledTimes(1);
+        expect(result.current.diarizationOutcome).toBeNull();
+
+        // Run 2 completes its (undiarized) transcription -- the byte-unchanged
+        // path: no speaker labels, because the toggle was off.
+        await emitFromWorker(workerComplete(postedRunId(1), "hello there"));
+        await settle();
+
+        expect(result.current.status).toBe("completed");
+        expect(
+            result.current.output?.chunks.every(
+                (chunk) => chunk.speaker === undefined,
+            ),
+        ).toBe(true);
+
+        // Run 1's diarizeJob finally answers -- stale, and must be dropped.
+        staleOutcome.resolve({
+            status: "succeeded",
+            turns: [{ start: 10, end: 20, speaker: 1 }],
+            speaker_count: 1,
+        });
+        await settle();
+        await settle();
+
+        expect(mocks.diarizeJob).toHaveBeenCalledTimes(1);
+        expect(result.current.diarizationOutcome).toBeNull();
+        expect(
+            result.current.output?.chunks.every(
+                (chunk) => chunk.speaker === undefined,
             ),
         ).toBe(true);
     });

@@ -1619,7 +1619,26 @@ pub async fn persist_transcript(
 // clearing is the reason a name can never silently move onto the wrong voice.
 // ---------------------------------------------------------------------------
 
-/// A name, trimmed, or a REFUSAL.
+/// A display name is a LABEL, not a document. SRT and VTT are positional,
+/// blank-line-delimited formats -- an embedded newline in a name lets it
+/// forge `\n\n<fake index>\n<fake timestamp> --> ...\n<fake text>` and inject
+/// an entirely fabricated cue block into an exported file. Strip out embedded
+/// newlines and every other C0/DEL control character so that junk can never
+/// reach the database in the first place. (`srtGenerator.ts` strips/escapes
+/// again at the export boundary -- defense in depth, because a serializer
+/// must be safe on any input regardless of what validation ran upstream, and
+/// because this store also predates this check for any row written before
+/// it shipped.)
+fn strip_control_chars(input: &str) -> String {
+    input.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// A label is short. 100 characters is generous for a person's name (or a
+/// short role like "Interviewer") while still ruling out someone pasting a
+/// paragraph into the rename box.
+const MAX_SPEAKER_NAME_LEN: usize = 100;
+
+/// A name, trimmed and sanitized, or a REFUSAL.
 ///
 /// A blank name is rejected rather than stored because it would render as an
 /// EMPTY speaker label -- `": Hello there."` in an SRT, a `<v >` in a WebVTT --
@@ -1631,18 +1650,30 @@ pub async fn persist_transcript(
 /// Trimming, and not merely checking: a name of `"  "` is blank, and a name of
 /// `" Alice "` is Alice. Split out from the command so it can be tested without a
 /// Tauri `State`, which a unit test cannot construct.
+///
+/// Embedded newlines and other control characters are stripped (not merely
+/// rejected) -- see `strip_control_chars` -- and the result is re-trimmed and
+/// re-checked for blankness, since a name of nothing but control characters
+/// (e.g. `"\t\n"`) strips down to empty. A name longer than
+/// `MAX_SPEAKER_NAME_LEN` characters (after stripping) is refused outright.
 fn validated_speaker_name<'a>(
     speaker_key: &'a str,
     display_name: &'a str,
-) -> Result<(&'a str, &'a str), String> {
+) -> Result<(&'a str, String), String> {
     let speaker_key = speaker_key.trim();
-    let display_name = display_name.trim();
+    let display_name = strip_control_chars(display_name.trim());
+    let display_name = display_name.trim().to_string();
 
     if speaker_key.is_empty() {
         return Err("A speaker key is required".to_string());
     }
     if display_name.is_empty() {
         return Err("A speaker name cannot be blank".to_string());
+    }
+    if display_name.chars().count() > MAX_SPEAKER_NAME_LEN {
+        return Err(format!(
+            "A speaker name cannot be longer than {MAX_SPEAKER_NAME_LEN} characters"
+        ));
     }
     Ok((speaker_key, display_name))
 }
@@ -1668,7 +1699,7 @@ pub async fn set_speaker_name(
 
     state
         .store
-        .set_speaker_name(source_id, speaker_key, display_name)
+        .set_speaker_name(source_id, speaker_key, &display_name)
         .map_err(|e| e.to_string())
 }
 
@@ -2596,7 +2627,43 @@ mod tests {
     fn a_speaker_name_is_trimmed() {
         assert_eq!(
             validated_speaker_name("  SPEAKER_00 ", "  Alice B.  "),
-            Ok(("SPEAKER_00", "Alice B."))
+            Ok(("SPEAKER_00", "Alice B.".to_string()))
         );
+    }
+
+    /// A name with an embedded newline (or other control character) is
+    /// stripped, not stored verbatim. Left in, SRT/VTT are positional,
+    /// blank-line-delimited formats -- a name of
+    /// `"Alice\n\n999\n00:00:00,000 --> 00:00:01,000\nInjected"` would let a
+    /// rename FABRICATE an entire extra cue block in every export made after
+    /// it. Stripping (not merely rejecting) means an ordinary paste with a
+    /// trailing newline from a form field still works instead of bouncing.
+    #[test]
+    fn a_speaker_name_strips_embedded_newlines_and_control_characters() {
+        assert_eq!(
+            validated_speaker_name(
+                "SPEAKER_00",
+                "Alice\n\n999\n00:00:00,000 --> 00:00:01,000\nInjected",
+            ),
+            Ok((
+                "SPEAKER_00",
+                "Alice99900:00:00,000 --> 00:00:01,000Injected".to_string()
+            ))
+        );
+
+        // A name that is NOTHING BUT control characters strips down to blank
+        // and is refused, same as any other blank name.
+        assert!(validated_speaker_name("SPEAKER_00", "\n\n\t").is_err());
+    }
+
+    /// A label is not a document: a name longer than 100 characters is
+    /// refused outright rather than silently truncated.
+    #[test]
+    fn a_speaker_name_over_the_length_cap_is_rejected() {
+        let ok_name = "A".repeat(100);
+        assert!(validated_speaker_name("SPEAKER_00", &ok_name).is_ok());
+
+        let too_long = "A".repeat(101);
+        assert!(validated_speaker_name("SPEAKER_00", &too_long).is_err());
     }
 }

@@ -376,4 +376,90 @@ describe("speaker labels in exports", () => {
             );
         });
     });
+
+    /**
+     * Display names are user-controlled and only minimally validated (trimmed,
+     * non-blank) on the Rust side. These generators are the LAST line before an
+     * exported file, so they must be safe on ANY input regardless of what
+     * validation ran upstream.
+     *
+     * Two distinct hazards:
+     *   - VTT `<v NAME>`: an unescaped `>` in NAME closes the opening tag early,
+     *     leaking the caption text and `</v>` as literal cue content. `&` and
+     *     `<` must also be escaped as WebVTT character references.
+     *   - SRT/VTT are POSITIONAL, blank-line-delimited formats. A name
+     *     containing embedded newlines can forge `\n\n<fake index>\n<fake
+     *     timestamp> --> ...\n<fake text>` — an entirely fabricated cue block
+     *     injected into the exported file. This is a structural integrity
+     *     defect, not merely cosmetic garbling.
+     */
+    describe("display names are sanitized/escaped at the serializer boundary", () => {
+        it("VTT escapes &, <, > in the voice-span annotation so the opening tag cannot be broken out of", () => {
+            const hostile = "Weird & <Name>";
+            const vtt = generateVtt(DIARIZED, { SPEAKER_00: hostile });
+
+            expect(vtt).toContain(
+                "<v Weird &amp; &lt;Name&gt;>Hello there.</v>",
+            );
+            // The caption text and closing tag must not have leaked out as
+            // literal cue content because of an unescaped `>`.
+            expect(cueTextsFrom(vtt, true)[0]).toBe(
+                "<v Weird &amp; &lt;Name&gt;>Hello there.</v>",
+            );
+        });
+
+        it("an embedded newline in a display name cannot fabricate an SRT cue block", () => {
+            const injection =
+                "Alice\n\n999\n00:00:00,000 --> 00:00:01,000\nInjected speaker text";
+            const srt = generateSrt(DIARIZED, { SPEAKER_00: injection });
+
+            // Still exactly the two real cues — no extra blank-line-delimited
+            // block was fabricated out of the name.
+            const blocks = srt.split("\n\n").filter((b) => b.trim().length > 0);
+            expect(blocks).toHaveLength(2);
+
+            // The injected timestamp line never appears as its own line, i.e.
+            // it never parses as a cue's timing line.
+            expect(srt).not.toMatch(/^00:00:00,000 --> 00:00:01,000$/m);
+            expect(srt).not.toMatch(/^999$/m);
+        });
+
+        it("an embedded newline in a display name cannot fabricate a VTT cue block", () => {
+            const injection =
+                "Alice\n\n999\n00:00:01.000 --> 00:00:02.000\nInjected speaker text";
+            const vtt = generateVtt(DIARIZED, { SPEAKER_00: injection });
+
+            const blocks = vtt
+                .replace(/^WEBVTT\n\n/, "")
+                .split("\n\n")
+                .filter((b) => b.trim().length > 0);
+            expect(blocks).toHaveLength(2);
+
+            expect(vtt).not.toMatch(/^00:00:01\.000 --> 00:00:02\.000$/m);
+            expect(vtt).not.toMatch(/^999$/m);
+        });
+
+        it("an embedded newline in a display name does not fabricate a TXT paragraph break", () => {
+            const injection = "Alice\n\nFake paragraph";
+            const txt = generateTxt(DIARIZED, { SPEAKER_00: injection });
+
+            // Exactly two turns (one per speaker) — no extra blank-line
+            // paragraph was created out of the name.
+            expect(txt.split("\n\n")).toHaveLength(2);
+        });
+
+        it("a `]` in a display name only breaks visual bracket pairing in SRT (cosmetic; current behavior pinned)", () => {
+            const srt = generateSrt(DIARIZED, { SPEAKER_00: "Ali]ce" });
+            expect(cueTextsFrom(srt, false)[0]).toBe("[Ali]ce]: Hello there.");
+        });
+
+        it("ordinary names (e.g. Alice) are completely unaffected", () => {
+            expect(generateSrt(DIARIZED, { SPEAKER_00: "Alice" })).toContain(
+                "[Alice]: Hello there.",
+            );
+            expect(generateVtt(DIARIZED, { SPEAKER_00: "Alice" })).toContain(
+                "<v Alice>Hello there.</v>",
+            );
+        });
+    });
 });

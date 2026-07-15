@@ -40,6 +40,37 @@ function speakerDisplay(speaker: string, names?: SpeakerNames): string {
 }
 
 /**
+ * Strip embedded newlines and other control characters out of a display name
+ * before it is interpolated into SRT/VTT — formats that are POSITIONAL and
+ * blank-line-delimited. A display name is minimally validated upstream (see
+ * `validated_speaker_name` in `src-tauri/src/commands.rs`: trimmed and
+ * non-blank, nothing more) and is reachable end-to-end from the rename UI, so
+ * this is the LAST line before the exported file and must be safe on ANY
+ * input regardless of what validation ran upstream. Without this, a name
+ * containing `\n\n<fake index>\n<fake timestamp> --> ...\n<fake text>` would
+ * inject a fabricated cue block into the exported file — a structural
+ * integrity defect, not merely cosmetic garbling.
+ */
+function sanitizeDisplayName(name: string): string {
+    // eslint-disable-next-line no-control-regex -- deliberately matching C0/DEL control chars, incl. \n and \r
+    return name.replace(/[\x00-\x1f\x7f]/g, "");
+}
+
+/**
+ * Escape the three WebVTT-significant characters as character references,
+ * per https://www.w3.org/TR/webvtt1/#webvtt-cue-voice-span. The name is
+ * interpolated directly inside the voice span's opening tag (`<v NAME>`), so
+ * an unescaped `>` would close that tag early and leak the caption text plus
+ * `</v>` out as literal, garbled cue content.
+ */
+function escapeVttAnnotation(name: string): string {
+    return name
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+}
+
+/**
  * The speaker prefix used by SRT and TXT, e.g. "[Alice]: " or "[SPEAKER_00]: "
  * when nobody has renamed that speaker yet. "" — no markup at all — when the
  * cue carries no speaker, which is what keeps an undiarized export identical to
@@ -57,7 +88,9 @@ function speakerPrefix(
     speaker: string | undefined,
     names?: SpeakerNames,
 ): string {
-    return speaker === undefined ? "" : `[${speakerDisplay(speaker, names)}]: `;
+    return speaker === undefined
+        ? ""
+        : `[${sanitizeDisplayName(speakerDisplay(speaker, names))}]: `;
 }
 
 /**
@@ -74,9 +107,13 @@ function speakerPrefix(
  * unambiguous, self-closing cue.
  */
 function voiceSpan(caption: ConsolidatedSegment, names?: SpeakerNames): string {
-    return caption.speaker === undefined
-        ? caption.text
-        : `<v ${speakerDisplay(caption.speaker, names)}>${caption.text}</v>`;
+    if (caption.speaker === undefined) {
+        return caption.text;
+    }
+    const annotation = escapeVttAnnotation(
+        sanitizeDisplayName(speakerDisplay(caption.speaker, names)),
+    );
+    return `<v ${annotation}>${caption.text}</v>`;
 }
 
 function formatTimestamp(seconds: number, separator: "," | "." = ","): string {

@@ -1,0 +1,23 @@
+[package]
+name = "diarize-sidecar"
+version = "1.0.0"
+description = "Speaker diarization as a crash-isolated child process"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+publish = false
+
+# One binary, no library. The app must never be able to `use` this crate --
+# doing so would drag ONNX Runtime back into the app's link graph, which is the
+# exact thing this crate exists to prevent.
+[[bin]]
+name = "diarize-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# Official k2-fsa crate (Apache-2.0). The default `static` feature makes its
+# build script download a prebuilt sherpa-onnx + ONNX Runtime static archive
+# from the project's own GitHub releases and link it in. ~16 MB of the binary.
+sherpa-onnx = "1.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

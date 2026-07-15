@@ -40,11 +40,128 @@ jobs:
       - name: Lint frontend
         run: npm --prefix frontend run lint
 
+      - name: Frontend tests
+        run: npm --prefix frontend test
+
+      # --skip-models: the 34 MB of diarization models are only touched by the
+      # #[ignore]d real-model tests, and CI does not pass --ignored. Downloading
+      # them here would be 34 MB per run for nothing.
+      #
+      # This is only safe because src-tauri/build.rs makes a missing models/
+      # directory a cargo:warning rather than a build failure. tauri-build
+      # validates bundle.resources during `cargo check` exactly as it validates
+      # externalBin, so a per-file resource map here would fail EVERY job below
+      # on a fresh clone, with an opaque `resource path ... doesn't exist`.
       - name: Fetch Tauri sidecars
-        run: ./scripts/fetch-sidecars.sh
+        run: ./scripts/fetch-sidecars.sh --skip-models
+
+      # Must precede every cargo command below: tauri-build's build script checks
+      # that each `externalBin` exists, so a missing diarize-sidecar-<triple>
+      # fails even a bare `cargo check`. --debug because CI never bundles; it
+      # only needs the file to exist and the crash-isolation tests to have
+      # something to spawn.
+      - name: Build the diarization sidecar
+        run: ./scripts/build-diarize-sidecar.sh --debug
 
       - name: Check Rust
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+        run: cargo check --workspace --manifest-path src-tauri/Cargo.toml
+
+      # --workspace, not just the app: it builds `diarize-sidecar`, which the
+      # app's crash-isolation tests spawn. Without it those tests have no
+      # binary to point at and fail.
+      - name: Test Rust
+        run: cargo test --workspace --manifest-path src-tauri/Cargo.toml
+
+  # The README has always claimed "Windows 10+". Until this job existed, that
+  # claim was never checked by CI or run on a real Windows machine -- adding a
+  # native ONNX Runtime dependency (Task 7-8) without a Windows runner would
+  # have made the claim actively unverifiable rather than merely unverified.
+  #
+  # STATUS AS OF THIS COMMIT: written and believed correct, NOT proven. It has
+  # not yet completed a run on a real Windows runner (no Windows machine was
+  # available to the author). `continue-on-error: true` keeps a first red run
+  # from blocking the pipeline while that is still true, but the job stays
+  # VISIBLE in the Actions tab either way -- remove continue-on-error once it
+  # has gone green at least once, so a later regression is not silently masked.
+  windows-build-checks:
+    name: Build checks (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+        shell: bash
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Build frontend
+        run: npm run frontend:build
+
+      - name: Lint frontend
+        run: npm --prefix frontend run lint
+
+      - name: Frontend tests
+        run: npm --prefix frontend test
+
+      # --skip-models: same reasoning as the macOS job above. This step does
+      # fetch yt-dlp for windows-x86_64-pc-windows-msvc; it deliberately does
+      # NOT fetch ffmpeg/ffprobe for Windows (see the script's own note) --
+      # those are fetched separately below.
+      - name: Fetch Tauri sidecars (yt-dlp; models skipped)
+        run: ./scripts/fetch-sidecars.sh --skip-models
+        shell: bash
+
+      # fetch-sidecars.sh does not auto-fetch ffmpeg/ffprobe for Windows -- the
+      # README has always documented that as a manual step. CI cannot do a
+      # manual step, and it is not optional here: tauri-build's build script
+      # checks that EVERY declared `externalBin` exists for the target triple,
+      # so a missing ffmpeg-x86_64-pc-windows-msvc.exe fails `cargo check`
+      # itself, before a single test runs -- the exact footgun the diarize
+      # sidecar hit on macOS in Task 8, now on the other two sidecars too.
+      - name: Fetch ffmpeg/ffprobe for Windows
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extracted
+          $ffmpegExe = Get-ChildItem -Path ffmpeg-extracted -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          $binDir = Split-Path $ffmpegExe.FullName
+          Copy-Item "$binDir\ffmpeg.exe" "src-tauri\binaries\ffmpeg-x86_64-pc-windows-msvc.exe"
+          Copy-Item "$binDir\ffprobe.exe" "src-tauri\binaries\ffprobe-x86_64-pc-windows-msvc.exe"
+
+      # Must precede every cargo command below, same reason as macOS: a
+      # missing diarize-sidecar-x86_64-pc-windows-msvc.exe fails even a bare
+      # `cargo check`. This is also the step that actually answers the open
+      # question: sherpa-onnx-sys's build script fetches a prebuilt static
+      # ONNX Runtime archive for win-x64 from sherpa-onnx's own GitHub
+      # releases (confirmed to exist -- see Task 13's report) and links it;
+      # whether that fetch-and-link succeeds on a real Windows runner is
+      # exactly what this step (and this job) exists to prove.
+      - name: Build the diarization sidecar
+        run: ./scripts/build-diarize-sidecar.sh --debug
+        shell: bash
+
+      - name: Check Rust
+        run: cargo check --workspace --manifest-path src-tauri/Cargo.toml
 
       - name: Test Rust
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --workspace --manifest-path src-tauri/Cargo.toml

@@ -34,6 +34,10 @@ if [[ ! -f src-tauri/binaries/yt-dlp-aarch64-apple-darwin ]]; then
     ./scripts/fetch-sidecars.sh aarch64-apple-darwin
 fi
 
+# Ours, so it is compiled rather than downloaded. Always rebuilt: a stale sidecar
+# silently shipping against new app code is not worth the seconds saved.
+./scripts/build-diarize-sidecar.sh aarch64-apple-darwin
+
 echo "Building signed + notarized .dmg for aarch64-apple-darwin..."
 npm run tauri -- build --target aarch64-apple-darwin
 

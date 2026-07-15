@@ -1,28 +1,187 @@
-import React, { useMemo, useState } from "react";
+import React, {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
 
 import Modal from "./modal/Modal";
 import { UrlInput } from "./modal/UrlInput";
 import { Transcriber } from "../hooks/useTranscriber";
 import Progress from "./Progress";
 
-export function AudioManager(props: { transcriber: Transcriber }) {
-    const [selectedFile, setSelectedFile] = useState<File | null>(null);
+/**
+ * What ffmpeg is willing to be pointed at. Used for BOTH the file picker's filter
+ * and the drop target's check, so the two entry points cannot disagree about what
+ * counts as media.
+ */
+const MEDIA_EXTENSIONS = [
+    "mp3",
+    "wav",
+    "m4a",
+    "aac",
+    "ogg",
+    "opus",
+    "flac",
+    "wma",
+    "mp4",
+    "mkv",
+    "avi",
+    "mov",
+    "webm",
+    "m4v",
+    "mpeg",
+    "mpg",
+];
 
-    const handleFileSelect = (file: File) => {
-        props.transcriber.onInputChange();
-        setSelectedFile(file);
-    };
+function basename(path: string): string {
+    const parts = path.split(/[\\/]/);
+    return parts[parts.length - 1] || path;
+}
+
+function hasMediaExtension(path: string): boolean {
+    const extension = basename(path).split(".").pop()?.toLowerCase() ?? "";
+    return MEDIA_EXTENSIONS.includes(extension);
+}
+
+export function AudioManager(props: { transcriber: Transcriber }) {
+    // A PATH, not a browser `File`. A `File` has no path, so Rust could never
+    // run ffmpeg over it — which is why local files now arrive from the Tauri
+    // dialog or a file drop.
+    const [selectedPath, setSelectedPath] = useState<string | null>(null);
+    const [isDragging, setIsDragging] = useState(false);
+    const [dropError, setDropError] = useState<string | null>(null);
+    const [dropNotice, setDropNotice] = useState<string | null>(null);
+
+    const { transcriber } = props;
+    const { onInputChange } = transcriber;
+    const isBusy = transcriber.isBusy;
+
+    // The drop listener reads `isBusy`, but it must not DEPEND on it: Tauri's
+    // `onDragDropEvent()` resolves asynchronously, so re-running the effect on
+    // every busy flip unlistens immediately and re-listens a tick later, leaving
+    // a window in which a drop lands on no listener at all. A ref gives the
+    // listener the current value without re-registering it.
+    const isBusyRef = useRef(isBusy);
+    useEffect(() => {
+        isBusyRef.current = isBusy;
+    }, [isBusy]);
+
+    const handleFileSelect = useCallback(
+        (path: string) => {
+            onInputChange();
+            setDropError(null);
+            setDropNotice(null);
+            setSelectedPath(path);
+        },
+        [onInputChange],
+    );
+
+    // Dropping a file onto the window. Tauri intercepts the webview's native
+    // drag-and-drop and re-emits it here WITH the real filesystem paths, which is
+    // exactly the currency this app now runs on.
+    useEffect(() => {
+        let unlisten: (() => void) | undefined;
+        let cancelled = false;
+
+        getCurrentWebview()
+            .onDragDropEvent((event) => {
+                // The union is `enter | over | drop | leave`. Only `over` was
+                // handled, so the drop zone stayed un-highlighted until the
+                // pointer MOVED inside the window — a file dragged in and released
+                // without moving showed no affordance at all.
+                if (
+                    event.payload.type === "enter" ||
+                    event.payload.type === "over"
+                ) {
+                    setIsDragging(true);
+                    return;
+                }
+                if (event.payload.type === "leave") {
+                    setIsDragging(false);
+                    return;
+                }
+                if (event.payload.type === "drop") {
+                    setIsDragging(false);
+
+                    // A run is already in flight and there is no queue, so taking
+                    // the drop would silently supersede it.
+                    if (isBusyRef.current) {
+                        setDropNotice(null);
+                        setDropError(
+                            "A transcription is already running. Wait for it to finish, then drop the file again.",
+                        );
+                        return;
+                    }
+
+                    const dropped = event.payload.paths;
+                    const media = dropped.filter(hasMediaExtension);
+                    if (media.length === 0) {
+                        setDropNotice(null);
+                        setDropError(
+                            "That is not an audio or video file we can read.",
+                        );
+                        return;
+                    }
+
+                    // One transcript at a time is all this app models, so a
+                    // multi-file drop can only take the first — but it must SAY so
+                    // rather than quietly discard the rest.
+                    handleFileSelect(media[0]);
+                    if (dropped.length > 1) {
+                        setDropNotice(
+                            `Only one file at a time — using ${basename(
+                                media[0],
+                            )} and ignoring the other ${dropped.length - 1}.`,
+                        );
+                    }
+                }
+            })
+            .then((fn) => {
+                if (cancelled) {
+                    fn();
+                } else {
+                    unlisten = fn;
+                }
+            })
+            .catch(() => {
+                // Drag-and-drop is a convenience; the picker still works without it.
+            });
+
+        return () => {
+            cancelled = true;
+            unlisten?.();
+        };
+    }, [handleFileSelect]);
 
     const handleYouTubeSubmit = (url: string) => {
-        props.transcriber.onInputChange();
-        setSelectedFile(null);
-        props.transcriber.startFromYouTube(url);
+        transcriber.onInputChange();
+        setSelectedPath(null);
+        setDropError(null);
+        setDropNotice(null);
+        transcriber.startFromYouTube(url);
     };
 
     const handleTranscribe = () => {
-        if (selectedFile) {
-            props.transcriber.start(selectedFile);
+        if (selectedPath) {
+            // Clear the drop messages FIRST. `dropError` outranks
+            // `transcriber.error` (it is normally the newer of the two), and it is
+            // set by things the hook never hears about — a rejected `.txt` drop,
+            // say. Left standing, it would sit on top of this run's real failure,
+            // or under its transcript, indefinitely.
+            setDropError(null);
+            setDropNotice(null);
+            transcriber.start(selectedPath);
         }
+    };
+
+    const handleCancel = () => {
+        setDropError(null);
+        setDropNotice(null);
+        transcriber.cancel();
     };
 
     const getStatusMessage = () => {
@@ -75,21 +234,81 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
     return (
         <div className='w-full'>
-            <div className='flex flex-col justify-center items-center rounded-lg bg-white shadow-xl shadow-black/5 ring-1 ring-slate-700/10'>
+            <div
+                className={`flex flex-col justify-center items-center rounded-lg bg-white shadow-xl shadow-black/5 ring-1 transition-all duration-150 ${
+                    isDragging
+                        ? "ring-2 ring-indigo-500 bg-indigo-50"
+                        : "ring-slate-700/10"
+                }`}
+            >
+                {/*
+                 * Both entry points are gated on `isBusy`.
+                 *
+                 * WHAT THE GATE IS NOT: it is no longer the thing that keeps an
+                 * overlap safe. It used to be — remove it before the current fix
+                 * and a second run could be started over a live one, whose worker
+                 * kept running, whose `complete` then resolved the NEW run's
+                 * promise with the OLD run's transcript, which was persisted under
+                 * the new run's job and content-cached forever. That is now closed
+                 * in the hook and pinned by tests that drive the overlap directly,
+                 * with this gate out of the picture (`useTranscriber.test.ts`,
+                 * "under an overlap the worker cannot stop" — all three fail against
+                 * the pre-fix hook): a new run terminates the previous worker, and
+                 * every worker message carries the id of the run that asked for it,
+                 * so a message that outlives its run is dropped rather than
+                 * misattributed.
+                 *
+                 * WHAT STILL DEPENDS ON IT, and would need answering before this
+                 * gate comes off for a queue or a second panel:
+                 *   - The app models exactly ONE transcript — one `jobId`, one
+                 *     `output`, one `status`. A second run cannot be SHOWN, only
+                 *     substituted, so without the gate a user can silently lose the
+                 *     run they were watching. This is the UX reason it exists.
+                 *   - `cancel()` / supersede do NOT stop the backend's ffmpeg or
+                 *     yt-dlp (there is no `cancel_job` command). The abandoned job's
+                 *     child runs to completion holding a `download_semaphore` permit
+                 *     and an active-download count, so without the gate a user can
+                 *     stack up abandoned backend work that later runs queue behind.
+                 *     (`cancel()` DOES kill the diarization sidecar — see
+                 *     `cancel_diarization`. It is the one child that would otherwise
+                 *     burn a core for half an hour rather than finish on its own.)
+                 *   - A finished run sits in `persisting` while `persistTranscript`
+                 *     writes one row per segment over IPC — thousands of them for a
+                 *     lecture, and slow. With the gate ON, only Cancel can start a
+                 *     second run inside that window; with it OFF, a plain supersede
+                 *     does, with no Cancel needed. The UI half of that race is
+                 *     closed in the hook — the persist re-checks the run token
+                 *     after its own await and will not repaint a UI it no longer
+                 *     owns (`useTranscriber.test.ts`: "does not repaint a finished
+                 *     run with a dead run's persist" and "does not release the busy
+                 *     gate under a live run when a dead run persists", both of which
+                 *     drive the overlap with this gate out of the picture) — but the
+                 *     WRITE still happens by design, so without the gate a supersede
+                 *     stacks DB writes the same way it stacks abandoned ffmpeg work.
+                 */}
                 <div className='flex flex-row space-x-2 py-2 w-full px-2'>
                     <YouTubeTile
                         icon={<YouTubeIcon />}
                         text='YouTube'
                         onUrlSubmit={handleYouTubeSubmit}
-                        enabled={props.transcriber.selectedModelAvailable}
+                        enabled={
+                            props.transcriber.selectedModelAvailable && !isBusy
+                        }
+                        disabled={isBusy}
                     />
                     <VerticalBar />
                     <FileTile
                         icon={<FolderIcon />}
                         text='From file'
                         onFileSelect={handleFileSelect}
+                        disabled={isBusy}
                     />
                 </div>
+                {isDragging && (
+                    <div className='w-full px-4 pb-2 text-center text-sm font-medium text-indigo-600'>
+                        Drop an audio or video file to transcribe it
+                    </div>
+                )}
                 <div className='w-full px-4 pb-4'>
                     <SettingsPanel transcriber={props.transcriber} />
                 </div>
@@ -145,21 +364,51 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                                 )}
                             </div>
                         )}
-                </div>
-            )}
-
-            {props.transcriber.error && (
-                <div className='w-full mt-4 p-4 bg-red-50 rounded-lg border border-red-200'>
-                    <div className='text-red-600 text-center'>
-                        {props.transcriber.error}
+                    {/*
+                     * The escape hatch, and the reason it has to exist: while a run
+                     * is in flight, BOTH tiles are disabled, the `Transcribe` button
+                     * is hidden and drops are refused. A run that never terminates
+                     * therefore had exactly one exit — quitting the app. This is the
+                     * other one.
+                     */}
+                    <div className='mt-3 flex justify-center'>
+                        <button
+                            onClick={handleCancel}
+                            className='text-sm text-slate-500 hover:text-red-600 underline underline-offset-2 transition-colors duration-200'
+                        >
+                            Cancel
+                        </button>
                     </div>
                 </div>
             )}
 
-            {selectedFile && !props.transcriber.isBusy && (
+            {/*
+             * `dropError` WINS. It used to be the fallback, so a stale error from
+             * an earlier transcription — which a rejected drop does not and should
+             * not clear, since it never reaches the hook — kept the screen and hid
+             * the reason the drop was refused. The drop error is always the newer
+             * event of the two, and it is cleared the moment a file is accepted.
+             */}
+            {(dropError || props.transcriber.error) && (
+                <div className='w-full mt-4 p-4 bg-red-50 rounded-lg border border-red-200'>
+                    <div className='text-red-600 text-center'>
+                        {dropError ?? props.transcriber.error}
+                    </div>
+                </div>
+            )}
+
+            {dropNotice && (
+                <div className='w-full mt-4 p-4 bg-amber-50 rounded-lg border border-amber-200'>
+                    <div className='text-amber-800 text-center text-sm'>
+                        {dropNotice}
+                    </div>
+                </div>
+            )}
+
+            {selectedPath && !props.transcriber.isBusy && (
                 <div className='w-full mt-4 flex justify-center items-center'>
                     <div className='text-sm text-slate-500 mr-4 flex items-center'>
-                        {selectedFile.name}
+                        {basename(selectedPath)}
                     </div>
                     <button
                         onClick={handleTranscribe}
@@ -176,66 +425,123 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
 function SettingsPanel(props: { transcriber: Transcriber }) {
     return (
-        <div className='grid grid-cols-1 md:grid-cols-3 gap-3 text-sm'>
-            <label className='flex flex-col text-slate-600'>
-                Model preset
-                <select
-                    value={props.transcriber.presetId}
+        <div className='flex flex-col gap-3 text-sm'>
+            <div className='grid grid-cols-1 md:grid-cols-3 gap-3'>
+                <label className='flex flex-col text-slate-600'>
+                    Model preset
+                    <select
+                        value={props.transcriber.presetId}
+                        onChange={(event) =>
+                            props.transcriber.setPresetId(
+                                event.target
+                                    .value as typeof props.transcriber.presetId,
+                            )
+                        }
+                        className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
+                    >
+                        {props.transcriber.presetOptions.map((preset) => (
+                            <option
+                                key={preset.id}
+                                value={preset.id}
+                                disabled={
+                                    preset.webgpuOnly &&
+                                    !props.transcriber.browserCaps?.canUseWebGPU
+                                }
+                            >
+                                {preset.label}
+                            </option>
+                        ))}
+                    </select>
+                </label>
+
+                <label className='flex flex-col text-slate-600'>
+                    Task
+                    <select
+                        value={props.transcriber.task}
+                        onChange={(event) =>
+                            props.transcriber.setTask(
+                                event.target.value as
+                                    | "transcribe"
+                                    | "translate",
+                            )
+                        }
+                        className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
+                    >
+                        <option value='transcribe'>Transcribe</option>
+                        <option value='translate'>Translate to English</option>
+                    </select>
+                </label>
+
+                <label className='flex flex-col text-slate-600'>
+                    Source language
+                    <select
+                        value={props.transcriber.language}
+                        onChange={(event) =>
+                            props.transcriber.setLanguage(event.target.value)
+                        }
+                        className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
+                    >
+                        {props.transcriber.languageOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                                {option.label}
+                            </option>
+                        ))}
+                    </select>
+                </label>
+            </div>
+            <DiarizationSettings transcriber={props.transcriber} />
+        </div>
+    );
+}
+
+/**
+ * Speaker detection is OPT-IN, default OFF — it runs a second, CPU-bound
+ * process alongside Whisper and most single-speaker content has nothing for it
+ * to label. The optional count is a HINT the engine may not honour exactly
+ * (asking for 4 speakers can still return 3), so it defaults to auto-detect
+ * rather than to any particular number, and the field is only offered once the
+ * toggle itself is on.
+ */
+function DiarizationSettings(props: { transcriber: Transcriber }) {
+    const { transcriber } = props;
+
+    return (
+        <div className='flex flex-wrap items-center gap-4 border-t border-slate-100 pt-3 text-slate-600'>
+            <label className='flex items-center gap-2'>
+                <input
+                    type='checkbox'
+                    checked={transcriber.diarizeEnabled}
                     onChange={(event) =>
-                        props.transcriber.setPresetId(
-                            event.target
-                                .value as typeof props.transcriber.presetId,
-                        )
+                        transcriber.setDiarizeEnabled(event.target.checked)
                     }
-                    className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
-                >
-                    {props.transcriber.presetOptions.map((preset) => (
-                        <option
-                            key={preset.id}
-                            value={preset.id}
-                            disabled={
-                                preset.webgpuOnly &&
-                                !props.transcriber.browserCaps?.canUseWebGPU
+                    className='rounded border-slate-300 text-indigo-600 focus:ring-indigo-500'
+                />
+                Identify speakers
+            </label>
+            {transcriber.diarizeEnabled && (
+                <label className='flex items-center gap-2'>
+                    Speaker count (optional)
+                    <input
+                        type='number'
+                        min={1}
+                        step={1}
+                        value={transcriber.numSpeakersHint ?? ""}
+                        onChange={(event) => {
+                            const raw = event.target.value;
+                            if (raw === "") {
+                                transcriber.setNumSpeakersHint(undefined);
+                                return;
                             }
-                        >
-                            {preset.label}
-                        </option>
-                    ))}
-                </select>
-            </label>
-
-            <label className='flex flex-col text-slate-600'>
-                Task
-                <select
-                    value={props.transcriber.task}
-                    onChange={(event) =>
-                        props.transcriber.setTask(
-                            event.target.value as "transcribe" | "translate",
-                        )
-                    }
-                    className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
-                >
-                    <option value='transcribe'>Transcribe</option>
-                    <option value='translate'>Translate to English</option>
-                </select>
-            </label>
-
-            <label className='flex flex-col text-slate-600'>
-                Source language
-                <select
-                    value={props.transcriber.language}
-                    onChange={(event) =>
-                        props.transcriber.setLanguage(event.target.value)
-                    }
-                    className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
-                >
-                    {props.transcriber.languageOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                            {option.label}
-                        </option>
-                    ))}
-                </select>
-            </label>
+                            const parsed = Math.max(1, Math.floor(Number(raw)));
+                            transcriber.setNumSpeakersHint(
+                                Number.isFinite(parsed) ? parsed : undefined,
+                            );
+                        }}
+                        placeholder='Auto-detect'
+                        className='w-24 rounded-lg border border-slate-300 px-2 py-1'
+                    />
+                </label>
+            )}
         </div>
     );
 }
@@ -262,6 +568,7 @@ function YouTubeTile(props: {
     text: string;
     onUrlSubmit: (url: string) => void;
     enabled: boolean;
+    disabled?: boolean;
 }) {
     const [showModal, setShowModal] = useState(false);
 
@@ -270,6 +577,7 @@ function YouTubeTile(props: {
             <Tile
                 icon={props.icon}
                 text={props.text}
+                disabled={props.disabled}
                 onClick={() => setShowModal(true)}
             />
             <YouTubeModal
@@ -334,43 +642,37 @@ function YouTubeModal(props: {
     );
 }
 
+/**
+ * The native file picker, via the Tauri dialog plugin.
+ *
+ * This used to build an `<input type="file">` and hand the resulting browser
+ * `File` straight to the transcriber. A `File` exposes only its bytes, never its
+ * path — so the audio could only ever be decoded in the webview, and Rust (where
+ * diarization runs) had no file to point ffmpeg or sherpa-onnx at. The dialog
+ * returns a real path instead.
+ */
 function FileTile(props: {
     icon: JSX.Element;
     text: string;
-    onFileSelect: (file: File) => void;
+    onFileSelect: (path: string) => void;
+    disabled?: boolean;
 }) {
     return (
         <Tile
             icon={props.icon}
             text={props.text}
+            disabled={props.disabled}
             onClick={() => {
-                const input = document.createElement("input");
-                input.type = "file";
-                input.accept =
-                    "video/*,audio/*,.mp4,.mkv,.avi,.mov,.webm,.mp3,.wav,.m4a,.aac,.ogg,.flac";
-                input.style.display = "none";
-                document.body.appendChild(input);
-
-                const cleanup = () => {
-                    if (input.parentNode) {
-                        input.parentNode.removeChild(input);
+                void open({
+                    multiple: false,
+                    directory: false,
+                    filters: [{ name: "Media", extensions: MEDIA_EXTENSIONS }],
+                }).then((selected) => {
+                    // `null` when the user cancels.
+                    if (typeof selected === "string") {
+                        props.onFileSelect(selected);
                     }
-                };
-
-                input.addEventListener(
-                    "change",
-                    (event) => {
-                        const files = (event.target as HTMLInputElement).files;
-                        if (files?.[0]) {
-                            props.onFileSelect(files[0]);
-                        }
-                        cleanup();
-                    },
-                    { once: true },
-                );
-                input.addEventListener("cancel", cleanup, { once: true });
-
-                input.click();
+                });
             }}
         />
     );
@@ -380,11 +682,13 @@ function Tile(props: {
     icon: JSX.Element;
     text?: string;
     onClick?: () => void;
+    disabled?: boolean;
 }) {
     return (
         <button
             onClick={props.onClick}
-            className='flex items-center justify-center rounded-lg p-2 bg-blue text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all duration-200'
+            disabled={props.disabled}
+            className='flex items-center justify-center rounded-lg p-2 bg-blue text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 disabled:text-slate-300 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all duration-200'
         >
             <div className='w-7 h-7'>{props.icon}</div>
             {props.text && (

@@ -11,13 +11,25 @@ import {
 } from "../config/transcription";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
-import { consolidateChunks } from "../utils/captionFormatter";
+import {
+    ConsolidatedSegment,
+    WordToken,
+    consolidateSegments,
+} from "../lib/captionFormatter";
+import {
+    WorkerChunk,
+    WorkerTranscript,
+    consolidateWorkerTranscript,
+    segmentsForPersistence,
+} from "../lib/workerTranscript";
+import type { SpeakerTurn } from "../lib/speakerAlignment";
 import {
     api,
+    DiarizationOutcome,
     Job,
     ModelStatusResponse,
     PersistTranscriptRequest,
-    TranscriptionSegment,
+    SpeakerNames,
 } from "../services/api";
 
 interface ProgressItem {
@@ -29,20 +41,12 @@ interface ProgressItem {
     status: string;
 }
 
-interface WorkerChunk {
-    text: string;
-    timestamp: [number, number | null];
-}
-
-interface WorkerTranscript {
-    text: string;
-    chunks: WorkerChunk[];
-}
-
 interface WorkerUpdateData {
     data: {
         text: string;
         chunks: WorkerChunk[];
+        /** Real per-word times. Only the final "complete" message carries them. */
+        words?: WordToken[];
         tps?: number;
     };
 }
@@ -59,7 +63,12 @@ interface WorkerProgressMessage {
 export interface TranscriberData {
     isBusy: boolean;
     text: string;
-    chunks: WorkerChunk[];
+    /**
+     * Display cues, already through the formatter. Branded so that neither the
+     * exporters nor a second `consolidateSegments` call can be handed raw
+     * segments (or these cues re-consolidated) without a compile error.
+     */
+    chunks: ConsolidatedSegment[];
     filename?: string;
     persisted: boolean;
     modelLabel?: string;
@@ -70,8 +79,30 @@ export interface Transcriber {
     isBusy: boolean;
     isModelLoading: boolean;
     progressItems: ProgressItem[];
-    start: (file: File) => void;
+    /**
+     * Takes a filesystem PATH, not a browser `File`. A `File` has no path, so
+     * Rust could never see it — which is why local files now come from the Tauri
+     * dialog or a file drop.
+     */
+    start: (path: string) => void;
     startFromYouTube: (url: string) => void;
+    /**
+     * Abandon the run in flight and return the app to idle: the wait dies, the
+     * worker is terminated, and the run token is bumped so that nothing still in
+     * flight can PAINT the UI — every point at which a dead run can resume
+     * re-checks the token before it writes, and every worker message carries the
+     * id of the run that asked for it.
+     *
+     * It does not stop work already started. The backend's ffmpeg/yt-dlp runs to
+     * completion (there is no `cancel_job` — see `cancel` below), and a
+     * `persistTranscript` already in flight still lands, writing the transcript
+     * under its own job: correct, and the content-keyed cache keeps it. Those
+     * writes just cannot reach the screen.
+     *
+     * The only exit from a run that never terminates, since both entry points are
+     * locked while busy.
+     */
+    cancel: () => void;
     output?: TranscriberData;
     jobId: string | null;
     error: string | null;
@@ -94,54 +125,51 @@ export interface Transcriber {
     selectedModelId: string | null;
     presetOptions: typeof MODEL_PRESETS;
     languageOptions: typeof LANGUAGE_OPTIONS;
+    /**
+     * Speaker detection is OPT-IN per job, default OFF: it costs real time (a
+     * second CPU-bound child alongside Whisper) and most single-speaker content
+     * has nothing for it to label. Read at the moment a run STARTS — flipping it
+     * mid-run does not retroactively diarize or un-diarize the run in flight.
+     */
+    diarizeEnabled: boolean;
+    setDiarizeEnabled: (enabled: boolean) => void;
+    /**
+     * "I know there are N speakers" — a HINT passed as `DiarizeOptions.num_speakers`,
+     * not a guarantee: sherpa-onnx's own reference case shows asking for 4 can
+     * still return 3. `undefined` means auto-detect, which is the default and is
+     * NOT uniformly worse than a supplied count — do not coerce this to a number
+     * before the user has actually set one.
+     */
+    numSpeakersHint: number | undefined;
+    setNumSpeakersHint: (value: number | undefined) => void;
+    /**
+     * What the most recent `diarize_job` call answered, for THIS run —
+     * `null` when the toggle was off, or no run has completed yet. The three
+     * arms of {@link DiarizationOutcome} are handled, not collapsed: a
+     * `"degraded"` run and a `"succeeded"` run that happened to find nobody both
+     * end up with no speaker labels on screen, and this is the only thing that
+     * lets a caller tell those apart and say so.
+     */
+    diarizationOutcome: DiarizationOutcome | null;
+    /** Every speaker name set for the current job's source, keyed by its opaque label. */
+    speakerNames: SpeakerNames;
+    /**
+     * Rename a speaker for the current job. A metadata write — it does not
+     * re-transcribe or re-diarize — and `speakerNames` reflects it once the
+     * write and the subsequent re-fetch both land.
+     */
+    renameSpeaker: (speakerKey: string, displayName: string) => Promise<void>;
 }
 
 type PendingWorker = {
+    /** The run that posted the `transcribe` message this is waiting on. */
+    runId: number;
     resolve: (value: WorkerTranscript) => void;
     reject: (reason?: unknown) => void;
     filename?: string;
     modelLabel?: string;
+    audioDuration: number;
 };
-
-function convertSegments(
-    segments: TranscriptionSegment[],
-): { text: string; timestamp: [number, number | null] }[] {
-    return segments.map((segment) => ({
-        text: segment.text,
-        timestamp: [segment.start, segment.end] as [number, number | null],
-    }));
-}
-
-function wordCount(text: string): number {
-    return text.replace(/\n/g, " ").trim().split(/\s+/).filter(Boolean).length;
-}
-
-function consolidateWorkerTranscript(
-    workerTranscript: WorkerTranscript,
-    options: { hideTrailingShortCaption?: boolean } = {},
-): WorkerTranscript {
-    const chunks = consolidateChunks(workerTranscript.chunks);
-    const displayChunks =
-        options.hideTrailingShortCaption &&
-        chunks.length > 0 &&
-        wordCount(chunks[chunks.length - 1].text) < 3
-            ? chunks.slice(0, -1)
-            : chunks;
-    const text =
-        displayChunks
-            .map((chunk) => chunk.text.replace(/\n/g, " "))
-            .join(" ")
-            .trim() || workerTranscript.text;
-
-    return { text, chunks: displayChunks };
-}
-
-async function sha256Hex(arrayBuffer: ArrayBuffer): Promise<string> {
-    const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);
-    return Array.from(new Uint8Array(digest))
-        .map((byte) => byte.toString(16).padStart(2, "0"))
-        .join("");
-}
 
 async function decodeAudio(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
     const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -193,12 +221,92 @@ export function useTranscriber(): Transcriber {
     const [modelStatusError, setModelStatusError] = useState<string | null>(
         null,
     );
+    const [diarizeEnabled, setDiarizeEnabled] = useState(false);
+    const [numSpeakersHint, setNumSpeakersHint] = useState<number | undefined>(
+        undefined,
+    );
+    const [diarizationOutcome, setDiarizationOutcome] =
+        useState<DiarizationOutcome | null>(null);
+    const [speakerNames, setSpeakerNames] = useState<SpeakerNames>({});
 
     const pendingWorkerRef = useRef<PendingWorker | null>(null);
-    const unsubscribeRef = useRef<(() => void) | null>(null);
+
+    /**
+     * The wait in flight, if any.
+     *
+     * `teardown` stops it listening and polling. `abandon` does that AND settles
+     * its promise, so the `transcribePreparedJob` frame parked on it unwinds
+     * instead of being stranded forever. Unmount uses `teardown` (there is no UI
+     * left to unwind into); cancel and supersede use `abandon`.
+     */
+    const pendingWaitRef = useRef<{
+        teardown: () => void;
+        abandon: () => void;
+    } | null>(null);
+
+    /**
+     * Which run owns the UI. Incremented by every start and by `cancel`, so it is
+     * a monotonic token: a run holds a number, and the moment that number stops
+     * being `runIdRef.current` the run is dead and may not touch anything.
+     *
+     * Two different things need this token, and only one of them was obvious.
+     *
+     * 1. CONTINUATIONS. `cancelPendingWait` can only kill a wait that has been
+     *    ARMED. A run still inside `api.createFileJob` (a whole-file sha256) or
+     *    `api.createYouTubeJob` (yt-dlp) has armed nothing, so there is nothing to
+     *    tear down; when that call finally returns, the superseded run would carry
+     *    on into a transcription unless it checks. Every resumption point checks.
+     *
+     * 2. WORKER MESSAGES. `pendingWorkerRef` used to be an unkeyed slot, and the
+     *    guards on it asked "does ANYONE own this?" — never "does the run that
+     *    POSTED this own it?". Those are different questions the moment two runs
+     *    overlap, and the difference is a wrong transcript persisted under the
+     *    wrong job. So the token is carried ON the worker message (see the
+     *    worker's `WorkerRequest.runId`) and matched against the pending run here.
+     */
+    const runIdRef = useRef(0);
 
     const worker = useWorker((event) => {
         const message = event.data;
+
+        /**
+         * A message belongs to this run only if the pending run is the one that
+         * posted it. Not "a run exists" — THIS run.
+         *
+         * The worker is terminated when a run is abandoned, so in practice a dead
+         * run's messages usually never arrive. `terminate()` cannot recall a
+         * message already in the queue, though, and this is what makes the
+         * receiver correct when one slips through.
+         */
+        const ownedPending = (): PendingWorker | null => {
+            const pending = pendingWorkerRef.current;
+            if (!pending || pending.runId !== message.runId) {
+                return null;
+            }
+            return pending;
+        };
+
+        // Model-loading traffic (`initiate`/`progress`/`done`/`ready`) is not tied
+        // to a pending promise, so it is keyed against the run token directly. A
+        // superseded run's download bar must not be painted over the live run's.
+        //
+        // FAIL CLOSED: this processes a message only if it is CURRENT. It used to
+        // drop one only if it was STAMPED AND STALE (`runId !== undefined &&
+        // runId !== current`), which is the weaker polarity — an UNSTAMPED message
+        // sailed through. Nothing emits one today (the worker's `post()` stamps
+        // every message from one place), but "no unstamped message exists" is a
+        // property of a file this one does not own, and the cost of the strong
+        // polarity is nil: an unstamped `runId` is `undefined`, which never equals
+        // a number, so it is dropped.
+        if (
+            (message.status === "progress" ||
+                message.status === "initiate" ||
+                message.status === "done" ||
+                message.status === "ready") &&
+            message.runId !== runIdRef.current
+        ) {
+            return;
+        }
 
         switch (message.status) {
             case "progress":
@@ -226,49 +334,67 @@ export function useTranscriber(): Transcriber {
                 setIsModelLoading(false);
                 break;
             case "update": {
+                const pending = ownedPending();
+                if (!pending) {
+                    break;
+                }
                 const updateMessage = message as WorkerUpdateData;
+                // Mid-stream the trailing chunk is still open, so its real end is
+                // unknown — do NOT stretch it to the audio duration here.
                 const displayTranscript = consolidateWorkerTranscript(
                     {
                         text: updateMessage.data.text,
                         chunks: updateMessage.data.chunks,
                     },
+                    null,
                     { hideTrailingShortCaption: true },
                 );
                 setTranscript({
                     isBusy: true,
                     text: displayTranscript.text,
                     chunks: displayTranscript.chunks,
-                    filename: pendingWorkerRef.current?.filename,
+                    filename: pending.filename,
                     persisted: false,
-                    modelLabel: pendingWorkerRef.current?.modelLabel,
+                    modelLabel: pending.modelLabel,
                 });
                 break;
             }
             case "complete": {
+                const pending = ownedPending();
+                if (!pending) {
+                    break;
+                }
                 const updateMessage = message as WorkerUpdateData;
                 const nextTranscript: WorkerTranscript = {
                     text: updateMessage.data.text,
                     chunks: updateMessage.data.chunks,
+                    words: updateMessage.data.words,
                 };
-                const displayTranscript =
-                    consolidateWorkerTranscript(nextTranscript);
+                const displayTranscript = consolidateWorkerTranscript(
+                    nextTranscript,
+                    pending.audioDuration,
+                );
                 setTranscript({
                     isBusy: true,
                     text: displayTranscript.text,
                     chunks: displayTranscript.chunks,
-                    filename: pendingWorkerRef.current?.filename,
+                    filename: pending.filename,
                     persisted: false,
-                    modelLabel: pendingWorkerRef.current?.modelLabel,
+                    modelLabel: pending.modelLabel,
                 });
-                pendingWorkerRef.current?.resolve(nextTranscript);
                 pendingWorkerRef.current = null;
+                pending.resolve(nextTranscript);
                 break;
             }
             case "error": {
+                const pending = ownedPending();
+                if (!pending) {
+                    break;
+                }
                 const messageText =
                     message.data?.message ?? "Transcription failed";
-                pendingWorkerRef.current?.reject(new Error(messageText));
                 pendingWorkerRef.current = null;
+                pending.reject(new Error(messageText));
                 setIsBusy(false);
                 setError(messageText);
                 break;
@@ -310,9 +436,8 @@ export function useTranscriber(): Transcriber {
 
     useEffect(
         () => () => {
-            if (unsubscribeRef.current) {
-                unsubscribeRef.current();
-            }
+            pendingWaitRef.current?.teardown();
+            pendingWaitRef.current = null;
         },
         [],
     );
@@ -351,21 +476,135 @@ export function useTranscriber(): Transcriber {
         );
     }, [modelStatus, selectedModelId]);
 
-    const applyCompletedJob = useCallback((job: Job, modelLabel: string) => {
-        setTranscript({
-            isBusy: false,
-            text: job.full_text || "",
-            chunks: convertSegments(job.segments),
-            filename: job.filename || undefined,
-            persisted: true,
-            modelLabel,
-        });
-        setJobId(job.id);
-        setProgress(1);
-        setStatus("completed");
-        setError(null);
-        setIsBusy(false);
+    /**
+     * Every name given to the current job's speakers. Best-effort: a failed fetch
+     * leaves `speakerNames` at whatever it already was (usually `{}`, the normal
+     * "nobody has renamed anyone" case), which renders every speaker as its own
+     * opaque label — a safe fallback, and not an error worth surfacing.
+     */
+    const refreshSpeakerNames = useCallback(async (targetJobId: string) => {
+        try {
+            const names = await api.getSpeakerNames(targetJobId);
+            setSpeakerNames(names);
+        } catch {
+            // See above.
+        }
     }, []);
+
+    /**
+     * `SPEAKER_00` -> `"Alice"`, for the current job. A metadata write —
+     * `api.setSpeakerName` does not re-transcribe or re-diarize — so the only
+     * thing this does afterward is re-fetch the map that write landed in, which
+     * is what makes `speakerNames` reflect it.
+     */
+    const renameSpeaker = useCallback(
+        async (speakerKey: string, displayName: string) => {
+            if (!jobId) {
+                return;
+            }
+            await api.setSpeakerName(jobId, speakerKey, displayName);
+            await refreshSpeakerNames(jobId);
+        },
+        [jobId, refreshSpeakerNames],
+    );
+
+    /**
+     * Kick off diarization for a job's already-prepared audio, if the toggle is
+     * on, and resolve the turns to align against.
+     *
+     * Resolves `undefined` in three cases that a caller must NOT conflate:
+     * the toggle was off (no `diarizationOutcome` write at all — nothing ran);
+     * the sidecar answered `"succeeded"` with an empty turn list (a real
+     * success — silence, or one speaker); or it answered `"degraded"` /
+     * `"cancelled"`. `setDiarizationOutcome` is the one place that distinction
+     * survives, which is what lets the UI show each of those three differently
+     * rather than rendering all of them as the same unlabelled transcript.
+     *
+     * `api.diarizeJob` REJECTS only when the request itself was wrong — an
+     * unknown job, no prepared audio (a cache hit whose WAV has aged out is the
+     * realistic case), or an impossible `numSpeakers`. That is not one of the
+     * three outcomes `DiarizationOutcome` models, but it is exactly as invisible
+     * a failure if swallowed, so it is folded into `"degraded"` for display: the
+     * user does not care whether the sidecar crashed or the request that reached
+     * it never had a chance to, only that speaker labels did not happen and why.
+     *
+     * `runId` is the caller's token, threaded through the exact same way
+     * `persistWorkerTranscript` gets one — every caller here already has it in
+     * scope. `api.diarizeJob` is an async round-trip, so the run that kicked it
+     * off can be superseded (cancel, or a second file) before it answers. The
+     * KICKOFF may happen for a run that is still current at the time it is
+     * called — that part needs no guard. The `setDiarizationOutcome` WRITE, at
+     * the moment the promise resolves, is the one that must be dropped if the
+     * token has moved on since: `persistWorkerTranscript` guards its own state
+     * write on `runIdRef.current === runId` right where its diarization promise
+     * resolves, and this mirrors that, not a new mechanism.
+     */
+    const diarizeAudio = useCallback(
+        async (
+            targetJobId: string,
+            runId: number,
+        ): Promise<SpeakerTurn[] | undefined> => {
+            if (!diarizeEnabled) {
+                return undefined;
+            }
+            try {
+                const outcome = await api.diarizeJob(
+                    targetJobId,
+                    numSpeakersHint,
+                );
+                if (runIdRef.current === runId) {
+                    setDiarizationOutcome(outcome);
+                }
+                return outcome.status === "succeeded"
+                    ? outcome.turns
+                    : undefined;
+            } catch (diarizeError) {
+                if (runIdRef.current === runId) {
+                    setDiarizationOutcome({
+                        status: "degraded",
+                        reason:
+                            diarizeError instanceof Error
+                                ? diarizeError.message
+                                : "Speaker detection could not run",
+                    });
+                }
+                return undefined;
+            }
+        },
+        [diarizeEnabled, numSpeakersHint],
+    );
+
+    const applyCompletedJob = useCallback(
+        (job: Job, modelLabel: string, turns?: readonly SpeakerTurn[]) => {
+            setTranscript({
+                isBusy: false,
+                text: job.full_text || "",
+                // The database stores RAW model segments as the source of truth, so a
+                // formatter improvement retroactively improves old transcripts. They
+                // must be consolidated on read, or the transcript at rest is one that
+                // never went through the formatter.
+                //
+                // `turns` is only ever passed here for a job whose segments do NOT
+                // already carry a `speaker` field (a fresh diarization of a cache hit
+                // or a not-yet-persisted job) — a job persisted THROUGH this run
+                // already has `speaker` baked into every row by
+                // `segmentsForPersistence`, and passing `undefined` here is what
+                // lets `consolidateSegments` fall through to its no-turns path and
+                // read that embedded label straight off the rows, unchanged.
+                chunks: consolidateSegments(job.segments, undefined, turns),
+                filename: job.filename || undefined,
+                persisted: true,
+                modelLabel,
+            });
+            setJobId(job.id);
+            setProgress(1);
+            setStatus("completed");
+            setError(null);
+            setIsBusy(false);
+            void refreshSpeakerNames(job.id);
+        },
+        [refreshSpeakerNames],
+    );
 
     const handleBackendJobUpdate = useCallback((job: Job) => {
         setJobId(job.id);
@@ -377,8 +616,85 @@ export function useTranscriber(): Transcriber {
         }
     }, []);
 
+    /**
+     * Abandon the wait already in flight: stop its listener, stop its poll, mark
+     * it settled so nothing it has already asked for can still be believed, and
+     * reject it so the run parked on it unwinds.
+     *
+     * Only ever called from `claimRun` (cancel and both `start*` entry points) and
+     * as belt-and-braces at the top of `waitForReady`/`transcribePreparedJob`.
+     */
+    const cancelPendingWait = useCallback(() => {
+        pendingWaitRef.current?.abandon();
+        pendingWaitRef.current = null;
+    }, []);
+
+    /**
+     * Claim the UI for a new run, killing whatever run held it — its wait, its
+     * worker, and its promise.
+     *
+     * Synchronous by contract — every caller must invoke it before its first
+     * `await`. Calling it "first, before any early return" inside
+     * `transcribePreparedJob` is NOT early enough: that runs only after
+     * `beginRun()` and `api.create*Job()` have both resolved, and `create_file_job`
+     * sha256s the whole file while `create_youtube_job` shells out to yt-dlp.
+     * Through that window the previous run's poll and listener would still be live.
+     *
+     * `worker.restart()` is the half that actually STOPS the abandoned run.
+     * Ignoring its messages is not stopping it: transformers.js has no abort, so
+     * without a terminate it keeps decoding — every core pinned for however many
+     * minutes of audio are left, its `Float32Array` held — and a second
+     * `postMessage` would merely start a concurrent handler sharing the same
+     * pipeline instance (whose `dispose()` on a preset change would then throw
+     * under the run still using it). Only the terminate ends it. It is done only
+     * when a transcription is actually in flight, so the ordinary
+     * one-file-then-the-next case keeps its warm, already-loaded model.
+     *
+     * Rejecting the abandoned promise is what frees its `AudioBuffer` and mono
+     * `Float32Array`: `transcribePreparedJob` is parked on that promise, and a
+     * promise that never settles strands the whole frame. The rejection is safe
+     * BECAUSE the token has already been bumped — the dead run's `catch` in
+     * `startFromFile`/`startFromYouTube` sees it no longer owns the UI and returns
+     * without calling `failRun`, so no error is shown for a run the user
+     * abandoned.
+     *
+     * THE INVARIANT THAT MAKES THE ORDERING WORK, since it is load-bearing and was
+     * unwritten: this function is entirely SYNCHRONOUS. `cancelPendingWait()`
+     * rejects before the bump lexically, and `worker.restart()`'s rejection also
+     * runs before the `return` — but a rejection does not run its `catch` inline,
+     * it QUEUES a microtask, and no microtask can run until this function (and the
+     * event handler that called it) returns. So every abandoned continuation
+     * observes the bumped token, whatever order the rejections appear in here. The
+     * same invariant, read the other way, is why the token cannot move across an
+     * `await` whose promise is resolved synchronously from a message handler —
+     * which is what makes the pre-persist guard in `transcribePreparedJob` dead
+     * and the post-persist one live. Introduce an `await` into this function and
+     * both facts stop holding.
+     */
+    const claimRun = useCallback(() => {
+        cancelPendingWait();
+        // Bump BEFORE rejecting: the rejection runs the dead run's `catch`, and
+        // that `catch` decides whether to show an error by comparing this token.
+        runIdRef.current += 1;
+
+        const abandoned = pendingWorkerRef.current;
+        if (abandoned) {
+            pendingWorkerRef.current = null;
+            worker.restart();
+            setIsModelLoading(false);
+            setProgressItems([]);
+            abandoned.reject(
+                new Error("Transcription was cancelled or superseded"),
+            );
+        }
+
+        return runIdRef.current;
+    }, [cancelPendingWait, worker]);
+
     const waitForReady = useCallback(
         (job: Job) => {
+            cancelPendingWait();
+
             if (
                 job.status === "ready" ||
                 job.status === "completed" ||
@@ -388,61 +704,154 @@ export function useTranscriber(): Transcriber {
             }
 
             return new Promise<Job>((resolve, reject) => {
-                if (unsubscribeRef.current) {
-                    unsubscribeRef.current();
-                }
+                let settled = false;
+                let poll: ReturnType<typeof setInterval> | null = null;
+                let unlistenEvents: (() => void) | null = null;
 
-                unsubscribeRef.current = api.subscribeToProgress(
-                    job.id,
-                    (nextJob) => {
-                        handleBackendJobUpdate(nextJob);
-                        if (
-                            nextJob.status === "ready" ||
-                            nextJob.status === "completed"
-                        ) {
-                            unsubscribeRef.current?.();
-                            unsubscribeRef.current = null;
-                            resolve(nextJob);
-                        } else if (nextJob.status === "failed") {
-                            unsubscribeRef.current?.();
-                            unsubscribeRef.current = null;
+                /**
+                 * `settled = true` is IN HERE, not only in `finish`, and that is
+                 * load-bearing.
+                 *
+                 * `clearInterval` stops the NEXT poll; it cannot recall the
+                 * `getJob` already in flight. `settled` is the only thing that can
+                 * — which is precisely why it exists. When the teardown was
+                 * reached via `finish` it was set; when it was reached via
+                 * `cancelPendingWait` (cancel, or a supersede) it was NOT, so that
+                 * in-flight `getJob`'s `.then(consider)` sailed through the guard
+                 * and handed a DEAD job to `handleBackendJobUpdate` — writing its
+                 * id, progress and status over the live run, and, if the dead job
+                 * had failed, its `setError` + `setIsBusy(false)` too. It could
+                 * even `finish(() => resolve(nextJob))` and settle a superseded
+                 * run's wait.
+                 *
+                 * Idempotent: `finish` sets it and then calls this.
+                 */
+                const teardown = () => {
+                    settled = true;
+                    if (poll !== null) {
+                        clearInterval(poll);
+                        poll = null;
+                    }
+                    unlistenEvents?.();
+                    unlistenEvents = null;
+                };
+
+                const finish = (settleWith: () => void) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    teardown();
+                    if (pendingWaitRef.current === handle) {
+                        pendingWaitRef.current = null;
+                    }
+                    settleWith();
+                };
+
+                /**
+                 * Settle a wait nobody is waiting for any more. The run parked on
+                 * this promise is dead — its `catch` in `startFromFile` /
+                 * `startFromYouTube` compares the run token, sees it no longer owns
+                 * the UI, and returns without touching a thing. Leaving the promise
+                 * pending instead would strand that frame for the life of the app.
+                 */
+                const abandon = () => {
+                    finish(() =>
+                        reject(
+                            new Error(
+                                "Transcription was cancelled or superseded",
+                            ),
+                        ),
+                    );
+                };
+
+                const handle = { teardown, abandon };
+
+                const consider = (nextJob: Job) => {
+                    // A `getJob` already in flight when the wait settled still
+                    // resolves. Without this guard it would push a stale status
+                    // and progress back into the UI — flipping `loading-audio`
+                    // back to `ready` and the progress bar back to 1.0 — after the
+                    // run had already moved on.
+                    if (settled) {
+                        return;
+                    }
+                    handleBackendJobUpdate(nextJob);
+                    if (
+                        nextJob.status === "ready" ||
+                        nextJob.status === "completed"
+                    ) {
+                        finish(() => resolve(nextJob));
+                    } else if (nextJob.status === "failed") {
+                        finish(() =>
                             reject(
                                 new Error(
                                     nextJob.error || "Failed to prepare audio",
                                 ),
-                            );
-                        }
-                    },
-                    (workerError) => {
-                        unsubscribeRef.current?.();
-                        unsubscribeRef.current = null;
-                        reject(workerError);
-                    },
+                            ),
+                        );
+                    }
+                };
+
+                unlistenEvents = api.subscribeToProgress(
+                    job.id,
+                    consider,
+                    (workerError) => finish(() => reject(workerError)),
                 );
+
+                // Tauri's `listen()` registers the listener ASYNCHRONOUSLY, so a job
+                // that finishes fast can emit `ready` into the void before the
+                // listener exists — and the UI would then wait forever for an event
+                // that has already fired.
+                //
+                // The YouTube path never hit this only because downloading takes
+                // seconds. ffmpeg over a short LOCAL file finishes in tens of
+                // milliseconds, comfortably inside that window, so routing local
+                // files through Rust is what exposes the race. Polling the job as a
+                // backstop closes it for both sources: whichever of the event or the
+                // poll first observes a terminal state wins, and `finish` makes that
+                // idempotent.
+                poll = setInterval(() => {
+                    api.getJob(job.id)
+                        .then(consider)
+                        .catch(() => {
+                            // Transient; the next tick (or the event) will catch it.
+                        });
+                }, 300);
+
+                pendingWaitRef.current = handle;
             });
         },
-        [handleBackendJobUpdate],
+        [cancelPendingWait, handleBackendJobUpdate],
     );
 
     const runWorkerTranscription = useCallback(
         (
             audioBuffer: AudioBuffer,
             config: ResolvedModelConfig,
+            runId: number,
             filename?: string,
         ) =>
             new Promise<WorkerTranscript>((resolve, reject) => {
                 pendingWorkerRef.current = {
+                    runId,
                     resolve,
                     reject,
                     filename,
                     modelLabel: config.presetLabel,
+                    audioDuration: audioBuffer.duration,
                 };
                 setStatus("transcribing");
                 setIsBusy(true);
                 setError(null);
 
+                // `runId` travels with the audio and comes back on every message
+                // the worker emits for it. The pending slot above holds the same
+                // id, so the receiver can ask "is this MY run's output?" rather
+                // than the question it used to ask, "is anyone waiting at all?".
                 worker.postMessage({
                     type: "transcribe",
+                    runId,
                     audio: mixToMono(audioBuffer),
                     modelId: config.modelId,
                     device: config.device,
@@ -454,213 +863,443 @@ export function useTranscriber(): Transcriber {
         [worker],
     );
 
+    /**
+     * Write the transcript, then — and ONLY then — decide whether this run is
+     * still allowed to paint it.
+     *
+     * `api.persistTranscript` is a Tauri IPC round-trip that writes one row per
+     * segment: thousands of rows for a lecture, and slow. The app sits inside it
+     * with `status: "persisting"` and `isBusy: true` — which is to say with the
+     * Cancel button on screen — and NOTHING HOLDS IT. `claimRun` bumps the token,
+     * abandons the wait and terminates the worker, but the worker is already idle
+     * by now and this promise is not one of the ones it settles. So a cancel (or
+     * a supersede, if the `isBusy` gate ever comes off) lands squarely inside this
+     * await, the run dies, and the persist resolves into a UI it no longer owns.
+     *
+     * Unguarded, `applyCompletedJob` then wrote `setJobId`, `setTranscript`,
+     * `setStatus("completed")` and `setIsBusy(false)` for that dead run: the user
+     * is left looking at the transcript they cancelled, under the wrong job id
+     * (which every jobId-keyed action downstream — export, the diarizer — then
+     * targets), and under a LIVE second run the `setIsBusy(false)` takes the busy
+     * panel and the Cancel button off the screen while Whisper is still grinding.
+     *
+     * THE PERSIST ITSELF STILL COMPLETES, deliberately. The transcript is written
+     * under ITS OWN job, which is correct, and the cache is content-keyed, so the
+     * work the user already paid for is kept and a re-run of that file is a cache
+     * hit. Cancelling a run means "stop showing me this", not "throw the compute
+     * away". What it may not do is repaint.
+     *
+     * Pinned by `useTranscriber.test.ts`: "does not repaint a finished run with a
+     * dead run's persist" and "does not release the busy gate under a live run
+     * when a dead run persists". Delete the guard below and both fail.
+     *
+     * `diarizationPromise` is where diarization's answer JOINS the transcript.
+     * It was kicked off by the caller as soon as the canonical WAV existed —
+     * concurrently with the Whisper transcription above, not after it, because
+     * Whisper (webview) and sherpa-onnx (Rust sidecar) share no runtime and
+     * diarizing a multi-minute file can take longer than transcribing it. By the
+     * time control reaches here the worker's `complete` has already fired, so
+     * this `await` is the one place both sides are known to have finished.
+     */
     const persistWorkerTranscript = useCallback(
         async (
             job: Job,
             config: ResolvedModelConfig,
             workerTranscript: WorkerTranscript,
+            audioDuration: number,
+            runId: number,
+            diarizationPromise: Promise<SpeakerTurn[] | undefined>,
         ) => {
+            // Safe unguarded: the only caller reaches here in the microtask that
+            // follows the worker's `complete`, and the token cannot move inside a
+            // microtask (see `claimRun`).
             setStatus("persisting");
             setIsBusy(true);
+
+            // The join. This DOES cross an await, so the token can move here —
+            // unlike the two lines above, nothing after this point is safe
+            // unguarded.
+            const turns = await diarizationPromise;
+
+            if (runIdRef.current === runId) {
+                // Show the diarized transcript as soon as the turns are known,
+                // rather than making the user wait for the persist round-trip
+                // below (one row per segment — thousands for a lecture) just to
+                // see who is speaking. This is the LIVE display path picking up
+                // `turns`: same `consolidateWorkerTranscript` call the mid-stream
+                // preview already used, now carrying the fourth argument that
+                // used to have no production caller at all.
+                const displayTranscript = consolidateWorkerTranscript(
+                    workerTranscript,
+                    audioDuration,
+                    {},
+                    turns,
+                );
+                setTranscript({
+                    isBusy: true,
+                    text: displayTranscript.text,
+                    chunks: displayTranscript.chunks,
+                    filename: job.filename || undefined,
+                    persisted: false,
+                    modelLabel: config.presetLabel,
+                });
+            }
+
             const payload: PersistTranscriptRequest = {
                 model_id: config.modelId,
                 task: config.task,
                 language: config.language,
                 full_text: workerTranscript.text,
-                segments: workerTranscript.chunks.map((chunk) => ({
-                    start: chunk.timestamp[0],
-                    end: chunk.timestamp[1] ?? chunk.timestamp[0],
-                    text: chunk.text,
-                })),
+                segments: segmentsForPersistence(
+                    workerTranscript,
+                    audioDuration,
+                    turns,
+                ),
             };
 
             const persistedJob = await api.persistTranscript(job.id, payload);
+
+            // THE LAST GATE, and the last await in the run. Everything above this
+            // line has already happened on disk; everything below it is UI.
+            if (runIdRef.current !== runId) {
+                return;
+            }
+
+            // No `turns` here: `persistedJob.segments` already carries `speaker`
+            // baked into every row by `segmentsForPersistence` above, and
+            // `applyCompletedJob` reads it straight off them. See the comment
+            // there.
             applyCompletedJob(persistedJob, config.presetLabel);
         },
         [applyCompletedJob],
     );
 
-    const startFromFile = useCallback(
-        async (file: File) => {
-            try {
-                setTranscript(undefined);
-                setIsBusy(true);
-                setError(null);
-                setProgress(0);
-                setStatus("checking-cache");
+    /**
+     * The setup both sources share: reset the view, resolve which model this run
+     * will actually use, and check it is available.
+     */
+    const beginRun = useCallback(
+        async (runId: number): Promise<ResolvedModelConfig> => {
+            setTranscript(undefined);
+            setIsBusy(true);
+            setError(null);
+            setProgress(0);
+            setStatus("checking-cache");
+            // A fresh run's diarization has not happened yet, so a stale
+            // outcome (or stale names) from the PREVIOUS job must not sit on
+            // screen looking like an answer for this one.
+            setDiarizationOutcome(null);
+            setSpeakerNames({});
 
-                const caps = await ensureBrowserCaps();
-                const config = resolveModelConfig(
-                    presetId,
-                    caps,
-                    task,
-                    language,
+            const caps = await ensureBrowserCaps();
+            const config = resolveModelConfig(presetId, caps, task, language);
+            if (
+                modelStatus &&
+                !modelStatus.items.some(
+                    (item) => item.model_id === config.modelId && item.ready,
+                )
+            ) {
+                throw new Error(
+                    `Model files for ${config.presetLabel} are not installed on the server`,
                 );
-                if (
-                    modelStatus &&
-                    !modelStatus.items.some(
-                        (item) =>
-                            item.model_id === config.modelId && item.ready,
-                    )
-                ) {
-                    throw new Error(
-                        `Model files for ${config.presetLabel} are not installed on the server`,
-                    );
-                }
-                setEffectivePresetLabel(config.presetLabel);
+            }
+            // A continuation, like every other: `ensureBrowserCaps` can await a
+            // GPU probe, and a run superseded during it must not relabel the UI
+            // with the model IT would have used. (`setBrowserCaps` inside
+            // `ensureBrowserCaps` is deliberately not guarded — the device's
+            // capabilities are a property of the machine, identical for every run,
+            // not state this run owns.)
+            if (runIdRef.current !== runId) {
+                return config;
+            }
+            setEffectivePresetLabel(config.presetLabel);
+            return config;
+        },
+        [ensureBrowserCaps, language, modelStatus, presetId, task],
+    );
 
-                const arrayBuffer = await file.arrayBuffer();
-                const fileHash = await sha256Hex(arrayBuffer);
+    const failRun = useCallback((nextError: unknown, fallback: string) => {
+        setTranscript((previous) =>
+            previous ? { ...previous, isBusy: false } : previous,
+        );
+        setError(nextError instanceof Error ? nextError.message : fallback);
+        setStatus("failed");
+        setIsBusy(false);
+    }, []);
+
+    /**
+     * Everything after a job exists — and it is now the SAME for every source.
+     *
+     * Wait for Rust to report `ready` (it has produced the canonical 16 kHz mono
+     * WAV), fetch that WAV back through the asset protocol, decode it, transcribe
+     * it, persist it.
+     *
+     * Local files used to take a different route entirely: the webview read the
+     * browser `File` into an `ArrayBuffer` and decoded THAT, so no WAV ever
+     * reached the disk and Rust never saw the audio — which left a Rust-side
+     * diarizer with nothing to work from for exactly the sources users are most
+     * likely to want diarized. Both sources now run this one already-proven path.
+     */
+    const transcribePreparedJob = useCallback(
+        async (initialJob: Job, config: ResolvedModelConfig, runId: number) => {
+            // Belt and braces. The call that actually closes the window is the one
+            // in the `start*` entry point, which ran before `api.create*Job` was
+            // even awaited; by here that job creation has already had all the time
+            // it wanted to let a stale poll tick. See `cancelPendingWait`.
+            cancelPendingWait();
+
+            if (initialJob.status === "completed") {
+                // A cache hit — the transcript already exists, but this run's
+                // diarization toggle has not been honoured yet. This IS the
+                // "legacy transcript" path a not-yet-word-granular cached row
+                // reaches: `diarizeAudio` returns turns (or doesn't) the same
+                // way regardless of granularity, and `consolidateSegments`
+                // inside `applyCompletedJob` decides word- vs segment-level
+                // alignment from the segments themselves.
+                //
+                // NOTE what this does NOT do: persist the turns. There is no
+                // command to write a new diarization run's speakers onto an
+                // already-persisted job's rows, so a cache hit's labels are
+                // shown for this session only, from `job.segments` as they
+                // already are. See the report for this task.
+                const turns = await diarizeAudio(initialJob.id, runId);
+                if (runIdRef.current !== runId) {
+                    return;
+                }
+                applyCompletedJob(initialJob, config.presetLabel, turns);
+                return;
+            }
+
+            handleBackendJobUpdate(initialJob);
+            const readyJob = await waitForReady(initialJob);
+
+            // FIRST, above every branch. An abandoned wait now rejects rather than
+            // hanging, so this is normally unreachable — but "normally" is what the
+            // last three rounds of this bug were built on. The `completed` branch
+            // below calls `applyCompletedJob`, which writes a transcript, a job id
+            // and `isBusy: false` straight into the UI; a dead run must not reach
+            // it, and it used to sit ABOVE the only check that could stop it.
+            if (runIdRef.current !== runId) {
+                return;
+            }
+
+            if (readyJob.status === "completed") {
+                // Same cache-hit case as above, reached via the polling path
+                // instead of the immediate one.
+                const turns = await diarizeAudio(readyJob.id, runId);
+                if (runIdRef.current !== runId) {
+                    return;
+                }
+                applyCompletedJob(readyJob, config.presetLabel, turns);
+                return;
+            }
+
+            setStatus("loading-audio");
+
+            // Kicked off HERE — as soon as the canonical WAV exists — and run
+            // CONCURRENTLY with the whisper transcription below, not awaited
+            // until `persistWorkerTranscript` needs the answer. Whisper (webview)
+            // and sherpa-onnx (Rust sidecar) share no runtime, so there is
+            // nothing to gain from serializing them: diarizing a multi-minute
+            // file can take longer than transcribing it.
+            const diarizationPromise = diarizeAudio(readyJob.id, runId);
+
+            const audioUrl = await api.getAudioUrl(readyJob.id);
+            const audioResponse = await fetch(audioUrl);
+            if (!audioResponse.ok) {
+                throw new Error("Failed to load prepared audio");
+            }
+
+            // The WAV is 16 kHz mono and `decodeAudio` opens its `AudioContext` at
+            // exactly 16 kHz, so nothing is resampled and `audioBuffer.duration` is
+            // the true duration of the source — the same number the in-browser
+            // decode of the original file used to yield.
+            //
+            // That number is load-bearing: `persistWorkerTranscript` passes it to
+            // `segmentsForPersistence`, which uses it to CLOSE the final segment. A
+            // missing or wrong duration silently swallows the end of the transcript
+            // rather than throwing, so it must keep coming from a real decode of
+            // the real audio.
+            const audioBuffer = await decodeAudio(
+                await audioResponse.arrayBuffer(),
+            );
+
+            if (runIdRef.current !== runId) {
+                return;
+            }
+
+            const workerTranscript = await runWorkerTranscription(
+                audioBuffer,
+                config,
+                runId,
+                readyJob.filename || undefined,
+            );
+
+            // NO GUARD HERE, deliberately, and this is the fourth round of that
+            // decision so it is worth writing down. One used to sit on this line,
+            // commented "the last gate before the transcript becomes PERMANENT".
+            // It was PROVABLY DEAD: `pending.resolve()` is called synchronously
+            // inside the worker's message handler, so the continuation of the
+            // `await` above is a microtask, microtasks drain before any task, and
+            // no click can bump the token in that window. The condition could
+            // never be false. Worse, it LOOKED like protection — and that is what
+            // hid the live hole ten lines below it, inside `persistWorkerTranscript`,
+            // for three rounds. The real gate is there, after the persist's own
+            // await, which is the one place a cancel can actually land.
+            //
+            // If a future change makes the resolve asynchronous (a `setTimeout`,
+            // a `queueMicrotask` chain that yields, an `await` before the resolve
+            // in the handler), this line becomes reachable and a guard belongs
+            // here again.
+            await persistWorkerTranscript(
+                readyJob,
+                config,
+                workerTranscript,
+                audioBuffer.duration,
+                runId,
+                diarizationPromise,
+            );
+        },
+        [
+            applyCompletedJob,
+            cancelPendingWait,
+            diarizeAudio,
+            handleBackendJobUpdate,
+            persistWorkerTranscript,
+            runWorkerTranscription,
+            waitForReady,
+        ],
+    );
+
+    const startFromFile = useCallback(
+        async (path: string) => {
+            // Synchronously, before ANY await: this run takes the UI, and the
+            // previous run's listener and poll die now — not after `beginRun` and
+            // a full-file sha256 have had their say. See `cancelPendingWait`.
+            const runId = claimRun();
+            try {
+                const config = await beginRun(runId);
                 const job = await api.createFileJob({
-                    file_hash: fileHash,
-                    filename: file.name,
-                    size_bytes: file.size,
+                    path,
                     model_id: config.modelId,
                     task: config.task,
                     language: config.language,
                 });
-
-                setJobId(job.id);
-
-                if (job.status === "completed") {
-                    applyCompletedJob(job, config.presetLabel);
+                if (runIdRef.current !== runId) {
                     return;
                 }
-
-                const audioBuffer = await decodeAudio(arrayBuffer);
-                const workerTranscript = await runWorkerTranscription(
-                    audioBuffer,
-                    config,
-                    file.name,
-                );
-                await persistWorkerTranscript(job, config, workerTranscript);
+                setJobId(job.id);
+                await transcribePreparedJob(job, config, runId);
             } catch (nextError) {
-                setTranscript((previous) =>
-                    previous ? { ...previous, isBusy: false } : previous,
-                );
-                setError(
-                    nextError instanceof Error
-                        ? nextError.message
-                        : "Failed to transcribe file",
-                );
-                setStatus("failed");
-                setIsBusy(false);
+                if (runIdRef.current !== runId) {
+                    return;
+                }
+                failRun(nextError, "Failed to transcribe file");
             }
         },
-        [
-            applyCompletedJob,
-            ensureBrowserCaps,
-            language,
-            modelStatus,
-            persistWorkerTranscript,
-            presetId,
-            runWorkerTranscription,
-            task,
-        ],
+        [beginRun, claimRun, failRun, transcribePreparedJob],
     );
 
     const startFromYouTube = useCallback(
         async (url: string) => {
+            const runId = claimRun();
             try {
-                setTranscript(undefined);
-                setIsBusy(true);
-                setError(null);
-                setProgress(0);
-                setStatus("checking-cache");
-
-                const caps = await ensureBrowserCaps();
-                const config = resolveModelConfig(
-                    presetId,
-                    caps,
-                    task,
-                    language,
-                );
-                if (
-                    modelStatus &&
-                    !modelStatus.items.some(
-                        (item) =>
-                            item.model_id === config.modelId && item.ready,
-                    )
-                ) {
-                    throw new Error(
-                        `Model files for ${config.presetLabel} are not installed on the server`,
-                    );
-                }
-                setEffectivePresetLabel(config.presetLabel);
-
-                const initialJob = await api.createYouTubeJob({
+                const config = await beginRun(runId);
+                const job = await api.createYouTubeJob({
                     url,
                     model_id: config.modelId,
                     task: config.task,
                     language: config.language,
                 });
-                setJobId(initialJob.id);
-
-                if (initialJob.status === "completed") {
-                    applyCompletedJob(initialJob, config.presetLabel);
+                if (runIdRef.current !== runId) {
                     return;
                 }
-
-                handleBackendJobUpdate(initialJob);
-                const readyJob = await waitForReady(initialJob);
-
-                if (readyJob.status === "completed") {
-                    applyCompletedJob(readyJob, config.presetLabel);
-                    return;
-                }
-
-                setStatus("loading-audio");
-                const audioUrl = await api.getAudioUrl(readyJob.id);
-                const audioResponse = await fetch(audioUrl);
-                if (!audioResponse.ok) {
-                    throw new Error("Failed to load prepared audio");
-                }
-
-                const audioBuffer = await decodeAudio(
-                    await audioResponse.arrayBuffer(),
-                );
-                const workerTranscript = await runWorkerTranscription(
-                    audioBuffer,
-                    config,
-                    readyJob.filename || undefined,
-                );
-                await persistWorkerTranscript(
-                    readyJob,
-                    config,
-                    workerTranscript,
-                );
+                setJobId(job.id);
+                await transcribePreparedJob(job, config, runId);
             } catch (nextError) {
-                setTranscript((previous) =>
-                    previous ? { ...previous, isBusy: false } : previous,
-                );
-                setError(
-                    nextError instanceof Error
-                        ? nextError.message
-                        : "YouTube preparation failed",
-                );
-                setStatus("failed");
-                setIsBusy(false);
+                if (runIdRef.current !== runId) {
+                    return;
+                }
+                failRun(nextError, "YouTube preparation failed");
             }
         },
-        [
-            applyCompletedJob,
-            ensureBrowserCaps,
-            handleBackendJobUpdate,
-            language,
-            modelStatus,
-            persistWorkerTranscript,
-            presetId,
-            runWorkerTranscription,
-            task,
-            waitForReady,
-        ],
+        [beginRun, claimRun, failRun, transcribePreparedJob],
     );
+
+    /**
+     * The escape hatch. Both entry points are gated on `isBusy` and the
+     * `Transcribe` button is hidden while busy, so a run that never terminates —
+     * a job stranded in `Extracting` with no event coming, say — used to leave
+     * quitting the app as the only way out.
+     *
+     * `claimRun` does the work: it abandons the wait, TERMINATES the worker (which
+     * is what actually stops a Whisper inference — see `useWorker.restart`),
+     * settles the abandoned promises so their frames unwind, and bumps the run
+     * token so anything still in flight lands on a run that no longer owns the UI.
+     *
+     * WHAT THE TOKEN BUYS, precisely — a dead run may still FINISH, but it may not
+     * PAINT. Every point at which one can resume re-checks the token before it
+     * writes to the UI: after `beginRun`, after `create*Job`, after `waitForReady`,
+     * after `decodeAudio`, and — the one that was missing for three rounds — after
+     * `api.persistTranscript`. Worker messages are keyed the same way, by the run
+     * that posted them. Driven directly by the tests in "under an overlap the
+     * worker cannot stop".
+     *
+     * Two things are deliberately NOT guarded, and both are correct: the persist
+     * still writes (below), and `setBrowserCaps` inside `ensureBrowserCaps` writes
+     * unconditionally, because the machine's GPU is a property of the machine and
+     * is the same answer for every run.
+     *
+     * WHAT THIS DOES NOT DO: stop the ffmpeg/yt-dlp child. There is no
+     * `cancel_job` command; Rust owns those and nothing tells them to stop. So
+     * after a cancel the download or the extraction runs to completion, still
+     * holding its `download_semaphore` permit and its `track_download_start()`
+     * count — which means `health()` and `queue_status` keep counting it, and the
+     * next YouTube run can queue behind a job the user has already abandoned. It
+     * eventually clears itself when the child exits. The UI is idle; the machine
+     * is not. That is tolerable ONLY because an abandoned ffmpeg finishes on its
+     * own, in seconds to a minute.
+     *
+     * The diarization sidecar is NOT like that, which is why it is the one child
+     * this does kill: it is a CPU-bound ONNX process with a 30-minute backstop
+     * timeout, so leaving it to "finish on its own" means pinning a core for up to
+     * half an hour behind an idle-looking app. `cancel_diarization` is a no-op for
+     * a job that is not diarizing, and it is fire-and-forget: a cancel that cannot
+     * reach the backend must still clear the UI.
+     *
+     * Nor does it stop a `persistTranscript` already in flight — and cancelling
+     * inside that window is exactly how the last bug was reached, because the app
+     * is `isBusy` while persisting, so the Cancel button is on screen. The persist
+     * is allowed to finish (it writes under its OWN job; the compute is kept and
+     * the content-keyed cache will hit on a re-run) and is stopped only from
+     * repainting. See `persistWorkerTranscript`.
+     */
+    const cancel = useCallback(() => {
+        claimRun();
+        if (jobId) {
+            void api.cancelDiarization(jobId).catch(() => {
+                // Best effort. The UI is being torn down either way, and there is
+                // nothing a user could do with "the cancel request failed".
+            });
+        }
+        setTranscript((previous) =>
+            previous ? { ...previous, isBusy: false } : previous,
+        );
+        setIsBusy(false);
+        setIsModelLoading(false);
+        setProgressItems([]);
+        setProgress(0);
+        setStatus("idle");
+        setError(null);
+    }, [claimRun, jobId]);
 
     const onInputChange = useCallback(() => {
         setTranscript(undefined);
         setError(null);
         setProgress(0);
         setStatus("idle");
+        setDiarizationOutcome(null);
+        setSpeakerNames({});
     }, []);
 
     const capabilityLabel = useMemo(() => {
@@ -680,6 +1319,7 @@ export function useTranscriber(): Transcriber {
             progressItems,
             start: startFromFile,
             startFromYouTube,
+            cancel,
             output: transcript,
             jobId,
             error,
@@ -703,10 +1343,20 @@ export function useTranscriber(): Transcriber {
             selectedModelId,
             presetOptions: MODEL_PRESETS,
             languageOptions: LANGUAGE_OPTIONS,
+            diarizeEnabled,
+            setDiarizeEnabled,
+            numSpeakersHint,
+            setNumSpeakersHint,
+            diarizationOutcome,
+            speakerNames,
+            renameSpeaker,
         }),
         [
             browserCaps,
+            cancel,
             capabilityLabel,
+            diarizeEnabled,
+            diarizationOutcome,
             effectivePresetLabel,
             error,
             isBusy,
@@ -715,12 +1365,15 @@ export function useTranscriber(): Transcriber {
             language,
             modelStatus,
             modelStatusError,
+            numSpeakersHint,
             onInputChange,
             presetId,
             progress,
             progressItems,
+            renameSpeaker,
             selectedModelAvailable,
             selectedModelId,
+            speakerNames,
             startFromFile,
             startFromYouTube,
             status,

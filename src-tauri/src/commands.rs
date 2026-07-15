@@ -1505,6 +1505,36 @@ pub async fn diarize_job(
     let wav_path = prepared_audio_for_job(&job_id, &state, &app)?;
     let opts = diarize_options(num_speakers)?;
 
+    // Cap concurrent ONNX sidecars at `MAX_CONCURRENT_DIARIZATIONS`. Normal use
+    // never contends this -- the frontend's `isBusy` gate allows only one run at
+    // a time -- EXCEPT across a Cancel: `cancel()` clears that gate and fires
+    // `cancel_diarization` as fire-and-forget before the old run's sidecar is
+    // confirmed dead, so a Cancel immediately followed by a new run can have two
+    // `diarize_job` calls alive together, each about to spawn its own
+    // core-pegging child. The permit is held for the rest of this function, so
+    // the second call queues behind the first rather than doubling up on cores.
+    //
+    // Taken AFTER registration (so a queued run is still cancellable) but BEFORE
+    // anything is spawned, matching the "real errors first, degrade after"
+    // shape below: `acquire_owned` only errors if the semaphore is closed, which
+    // this app never does, but a queued run can still be cancelled while it
+    // waits -- checked the moment the permit is granted.
+    let _diarize_permit = match state.diarization_semaphore.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) if cancel.is_cancelled() => return Ok(DiarizationOutcome::Cancelled),
+        Err(e) => {
+            return Ok(DiarizationOutcome::Degraded {
+                reason: format!("could not queue diarization: {e}"),
+            })
+        }
+    };
+    if cancel.is_cancelled() {
+        // Cancelled while queued behind another diarization -- report it as the
+        // user's own cancellation, not a degradation, same as every other
+        // cancellation check in this function.
+        return Ok(DiarizationOutcome::Cancelled);
+    }
+
     // Everything from here on degrades rather than fails. A build with no models
     // (or no sidecar) is a build without speaker labels, not a broken app. That
     // build is reachable: `src-tauri/build.rs` deliberately lets a checkout with
@@ -2080,6 +2110,63 @@ mod tests {
 
         drop(first);
         register(&registry, "job-1", CancelToken::new()).expect("the job is free again");
+    }
+
+    /// **The diarization semaphore actually serializes.**
+    ///
+    /// `diarize_job` is reachable with two DIFFERENT job ids overlapping: Cancel
+    /// clears the frontend's `isBusy` gate and fires `cancel_diarization`
+    /// fire-and-forget before the cancelled run's sidecar is confirmed dead, so a
+    /// Cancel immediately followed by a new run can have two `diarize_job` calls
+    /// alive together (the registry's duplicate check above only refuses a
+    /// SECOND run of the SAME job, which does not apply here). Each would spawn
+    /// its own core-pegging ONNX child without a cap.
+    ///
+    /// This does not stand up a full `AppState`/`State`/`AppHandle` -- there is
+    /// no tauri test harness in this crate, and the other `diarize_job` tests
+    /// exercise its logic at the same seam (`register`, `run_diarization`, ...)
+    /// rather than through the command itself. What is tested here is the
+    /// mechanism `diarize_job` relies on: a `Semaphore::new(1)` (the same
+    /// capacity as `paths::MAX_CONCURRENT_DIARIZATIONS`) genuinely makes a
+    /// second acquire wait for the first permit to be released, rather than
+    /// handing out two permits at once.
+    #[tokio::test]
+    async fn the_diarization_semaphore_serializes_two_overlapping_runs() {
+        assert_eq!(
+            crate::paths::MAX_CONCURRENT_DIARIZATIONS, 1,
+            "this test's capacity-1 premise must match the real cap"
+        );
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            crate::paths::MAX_CONCURRENT_DIARIZATIONS,
+        ));
+
+        // "job-1" takes the only permit, as `diarize_job` would.
+        let first_permit = semaphore.clone().acquire_owned().await.expect("uncontended");
+
+        // "job-2" (Cancel, then a new run) queues behind it instead of getting a
+        // second permit.
+        let contender = semaphore.clone();
+        let mut second_acquire = tokio::spawn(async move { contender.acquire_owned().await });
+
+        // Give the spawned task every chance to (wrongly) complete before the
+        // first permit is released. `now_or_never`-style polling would be
+        // cleaner, but this crate's other async tests do not depend on
+        // `futures`, so a bounded `tokio::time::timeout` says the same thing
+        // without a new dependency: the second acquire must NOT resolve yet.
+        let raced = tokio::time::timeout(std::time::Duration::from_millis(50), &mut second_acquire)
+            .await;
+        assert!(
+            raced.is_err(),
+            "a second acquire must block while the cap's only permit is held"
+        );
+
+        // Releasing the first permit is what lets the second one through.
+        drop(first_permit);
+        let second_permit = second_acquire
+            .await
+            .expect("task did not panic")
+            .expect("semaphore was not closed");
+        drop(second_permit);
     }
 
     // -- the bundle ------------------------------------------------------------

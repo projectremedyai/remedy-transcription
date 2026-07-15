@@ -22,6 +22,11 @@ pub struct AppState {
     /// CPU-bound ONNX child running for up to its 30-minute timeout while the app
     /// showed idle. See `commands::DiarizationRegistry`.
     pub diarizations: commands::DiarizationRegistry,
+    /// Caps how many diarization sidecars can run at once. See
+    /// `paths::MAX_CONCURRENT_DIARIZATIONS` for why one is not always enough of
+    /// a guarantee on its own (Cancel + immediate restart) and why it is still
+    /// the right cap.
+    pub diarization_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -38,6 +43,8 @@ pub fn run() {
             let events = Arc::new(JobEvents::new(app.handle().clone()));
             let download_semaphore =
                 Arc::new(tokio::sync::Semaphore::new(paths::MAX_CONCURRENT_DOWNLOADS));
+            let diarization_semaphore =
+                Arc::new(tokio::sync::Semaphore::new(paths::MAX_CONCURRENT_DIARIZATIONS));
 
             store.cleanup_expired_audio(paths::PREPARED_AUDIO_TTL_HOURS, &paths::audio_dir(&app_data_dir));
 
@@ -46,6 +53,7 @@ pub fn run() {
                 events,
                 download_semaphore,
                 diarizations: Default::default(),
+                diarization_semaphore,
             });
 
             Ok(())

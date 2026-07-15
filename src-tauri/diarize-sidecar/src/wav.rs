@@ -40,6 +40,20 @@ const FORMAT_IEEE_FLOAT: u16 = 3;
 /// SubFormat GUID, 24 bytes into the `fmt ` body.
 const FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
+/// The canonical PCM SubFormat GUID (`00000001-0000-0010-8000-00AA00389B71`,
+/// little-endian byte order), which `WAVE_FORMAT_EXTENSIBLE` uses to mean
+/// "actually PCM". Checking only its first two bytes (the same bytes as the
+/// `FORMAT_PCM` tag) would accept ANY GUID that happens to start `01 00` --
+/// including a custom or malformed one whose remaining 14 bytes name a
+/// completely different encoding. Not reachable from production input (ffmpeg
+/// never emits WAVE_FORMAT_EXTENSIBLE), but a hand-crafted file could carry
+/// one, and the whole point of this module is not waving an unrecognised
+/// encoding through to the decoder on a partial check.
+const PCM_SUBFORMAT_GUID: [u8; 16] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B,
+    0x71,
+];
+
 /// A `fmt ` body is 16, 18, or 40 bytes. Nothing beyond 40 is of any interest.
 const MAX_FMT_BODY: u64 = 40;
 
@@ -98,15 +112,29 @@ fn parse_format<R: Read + Seek>(r: &mut R) -> Result<WavFormat, String> {
 
         if tag == FORMAT_EXTENSIBLE {
             // The tag we were given is a placeholder; the real one lives in the
-            // SubFormat GUID. A 16- or 18-byte body cannot carry one.
-            if body.len() < 26 {
+            // full 16-byte SubFormat GUID, 24 bytes into the body. A 16- or
+            // 18-byte body cannot carry one at all.
+            if body.len() < 24 + 16 {
                 return Err(
                     "the fmt chunk says WAVE_FORMAT_EXTENSIBLE but is too short to carry a \
                      SubFormat GUID"
                         .into(),
                 );
             }
-            tag = u16::from_le_bytes([body[24], body[25]]);
+            let guid: [u8; 16] = body[24..40].try_into().expect("checked len above");
+            // ALL 16 bytes, not just the first two. The first two bytes of the
+            // canonical PCM GUID equal `FORMAT_PCM` itself, so checking only
+            // those would accept any GUID that merely starts the same way --
+            // exactly the silent-reinterpretation hole this module exists to
+            // close.
+            if guid != PCM_SUBFORMAT_GUID {
+                return Err(format!(
+                    "the fmt chunk says WAVE_FORMAT_EXTENSIBLE with SubFormat GUID {guid:02x?}, \
+                     which is not the canonical PCM SubFormat GUID. Convert it first \
+                     (ffmpeg -acodec pcm_s16le -ac 1 -ar 16000)."
+                ));
+            }
+            tag = FORMAT_PCM;
         }
 
         if channels == 0 || sample_rate == 0 {
@@ -272,12 +300,51 @@ mod tests {
         b.extend_from_slice(&22u16.to_le_bytes()); // cbSize
         b.extend_from_slice(&16u16.to_le_bytes()); // valid bits
         b.extend_from_slice(&4u32.to_le_bytes()); // channel mask
-        b.extend_from_slice(&FORMAT_PCM.to_le_bytes()); // SubFormat GUID: PCM
-        b.extend_from_slice(&[0u8; 14]); // ...rest of the GUID
+        b.extend_from_slice(&PCM_SUBFORMAT_GUID); // SubFormat GUID: the full canonical PCM GUID
         b.extend_from_slice(b"data");
         b.extend_from_slice(&0u32.to_le_bytes());
 
         assert_eq!(parse(&b).unwrap().sample_rate, 16_000);
+    }
+
+    /// The other half of the GUID check: a SubFormat whose first two bytes
+    /// match PCM's (`01 00`, the same as `FORMAT_PCM` itself) but whose
+    /// remaining 14 bytes do NOT match the canonical PCM GUID must be
+    /// rejected, not waved through as if the first two bytes were the whole
+    /// story. Before the fix this passed silently -- the parser only ever
+    /// read `body[24..26]`.
+    #[test]
+    fn rejects_extensible_with_a_guid_that_only_looks_like_pcm_at_a_glance() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&60u32.to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&40u32.to_le_bytes()); // extensible body
+        b.extend_from_slice(&FORMAT_EXTENSIBLE.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // channels
+        b.extend_from_slice(&16_000u32.to_le_bytes()); // rate
+        b.extend_from_slice(&32_000u32.to_le_bytes()); // byte rate
+        b.extend_from_slice(&2u16.to_le_bytes()); // block align
+        b.extend_from_slice(&16u16.to_le_bytes()); // bits
+        b.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        b.extend_from_slice(&16u16.to_le_bytes()); // valid bits
+        b.extend_from_slice(&4u32.to_le_bytes()); // channel mask
+        // First two bytes match PCM (`01 00`); the rest is garbage, not the
+        // canonical GUID's `00 00 00 00 10 00 80 00 00 AA 00 38 9B 71`.
+        let mut bogus_guid = PCM_SUBFORMAT_GUID;
+        bogus_guid[15] = 0xFF;
+        b.extend_from_slice(&bogus_guid);
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&0u32.to_le_bytes());
+
+        let err = parse(&b).expect_err(
+            "a SubFormat GUID matching PCM only in its first two bytes must be rejected",
+        );
+        assert!(
+            err.contains("SubFormat GUID"),
+            "should name the reason: {err}"
+        );
     }
 
     #[test]

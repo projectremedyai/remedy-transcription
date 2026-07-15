@@ -175,3 +175,205 @@ describe("the export path formats exactly once", () => {
         expect(JSON.parse(generateJson([]))).toEqual([]);
     });
 });
+
+/**
+ * Speaker labels in exports (Task 11).
+ *
+ * Two conventions were verified against a primary source before writing any of
+ * this, per the brief's explicit warning that the plan's original guess (a
+ * bare "SPEAKER_00:" SRT prefix, a `<v Speaker>` VTT span) was never confirmed:
+ *
+ *   - VTT voice span: https://www.w3.org/TR/webvtt1/#webvtt-cue-voice-span —
+ *     "v" is a cue span start tag that REQUIRES an annotation (the voice's
+ *     name), written inside the opening tag after a space, e.g. the spec's own
+ *     `<v.first.loud Esme>It's a blue apple tree!`. `</v>` MAY be omitted when
+ *     the span is the cue's only content, but is not required to be.
+ *   - SRT/TXT prefix: SRT has no standard at all. whisperX — the reference
+ *     tool for this exact combination (Whisper word timestamps + diarization,
+ *     SPEAKER_NN-style ids) — emits `[SPEAKER_00]: text` (brackets), not a
+ *     bare `SPEAKER_00:` prefix. Confirmed by reading its writer source
+ *     directly (`whisperx/utils.py`, `SubtitlesWriter.iterate_result` and
+ *     `WriteTXT.write_result`, both `prefix = f"[{speaker}]: "`).
+ */
+describe("speaker labels in exports", () => {
+    const speakerCue = (
+        start: number,
+        end: number,
+        text: string,
+        speaker: string,
+    ): ConsolidatedSegment =>
+        ({ start, end, text, speaker } as ConsolidatedSegment);
+
+    const DIARIZED: ConsolidatedSegment[] = [
+        speakerCue(0, 2, "Hello there.", "SPEAKER_00"),
+        speakerCue(2, 4, "Hi, how are you?", "SPEAKER_01"),
+    ];
+
+    const PLAIN: ConsolidatedSegment[] = [cue(0, 2, "Hello there.")];
+
+    describe("with speakers, no display names", () => {
+        it("prefixes SRT cue text with the bracketed raw label", () => {
+            const srt = generateSrt(DIARIZED);
+            expect(cueTextsFrom(srt, false)).toEqual([
+                "[SPEAKER_00]: Hello there.",
+                "[SPEAKER_01]: Hi, how are you?",
+            ]);
+        });
+
+        it("shows the exact diarized SRT output", () => {
+            expect(generateSrt(DIARIZED)).toBe(
+                [
+                    "1",
+                    "00:00:00,000 --> 00:00:02,000",
+                    "[SPEAKER_00]: Hello there.",
+                    "",
+                    "2",
+                    "00:00:02,000 --> 00:00:04,000",
+                    "[SPEAKER_01]: Hi, how are you?",
+                    "",
+                ].join("\n"),
+            );
+        });
+
+        it("wraps VTT cue text in a voice span carrying the raw label", () => {
+            const vtt = generateVtt(DIARIZED);
+            expect(cueTextsFrom(vtt, true)).toEqual([
+                "<v SPEAKER_00>Hello there.</v>",
+                "<v SPEAKER_01>Hi, how are you?</v>",
+            ]);
+        });
+
+        it("shows the exact diarized VTT output", () => {
+            expect(generateVtt(DIARIZED)).toBe(
+                [
+                    "WEBVTT",
+                    "",
+                    "1",
+                    "00:00:00.000 --> 00:00:02.000",
+                    "<v SPEAKER_00>Hello there.</v>",
+                    "",
+                    "2",
+                    "00:00:02.000 --> 00:00:04.000",
+                    "<v SPEAKER_01>Hi, how are you?</v>",
+                    "",
+                ].join("\n"),
+            );
+        });
+
+        it("prefixes each TXT turn with the raw label", () => {
+            expect(generateTxt(DIARIZED)).toBe(
+                "[SPEAKER_00]: Hello there.\n\n[SPEAKER_01]: Hi, how are you?",
+            );
+        });
+
+        it("merges consecutive same-speaker cues into one TXT turn", () => {
+            const sameSpeakerTwice: ConsolidatedSegment[] = [
+                speakerCue(0, 2, "Part one.", "SPEAKER_00"),
+                speakerCue(2, 4, "Part two.", "SPEAKER_00"),
+            ];
+            expect(generateTxt(sameSpeakerTwice)).toBe(
+                "[SPEAKER_00]: Part one. Part two.",
+            );
+        });
+
+        it("emits a `speaker` field per JSON segment, keeping the raw label", () => {
+            const parsed = JSON.parse(generateJson(DIARIZED));
+            expect(parsed.segments[0]).toEqual({
+                start: 0,
+                end: 2,
+                text: "Hello there.",
+                speaker: "SPEAKER_00",
+            });
+            expect(parsed.segments[1].speaker).toBe("SPEAKER_01");
+        });
+
+        it("JSON carries an (empty) top-level speakerNames map when none were given", () => {
+            const parsed = JSON.parse(generateJson(DIARIZED));
+            expect(parsed.speakerNames).toEqual({});
+        });
+    });
+
+    describe("with speakers AND display names", () => {
+        const NAMES = { SPEAKER_00: "Alice", SPEAKER_01: "Bob" };
+
+        it("SRT shows the display name in place of the raw label", () => {
+            expect(generateSrt(DIARIZED, NAMES)).toContain(
+                "[Alice]: Hello there.",
+            );
+            expect(generateSrt(DIARIZED, NAMES)).toContain(
+                "[Bob]: Hi, how are you?",
+            );
+        });
+
+        it("VTT voice span carries the display name", () => {
+            expect(generateVtt(DIARIZED, NAMES)).toContain("<v Alice>");
+            expect(generateVtt(DIARIZED, NAMES)).toContain("<v Bob>");
+        });
+
+        it("TXT turn is prefixed with the display name", () => {
+            expect(generateTxt(DIARIZED, NAMES)).toBe(
+                "[Alice]: Hello there.\n\n[Bob]: Hi, how are you?",
+            );
+        });
+
+        it("an unnamed speaker in a partial map still falls back to its raw label", () => {
+            expect(generateSrt(DIARIZED, { SPEAKER_00: "Alice" })).toContain(
+                "[SPEAKER_01]: Hi, how are you?",
+            );
+        });
+
+        it("JSON keeps the raw `speaker` field AND surfaces the names map separately", () => {
+            const parsed = JSON.parse(generateJson(DIARIZED, NAMES));
+            expect(parsed.segments[0].speaker).toBe("SPEAKER_00");
+            expect(parsed.speakerNames).toEqual(NAMES);
+        });
+    });
+
+    describe("without speakers — byte-identical to today, no markup at all", () => {
+        // The assertion that matters most in this whole file: a legacy or
+        // never-diarized transcript must produce EXACTLY what it always has.
+        // NB: don't assert `.not.toContain(":")` on SRT — the cue timestamp
+        // line ("00:00:00,000 --> ...") is full of colons — assert on the text
+        // line specifically instead.
+        it("SRT text line carries no speaker prefix", () => {
+            const srt = generateSrt(PLAIN);
+            expect(srt).not.toMatch(/^\[.*\]:/m);
+            expect(cueTextsFrom(srt, false)).toEqual(["Hello there."]);
+        });
+
+        it("VTT contains no voice span", () => {
+            expect(generateVtt(PLAIN)).not.toContain("<v");
+        });
+
+        it("TXT carries no speaker prefix", () => {
+            expect(generateTxt(PLAIN)).toBe("Hello there.");
+        });
+
+        it("JSON stays a bare array with no `speaker` key and no wrapper object", () => {
+            const parsed = JSON.parse(generateJson(PLAIN));
+            expect(Array.isArray(parsed)).toBe(true);
+            expect(parsed).toEqual([
+                { start: 0, end: 2, text: "Hello there." },
+            ]);
+        });
+
+        it("passing a names map with no speakers present changes nothing", () => {
+            const names = { SPEAKER_00: "Alice" };
+            expect(generateSrt(PLAIN, names)).toBe(generateSrt(PLAIN));
+            expect(generateVtt(PLAIN, names)).toBe(generateVtt(PLAIN));
+            expect(generateTxt(PLAIN, names)).toBe(generateTxt(PLAIN));
+            expect(generateJson(PLAIN, names)).toBe(generateJson(PLAIN));
+        });
+
+        it("existing no-speaker fixtures (CUES, REPEAT_CUES) stay byte-identical with the new code path", () => {
+            expect(generateSrt(CUES)).not.toMatch(/^\[.*\]:/m);
+            expect(generateVtt(CUES)).not.toContain("<v");
+            expect(JSON.parse(generateJson(CUES))).toEqual(
+                CUES.map((c) => ({ start: c.start, end: c.end, text: c.text })),
+            );
+            expect(generateTxt(REPEAT_CUES)).toBe(
+                "Really chlorophyll absorbs photons chlorophyll absorbs photons you.",
+            );
+        });
+    });
+});

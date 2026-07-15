@@ -1,0 +1,14 @@
+[
+    {
+        "start": 0.0,
+        "end": 1.94,
+        "text": " Hello there and welcome.",
+        "speaker": "SPEAKER_00"
+    },
+    {
+        "start": 3.2,
+        "end": 5.9,
+        "text": " Word-level timing is real now.",
+        "speaker": "SPEAKER_01"
+    }
+]

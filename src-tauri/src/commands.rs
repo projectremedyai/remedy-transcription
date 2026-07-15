@@ -1608,11 +1608,15 @@ pub async fn persist_transcript(
 // renaming a speaker is possible at all once the audio has been cleaned up (see
 // `PREPARED_AUDIO_TTL_HOURS`), which for any transcript older than a day it has.
 //
-// Both commands take a JOB id, because a job id is the only handle the frontend
-// has. `transcript_id_for_job` resolves it to the transcript row the cache
-// itself serves -- so a name given to a speaker today is still attached when the
-// same file is dropped in next week and comes back as a cache hit under a new
-// job id.
+// Names key on the SOURCE, because diarization is a property of the AUDIO: a
+// name given to a speaker today must still be attached when the same file is
+// re-transcribed under a different model preset -- which lands on a different
+// transcript row but the same source. Both commands take a JOB id (the only
+// handle the frontend has) and resolve it with `source_id_for_job`.
+//
+// Speaker ids are stable only within ONE diarization run, so re-diarizing the
+// same audio drops the source's names -- see `Store::persist_transcript`. That
+// clearing is the reason a name can never silently move onto the wrong voice.
 // ---------------------------------------------------------------------------
 
 /// A name, trimmed, or a REFUSAL.
@@ -1645,8 +1649,8 @@ fn validated_speaker_name<'a>(
 
 /// Name a speaker: `SPEAKER_00` -> `"Alice"`. Renaming twice overwrites.
 ///
-/// `Err` means the REQUEST was wrong: an unknown job, a job with no transcript
-/// yet (nothing to attach a name to), a blank key, or a blank name.
+/// `Err` means the REQUEST was wrong: an unknown job, a job whose source was
+/// deleted (nothing to attach a name to), a blank key, or a blank name.
 #[tauri::command]
 pub async fn set_speaker_name(
     job_id: String,
@@ -1656,33 +1660,33 @@ pub async fn set_speaker_name(
 ) -> Result<(), String> {
     let (speaker_key, display_name) = validated_speaker_name(&speaker_key, &display_name)?;
 
-    let transcript_id = state
+    let source_id = state
         .store
-        .transcript_id_for_job(&job_id)
+        .source_id_for_job(&job_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "This job has no transcript to name speakers in".to_string())?;
+        .ok_or_else(|| "This job has no source to name speakers for".to_string())?;
 
     state
         .store
-        .set_speaker_name(transcript_id, speaker_key, display_name)
+        .set_speaker_name(source_id, speaker_key, display_name)
         .map_err(|e| e.to_string())
 }
 
 /// Every name the user has given this job's speakers, keyed by the opaque label
 /// the segments carry: `{"SPEAKER_00": "Alice"}`.
 ///
-/// A job with no transcript, or with no names yet, answers with an EMPTY MAP
-/// rather than an error -- the UI asks this on every load, and "nobody has
-/// renamed anyone" is the normal answer, not a failure. Speakers with no name
+/// A job whose source is gone, or a source with no names yet, answers with an
+/// EMPTY MAP rather than an error -- the UI asks this on every load, and "nobody
+/// has renamed anyone" is the normal answer, not a failure. Speakers with no name
 /// simply have no entry; the caller falls back to the key.
 #[tauri::command]
 pub async fn get_speaker_names(
     job_id: String,
     state: State<'_, AppState>,
 ) -> Result<HashMap<String, String>, String> {
-    let Some(transcript_id) = state
+    let Some(source_id) = state
         .store
-        .transcript_id_for_job(&job_id)
+        .source_id_for_job(&job_id)
         .map_err(|e| e.to_string())?
     else {
         return Ok(HashMap::new());
@@ -1690,7 +1694,7 @@ pub async fn get_speaker_names(
 
     state
         .store
-        .get_speaker_names(transcript_id)
+        .get_speaker_names(source_id)
         .map_err(|e| e.to_string())
 }
 

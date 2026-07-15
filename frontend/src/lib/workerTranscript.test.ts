@@ -10,6 +10,7 @@ import { consolidateSegments } from "./captionFormatter";
 import type { SpeakerTurn } from "./speakerAlignment";
 import type { TranscriptionSegment } from "../services/types";
 import PERSISTED_ROWS_FIXTURE from "./persistedSegments.fixture.json";
+import PERSISTED_CHUNK_ROWS_FIXTURE from "./persistedChunkSegments.fixture.json";
 
 /**
  * Whisper leaves the final chunk's end timestamp NULL. Rendering or persisting
@@ -441,22 +442,15 @@ describe("segmentsForPersistence: a DIARIZED transcript keeps its speakers", () 
             { text: " Word-level timing is real now.", timestamp: [3.2, 5.9] },
         ];
 
+        // THE OTHER CROSS-LANGUAGE PIN. This chunk-granular shape is a SECOND thing
+        // that crosses the wire into `segments_json`, distinct from the
+        // word-granular fixture. `store.rs` deserializes this same file under
+        // `deny_unknown_fields`, so a field added on the chunk path
+        // (`assignSpeakersToSegments`) and forgotten in Rust turns `cargo test` red
+        // here — instead of a legacy transcript silently failing to save at runtime.
         expect(
             segmentsForPersistence({ text: "", chunks }, 6.0, TURNS),
-        ).toEqual([
-            {
-                start: 0,
-                end: 1.94,
-                text: " Hello there and welcome.",
-                speaker: "SPEAKER_00",
-            },
-            {
-                start: 3.2,
-                end: 5.9,
-                text: " Word-level timing is real now.",
-                speaker: "SPEAKER_01",
-            },
-        ]);
+        ).toEqual(PERSISTED_CHUNK_ROWS_FIXTURE);
     });
 });
 

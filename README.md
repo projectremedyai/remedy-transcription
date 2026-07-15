@@ -157,6 +157,58 @@ React webview ←─Tauri IPC─→ Rust core ──spawn──> yt-dlp + ffmpeg
 
 Diarization runs in its own process because ONNX Runtime does not report a corrupt or truncated model as an error — it throws a C++ exception that nothing catches, and the C++ runtime aborts the process (`SIGABRT`). In-process, one bad byte in a model file would take transcription down with it. Out of process, it is a dead child and an error, and the transcript simply arrives without speaker labels.
 
+### Shipped-size cost of speaker diarization
+
+Because sherpa-onnx / ONNX Runtime is linked only into `diarize-sidecar`, not
+into the main app, the main app binary carries none of the cost. Measured on a
+release build, macOS arm64, 2026-07-14 (`lto = true`, `opt-level = "s"`,
+`strip = true`):
+
+| Artifact | Bytes | |
+|---|---|---|
+| `remedy-transcription` (main app) | 6,920,256 | unchanged by diarization — `strings … \| grep -ci onnxruntime` = 0, `cargo tree -p remedy-transcription \| grep sherpa` = nothing |
+| `diarize-sidecar` | 16,333,600 | ~15.6 MiB — links ONNX Runtime (`grep -ci onnxruntime` = 2004) |
+| `sherpa-onnx-pyannote-segmentation-3-0/model.onnx` | 5,992,913 | ~5.7 MB, bundled as a Tauri resource |
+| `wespeaker_en_voxceleb_CAM++.onnx` | 29,292,684 | ~27.9 MB, bundled as a Tauri resource |
+| **Total added to the shipped installer** | **51,619,197** | **≈ +49 MiB (+52 MB)** — sidecar binary + both models; not committed to the repo, but present in every built `.app`/`.msi` |
+
+Both models are bundled into the app as Tauri `resources` (a whole-directory
+resource, not a hand-picked file list — see `src-tauri/build.rs`), so they ship
+inside the installer even though `models/diarization/` is gitignored and never
+committed. `./scripts/fetch-sidecars.sh --models-only` re-fetches them from
+sherpa-onnx's own GitHub releases.
+
+### Accuracy — smoke-tested, not benchmarked
+
+sherpa-onnx's ONNX port of pyannote/WeSpeaker is a different implementation
+from the upstream Python pipeline, and upstream issue #1708 reports it can
+diverge from it; nothing here quantifies that gap into a DER (diarization
+error rate) number, and the following is **not** a DER benchmark.
+
+What has been checked: the sidecar correctly finds 2 speakers with turn
+boundaries within ~50 ms of ground truth on 3 of 4 turns on the committed
+`two_speakers.wav` fixture (macOS `say`, two distinct voices), and separately
+recovers a 2-speaker count exactly on a denser 8-turn fixture when told
+`num_speakers = 2` (see `src-tauri/src/diarize.rs`'s `#[ignore]`d tests, run
+with `cargo test --workspace -- --ignored`). A follow-up spot check with two
+different `say` voices and different sentence content was inconsistent: on a
+32 s, 4-turn "interview" clip, both auto-detect (5 spurious speakers) and
+`num_speakers = 2` (which merged three real turns into one, then hallucinated
+alternation in the last 7 s) missed most of the true turn boundaries; on a
+15 s, 6-turn rapid exchange, auto-detect partially tracked alternation but
+reused inconsistent ids for the same speaker, and `num_speakers = 2` collapsed
+4 of 5 boundaries. In short: accuracy is real but inconsistent, and depends
+on voice pair, turn length, and content — consistent with the upstream issue,
+not a confirmation of any specific error rate.
+
+`say`-generated speech is also cleaner than real recordings (no overlap, no
+background noise, uniform prosody), so a real accuracy claim would need
+several minutes of genuinely recorded, multi-speaker audio with hand-labeled
+ground truth (ideally scored with a real DER tool, e.g. `pyannote.metrics`)
+across a representative sample — none of which exists in this repo. Until
+that exists, the UI should keep treating speaker labels as a best-effort aid,
+not an authoritative transcript feature.
+
 ## License
 
 MIT. See `LICENSE`.

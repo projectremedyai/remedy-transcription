@@ -338,32 +338,11 @@ pub async fn diarize_in_background(
 ///
 /// Holds three paths and a deadline; no models, no runtime, no memory. Every way
 /// the child can go wrong -- including being killed by SIGABRT from deep inside
-/// ONNX Runtime -- arrives here as an ordinary `Err`.
-///
-/// # Wiring this up (five things that are NOT done yet)
-///
-/// 1. **`diarize()` blocks, so it must not be `await`ed on a tokio worker.** It
-///    runs for as long as the engine takes -- minutes on a long file. Calling it
-///    from an `async` Tauri command parks that worker for the whole job and the
-///    app stops answering IPC (including Cancel). Call
-///    [`diarize_in_background`], which does the `spawn_blocking` for you. The
-///    signature is arranged so that this is also the *easy* path.
-/// 2. **Hold the [`CancelToken`] where the cancel command can reach it.** Today
-///    Cancel is frontend-only (`AudioManager.tsx` says so) and an abandoned
-///    ffmpeg simply finishes. Diarization is not like that: an abandoned run is a
-///    CPU-bound ONNX child pinning a core for up to [`DEFAULT_TIMEOUT`] (30
-///    minutes) while the app shows idle. Clone the token into the job map before
-///    starting, and call `cancel()` from `cancel_job`.
-/// 3. **The models are not bundled.** They are not in `tauri.conf.json`'s
-///    `resources`, and the only path resolution that exists anywhere is a
-///    repo-relative `../models/diarization` in this file's `#[ignore]`d tests --
-///    which does not exist inside a packaged `.app`. Add them to `resources` and
-///    resolve them with `app.path().resolve(.., BaseDirectory::Resource)`.
-/// 4. **The sidecar executable** is declared in `externalBin`, so Tauri stages
-///    it next to the main binary and signs it. Resolve it from the `AppHandle`
-///    rather than hardcoding a path; do not assume the dev-tree layout.
-/// 5. **`Ok(vec![])` is a success.** Silence and zero-length audio have no turns.
-///    Do not treat empty as failure, and do not divide by the turn count.
+/// ONNX Runtime -- arrives here as an ordinary `Err`. Callers run it via
+/// [`diarize_in_background`] (`spawn_blocking`, so it never parks a tokio
+/// worker), with a [`CancelToken`] registered in the job map before the sidecar
+/// starts, models and sidecar resolved from the packaged app's resource/exe
+/// dirs, and `Ok(vec![])` treated as a real success (silence has no turns).
 pub struct SidecarDiarizer {
     exe: PathBuf,
     segmentation_model: PathBuf,

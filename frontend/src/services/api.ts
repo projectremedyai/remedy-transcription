@@ -201,12 +201,19 @@ class TauriApiClient {
      * `captions` must be the output of `consolidateSegments` — the very cues on
      * screen. The `ConsolidatedSegment` brand makes that a compile-time
      * requirement: raw model segments will not typecheck here.
+     *
+     * `names` is optional and threaded straight through to the generators
+     * (`srtGenerator.ts`) unchanged — see their doc comments for what each
+     * format does with it. Omitting it must reproduce today's undiarized
+     * output exactly; passing it is what makes a renamed speaker actually show
+     * up in an exported file (see final-review.md, B1).
      */
     async exportTranscript(
         jobId: string,
         format: "srt" | "vtt" | "txt" | "json",
         captions: ConsolidatedSegment[],
         suggestedName: string,
+        names?: SpeakerNames,
     ): Promise<string | null> {
         const filters = {
             srt: { name: "SubRip Subtitle", extensions: ["srt"] },
@@ -229,7 +236,7 @@ class TauriApiClient {
             txt: generateTxt,
             json: generateJson,
         };
-        const content = generators[format](captions);
+        const content = generators[format](captions, names);
 
         await invoke("export_transcript", {
             request: {

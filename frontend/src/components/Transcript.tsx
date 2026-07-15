@@ -216,6 +216,7 @@ export default function Transcript({
                 format,
                 cues,
                 getBaseName(),
+                names,
             );
         } catch (err) {
             console.error("Export failed:", err);

@@ -93,7 +93,7 @@ npm run frontend:build
 npm --prefix frontend run lint
 npm --prefix frontend test
 
-# --skip-models: the diarization models are 34 MB and only the #[ignore]d
+# --skip-models: the diarization models are 34 MiB and only the #[ignore]d
 # real-model tests touch them, so CI would be downloading them for nothing.
 # This is safe ONLY because a missing models/ directory is a warning, not a
 # build failure — see build.rs. It did not used to be.
@@ -109,7 +109,7 @@ cargo test  --workspace --manifest-path src-tauri/Cargo.toml
 
 Both sidecar steps run in CI, not only during release packaging, because Tauri validates the configured `externalBin` entries during `cargo check` and `cargo test` — a missing sidecar fails the build before a single test runs.
 
-The models are the one bundled asset that `cargo check` tolerates being absent, and that is a deliberate, load-bearing exception rather than an accident: `build.rs` creates an empty `models/diarization` so `tauri-build` has a resource path to walk. If you ever move the models back to a per-file `bundle.resources` map (or a glob — an empty glob is a `GlobPathNotFound` error), CI breaks on a fresh clone and so does every `cargo check` without a 34 MB download.
+The models are the one bundled asset that `cargo check` tolerates being absent, and that is a deliberate, load-bearing exception rather than an accident: `build.rs` creates an empty `models/diarization` so `tauri-build` has a resource path to walk. If you ever move the models back to a per-file `bundle.resources` map (or a glob — an empty glob is a `GlobPathNotFound` error), CI breaks on a fresh clone and so does every `cargo check` without a 34 MiB download.
 
 `--workspace` matters: `diarize-sidecar` is a separate workspace member, and the app's crash-isolation tests spawn the real binary. Without it, those tests have nothing to point at.
 
@@ -168,8 +168,8 @@ release build, macOS arm64, 2026-07-14 (`lto = true`, `opt-level = "s"`,
 |---|---|---|
 | `remedy-transcription` (main app) | 6,920,256 | unchanged by diarization — `strings … \| grep -ci onnxruntime` = 0, `cargo tree -p remedy-transcription \| grep sherpa` = nothing |
 | `diarize-sidecar` | 16,333,600 | ~15.6 MiB — links ONNX Runtime (`grep -ci onnxruntime` = 2004) |
-| `sherpa-onnx-pyannote-segmentation-3-0/model.onnx` | 5,992,913 | ~5.7 MB, bundled as a Tauri resource |
-| `wespeaker_en_voxceleb_CAM++.onnx` | 29,292,684 | ~27.9 MB, bundled as a Tauri resource |
+| `sherpa-onnx-pyannote-segmentation-3-0/model.onnx` | 5,992,913 | ~5.7 MiB, bundled as a Tauri resource |
+| `wespeaker_en_voxceleb_CAM++.onnx` | 29,292,684 | ~27.9 MiB, bundled as a Tauri resource |
 | **Total added to the shipped installer** | **51,619,197** | **≈ +49 MiB (+52 MB)** — sidecar binary + both models; not committed to the repo, but present in every built `.app`/`.msi` |
 
 Both models are bundled into the app as Tauri `resources` (a whole-directory

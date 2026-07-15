@@ -11,7 +11,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ConsolidatedSegment } from "../lib/captionFormatter";
-import type { DiarizationOutcome, SpeakerNames } from "../services/api";
+import { api, DiarizationOutcome, SpeakerNames } from "../services/api";
 import type { TranscriberData } from "../hooks/useTranscriber";
 
 vi.mock("../services/api", () => ({
@@ -296,5 +296,33 @@ describe("Transcript: each DiarizationOutcome arm renders distinctly", () => {
         const banner = screen.getByTestId("diarization-status");
         expect(banner.getAttribute("data-status")).toBe("succeeded");
         expect(banner.textContent).toContain("2 speakers");
+    });
+});
+
+describe("Transcript export wiring (final-review.md B1)", () => {
+    // Task 10/11 made the generators name-aware, but nothing forced the
+    // export call site to actually pass the names map through. Assert on
+    // the wiring at the boundary: `runExport` must hand `speakerNames` to
+    // `api.exportTranscript`, not drop it.
+    it("passes the speakerNames map through to api.exportTranscript on export", async () => {
+        const names: SpeakerNames = { SPEAKER_00: "Alice" };
+        const data = transcriptWith([cue(0, 2, "Hello there.", "SPEAKER_00")]);
+        render(
+            <Transcript
+                transcribedData={data}
+                jobId='job-1'
+                speakerNames={names}
+            />,
+        );
+
+        fireEvent.click(screen.getByText("Export SRT"));
+
+        expect(api.exportTranscript).toHaveBeenCalledWith(
+            "job-1",
+            "srt",
+            expect.any(Array),
+            expect.any(String),
+            names,
+        );
     });
 });

@@ -142,8 +142,9 @@ export type DiarizationOutcome =
            * turns. Do not treat `[]` as a failure, and do not divide by
            * `speaker_count`.
            *
-           * Speaker ids are DENSE (`0..speaker_count`) — Rust remaps the engine's
-           * sparse ids at the boundary, so `speaker` is a valid index.
+           * Rust remaps the engine's sparse ids at the boundary, so the ids are
+           * dense (0..n-1), but treat the value as an opaque label; do not index
+           * arrays with it.
            */
           turns: SpeakerTurn[];
           speaker_count: number;

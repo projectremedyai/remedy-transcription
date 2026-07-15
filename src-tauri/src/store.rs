@@ -616,19 +616,34 @@ impl Store {
         // same audio with a different speaker count and `SPEAKER_00` may become a
         // different person — so a name the user gave the old `SPEAKER_00` would
         // silently move onto the wrong voice, which is the one genuinely bad
-        // outcome. When a NEW diarization outcome is persisted for this source, its
-        // names are dropped: making the user re-enter a name is strictly better
-        // than pinning it to a stranger.
+        // outcome. When a diarization run is RE-CLUSTERED, the source's names are
+        // dropped: making the user re-enter a name is strictly better than pinning
+        // it to a stranger.
         //
-        // "New" is told from a mere re-persist by the SPEAKER SIGNATURE — the
-        // ordered per-segment speaker labels for this recipe. Diarization can land
-        // after the first text-only save and get written a second time; an
-        // idempotent re-persist of that same run has an identical signature and
-        // must NOT wipe names (the report's `naming survives a re-persist`). Only a
-        // signature that actually changed is a new run. A first-ever labelling
-        // (was none, now some) also counts as new — but no name can exist yet, so
-        // that clear is a no-op. Pinned both ways: `naming_survives_a_re_persist_of
-        // _the_same_diarization_run` and `a_new_diarization_run_clears_the_names`.
+        // A re-diarization re-persists the SAME recipe — you re-cluster the audio
+        // you are already looking at — so "did this run change?" is asked against
+        // THIS recipe's stored per-segment labels. Three cases, one clears:
+        //
+        //   * previous had speakers, incoming differs  -> a genuine re-cluster of
+        //     an already-diarized recipe. CLEAR.
+        //     (`a_new_diarization_run_clears_the_names`)
+        //   * previous had speakers, incoming identical -> an idempotent re-persist
+        //     of the same run (diarization can land twice). KEEP.
+        //     (`naming_survives_a_re_persist_of_the_same_diarization_run`)
+        //   * previous had NO speaker — a fresh recipe's FIRST labelling, e.g. the
+        //     same file re-transcribed under a different model preset — is NOT a
+        //     re-cluster of anything. KEEP: the names belong to the SOURCE and may
+        //     have been given under another recipe whose run never changed. Wiping
+        //     them here was the bug.
+        //     (`names_survive_a_re_transcribe_and_re_diarize_under_a_different_model`)
+        //
+        // The DELETE is source-scoped because the names are; the COMPARISON is
+        // per-recipe because a per-segment label sequence is coupled to the
+        // transcription model's own segmentation, so it is only meaningful within
+        // ONE recipe (model B labels the same audio with a different sequence than
+        // model A even when the diarization is identical). `previous_was_diarized`
+        // is what stops a fresh recipe's first labelling from reading as a
+        // source-wide re-cluster.
         let previous_speakers: Vec<Option<String>> = conn
             .query_row(
                 "SELECT segments_json FROM transcripts
@@ -641,8 +656,10 @@ impl Store {
             .unwrap_or_default();
         let incoming_speakers: Vec<Option<String>> =
             segments.iter().map(|s| s.speaker.clone()).collect();
-        let is_new_diarization_run = segments.iter().any(|s| s.speaker.is_some())
-            && incoming_speakers != previous_speakers;
+        let previous_was_diarized = previous_speakers.iter().any(|s| s.is_some());
+        let incoming_is_diarized = incoming_speakers.iter().any(|s| s.is_some());
+        let is_new_diarization_run =
+            incoming_is_diarized && previous_was_diarized && incoming_speakers != previous_speakers;
 
         let segments_json = serde_json::to_string(segments)?;
 
@@ -1687,6 +1704,106 @@ mod tests {
             "a new diarization run must clear the source's names — SPEAKER_00 may \
              now be a different voice"
         );
+    }
+
+    /// **The cross-recipe KEEP — the bug this fix closes.**
+    ///
+    /// Names live on the SOURCE, and switching model presets on the same audio is
+    /// a supported, first-class workflow. Diarize under model A, name the
+    /// speakers, then re-transcribe AND re-diarize the SAME source under model B.
+    /// Model B's diarization is the FIRST diarization of model B's recipe — not a
+    /// re-cluster of anything — so it must not disturb the names, even though its
+    /// per-segment labels differ from model A's (a different transcription model
+    /// segments the audio differently).
+    ///
+    /// The old code compared model B's incoming labels against model B's OWN
+    /// recipe (which had none) and, seeing real speakers where there had been
+    /// none, wiped the whole SOURCE's names — model A's included, though model A's
+    /// run never changed. This test failed against that code.
+    #[test]
+    fn names_survive_a_re_transcribe_and_re_diarize_under_a_different_model() {
+        let (temp, source_id) = store_with_source();
+        const MODEL_A: &str = "onnx-community/whisper-base_timestamped";
+        const MODEL_B: &str = "onnx-community/whisper-large-v3-turbo_timestamped";
+
+        // 1. Diarize under model A and name both speakers of the source.
+        write_segments(&temp.store, source_id, MODEL_A, "hello", &diarized_rows());
+        temp.store
+            .set_speaker_name(source_id, "SPEAKER_00", "Alice")
+            .expect("name SPEAKER_00");
+        temp.store
+            .set_speaker_name(source_id, "SPEAKER_01", "Bob")
+            .expect("name SPEAKER_01");
+
+        // 2. Re-transcribe the SAME source under model B — a brand new job on a
+        //    different recipe. The text-only save lands FIRST (diarization has not
+        //    run for B yet)...
+        let job_b = temp
+            .store
+            .create_pending_job(
+                source_id,
+                SourceType::File,
+                "sha256",
+                JobStatus::Ready,
+                Some("lecture.mp3"),
+                Some("audio/mpeg"),
+                MODEL_B,
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("create job for model B");
+        temp.store
+            .persist_transcript(
+                &job_b.id,
+                MODEL_B,
+                TaskType::Transcribe,
+                "english",
+                "hello",
+                &[TranscriptionSegment {
+                    start: 0.0,
+                    end: 3.0,
+                    text: " Hello there.".to_string(),
+                    speaker: None,
+                }],
+            )
+            .expect("text-only persist for model B");
+
+        // ...then B's own diarization lands as a SECOND persist for B's recipe.
+        // Real speakers, but a different per-segment sequence than A produced.
+        let b_diarized = vec![
+            TranscriptionSegment {
+                start: 0.0,
+                end: 3.0,
+                text: " Hello there.".to_string(),
+                speaker: Some("SPEAKER_00".to_string()),
+            },
+            TranscriptionSegment {
+                start: 3.0,
+                end: 6.0,
+                text: " Welcome.".to_string(),
+                speaker: Some("SPEAKER_01".to_string()),
+            },
+        ];
+        temp.store
+            .persist_transcript(
+                &job_b.id,
+                MODEL_B,
+                TaskType::Transcribe,
+                "english",
+                "hello",
+                &b_diarized,
+            )
+            .expect("diarized persist for model B");
+
+        // 3. The names given against model A must SURVIVE model B's diarization.
+        let names = temp.store.get_speaker_names(source_id).expect("names");
+        assert_eq!(
+            names.get("SPEAKER_00"),
+            Some(&"Alice".to_string()),
+            "re-transcribing + re-diarizing under a different model preset must \
+             not wipe the source's names — model A's run never changed"
+        );
+        assert_eq!(names.get("SPEAKER_01"), Some(&"Bob".to_string()));
     }
 
     /// **Names attach to the SOURCE, not the job or the transcript.**

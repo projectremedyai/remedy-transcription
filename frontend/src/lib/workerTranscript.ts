@@ -165,15 +165,27 @@ function rowFromToken(word: WordToken): TranscriptionSegment {
 /**
  * Worker output -> the cues the UI renders and the exporters serialize. This is
  * the display path's single call to `consolidateSegments`, on RAW chunks.
+ *
+ * `turns` is diarization's answer, threaded straight through to
+ * `consolidateSegments` — this is the ONLY thing that decides whether a live
+ * transcript shows speakers. Before this parameter existed, every production
+ * caller passed nothing, so `consolidateSegments`'s speaker-aware cue splitting
+ * was reachable only from a direct test call: a live diarized run rendered
+ * exactly like an undiarized one, regardless of what `diarize_job` returned.
+ * Omit it (or pass `[]`, a real success for silence) and this behaves exactly
+ * as it always has — that is what keeps an undiarized transcript byte-for-byte
+ * unchanged.
  */
 export function consolidateWorkerTranscript(
     workerTranscript: WorkerTranscript,
     audioDuration: number | null,
     options: { hideTrailingShortCaption?: boolean } = {},
+    turns?: readonly SpeakerTurn[],
 ): { text: string; chunks: ConsolidatedSegment[] } {
     const chunks = consolidateSegments(
         segmentsFromWorkerChunks(workerTranscript.chunks, audioDuration),
         workerTranscript.words,
+        turns,
     );
     const displayChunks =
         options.hideTrailingShortCaption &&

@@ -27,6 +27,9 @@ const mocks = vi.hoisted(() => ({
     subscribeToProgress: vi.fn(),
     unsubscribe: vi.fn(),
     cancelDiarization: vi.fn(),
+    diarizeJob: vi.fn(),
+    setSpeakerName: vi.fn(),
+    getSpeakerNames: vi.fn(),
 }));
 
 /**
@@ -55,6 +58,9 @@ vi.mock("../services/api", () => ({
         getModelStatus: mocks.getModelStatus,
         subscribeToProgress: mocks.subscribeToProgress,
         cancelDiarization: mocks.cancelDiarization,
+        diarizeJob: mocks.diarizeJob,
+        setSpeakerName: mocks.setSpeakerName,
+        getSpeakerNames: mocks.getSpeakerNames,
     },
 }));
 
@@ -161,6 +167,10 @@ beforeEach(() => {
     });
     mocks.getAudioUrl.mockResolvedValue("asset://localhost/audio.wav");
     mocks.cancelDiarization.mockResolvedValue(false);
+    // Not called unless a test flips `diarizeEnabled` on — see the diarization
+    // describe block below, which sets its own resolved values per case.
+    mocks.getSpeakerNames.mockResolvedValue({});
+    mocks.setSpeakerName.mockResolvedValue(undefined);
     mocks.persistTranscript.mockImplementation(async (jobId: string) =>
         makeJob({ id: jobId, status: "completed", progress: 1 }),
     );
@@ -983,5 +993,345 @@ describe("useTranscriber under an overlap the worker cannot stop", () => {
         expect(result.current.output?.text).toBe("the cached transcript");
         expect(mocks.getAudioUrl).not.toHaveBeenCalled();
         expect(mocks.postMessage).not.toHaveBeenCalled();
+    });
+});
+
+/**
+ * Task 12: the toggle, the join, and the three-arm outcome actually reaching a
+ * caller — the wiring nothing in the frontend did before this task. Every test
+ * here drives the hook end to end (a real `start`, a real worker `complete`);
+ * none of them call `consolidateSegments` or `assignSpeakers` directly, because
+ * the property under test is that THIS hook calls them, not that they work.
+ */
+describe("useTranscriber's diarization wiring", () => {
+    function readyFile(jobId = "job-1") {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: jobId, status: "ready", progress: 1 }),
+        );
+    }
+
+    it("does not call diarizeJob when the toggle is off, and renders exactly as before", async () => {
+        readyFile();
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+        await settle();
+
+        expect(mocks.diarizeJob).not.toHaveBeenCalled();
+        // `null`, not any DiarizationOutcome -- "never ran" is its own state,
+        // distinct from all three arms of the union.
+        expect(result.current.diarizationOutcome).toBeNull();
+        expect(
+            result.current.output?.chunks.every(
+                (chunk) => chunk.speaker === undefined,
+            ),
+        ).toBe(true);
+    });
+
+    it("kicks off diarizeJob once the canonical WAV is ready, with the numSpeakers hint", async () => {
+        readyFile();
+        mocks.diarizeJob.mockResolvedValue({
+            status: "succeeded",
+            turns: [],
+            speaker_count: 0,
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        // `readyJob.status === "ready"` here (see `readyFile`), so this fires
+        // before the worker has produced anything -- the WAV exists, the
+        // transcript does not.
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+    });
+
+    it("passes the optional speaker-count hint through, and omits it (auto-detect) when unset", async () => {
+        readyFile();
+        mocks.diarizeJob.mockResolvedValue({
+            status: "succeeded",
+            turns: [],
+            speaker_count: 0,
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(4);
+        });
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", 4);
+    });
+
+    /**
+     * The join. Diarization was kicked off concurrently with the worker
+     * transcription (previous test), so by the time `complete` arrives the
+     * outcome may or may not be in yet — `persistWorkerTranscript` awaits it.
+     * This pins BOTH halves of hard constraint 3: the turns reach the
+     * PERSISTED segments (what a reload will show) and the LIVE pre-persist
+     * display (what the user sees before the persist round-trip, which writes
+     * one row per segment, finishes).
+     */
+    it("threads a succeeded outcome's turns into the persisted segments and the live pre-persist display", async () => {
+        readyFile();
+        mocks.diarizeJob.mockResolvedValue({
+            status: "succeeded",
+            turns: [{ start: 0, end: 5, speaker: 0 }],
+            speaker_count: 1,
+        });
+        // Slow enough to inspect the LIVE display before the persisted rows
+        // come back.
+        mocks.persistTranscript.mockImplementation(async (jobId: string) => {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            return makeJob({ id: jobId, status: "completed", progress: 1 });
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+
+        // The join already happened (diarizeJob resolves in a microtask, well
+        // inside the ticks `emitFromWorker` flushes); the 1s persist has not.
+        expect(result.current.status).toBe("persisting");
+        expect(result.current.output?.chunks.length).toBeGreaterThan(0);
+        expect(
+            result.current.output?.chunks.every(
+                (chunk) => chunk.speaker === "SPEAKER_00",
+            ),
+        ).toBe(true);
+
+        await tick(1000);
+
+        expect(mocks.persistTranscript).toHaveBeenCalledTimes(1);
+        const segments = mocks.persistTranscript.mock.calls[0][1]
+            .segments as Array<{ speaker?: string }>;
+        expect(segments.length).toBeGreaterThan(0);
+        expect(
+            segments.every((segment) => segment.speaker === "SPEAKER_00"),
+        ).toBe(true);
+
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "succeeded",
+            turns: [{ start: 0, end: 5, speaker: 0 }],
+            speaker_count: 1,
+        });
+    });
+
+    it("surfaces a degraded outcome, and never fails the transcript over it", async () => {
+        readyFile();
+        mocks.diarizeJob.mockResolvedValue({
+            status: "degraded",
+            reason: "the segmentation model is not installed",
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+        await settle();
+
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "degraded",
+            reason: "the segmentation model is not installed",
+        });
+        // The governing rule: diarization failure must never fail transcription.
+        expect(result.current.status).toBe("completed");
+        expect(result.current.error).toBeNull();
+        expect(
+            result.current.output?.chunks.every(
+                (chunk) => chunk.speaker === undefined,
+            ),
+        ).toBe(true);
+    });
+
+    it("surfaces a cancelled outcome distinctly from degraded", async () => {
+        readyFile();
+        mocks.diarizeJob.mockResolvedValue({ status: "cancelled" });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+        await settle();
+
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "cancelled",
+        });
+        expect(result.current.diarizationOutcome?.status).not.toBe("degraded");
+    });
+
+    it("keeps a real empty-turn success distinct from off, degraded and cancelled", async () => {
+        readyFile();
+        mocks.diarizeJob.mockResolvedValue({
+            status: "succeeded",
+            turns: [],
+            speaker_count: 0,
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+        await settle();
+
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "succeeded",
+            turns: [],
+            speaker_count: 0,
+        });
+    });
+
+    /**
+     * A malformed REQUEST (unknown job, or — the realistic case — a cache hit
+     * whose prepared WAV has already aged out) is a REJECTED promise, not one
+     * of the three `DiarizationOutcome` arms. Swallowed, it is exactly as
+     * invisible a failure as an unhandled `"degraded"`, so it is folded into
+     * one for display rather than silently producing an unlabelled transcript
+     * with no explanation at all.
+     */
+    it("folds a diarizeJob rejection into a visible degraded outcome", async () => {
+        readyFile();
+        mocks.diarizeJob.mockRejectedValue(
+            new Error("Prepared audio not found"),
+        );
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+        await settle();
+
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "degraded",
+            reason: "Prepared audio not found",
+        });
+        expect(result.current.status).toBe("completed");
+    });
+
+    /**
+     * Constraint 6: legacy (no-word-timings) and cache-hit transcripts still
+     * diarize. A cache hit's segments carry no `speaker` field yet, so this is
+     * the one case where `applyCompletedJob` is handed turns explicitly rather
+     * than reading a label already baked into the rows.
+     */
+    it("diarizes a cache-hit job too, without waiting on word timings that do not exist", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({
+                id: "job-1",
+                status: "completed",
+                progress: 1,
+                cache_hit: true,
+                full_text: "Hello there and welcome.",
+                segments: [
+                    { start: 0, end: 2, text: "Hello there and welcome." },
+                ],
+            }),
+        );
+        mocks.diarizeJob.mockResolvedValue({
+            status: "succeeded",
+            turns: [{ start: 0, end: 2, speaker: 0 }],
+            speaker_count: 1,
+        });
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+        });
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+        expect(result.current.status).toBe("completed");
+        expect(
+            result.current.output?.chunks.some(
+                (chunk) => chunk.speaker === "SPEAKER_00",
+            ),
+        ).toBe(true);
+    });
+
+    it("renameSpeaker writes through api.setSpeakerName and refreshes speakerNames", async () => {
+        readyFile();
+        mocks.getSpeakerNames
+            .mockResolvedValueOnce({})
+            .mockResolvedValueOnce({ SPEAKER_00: "Alice" });
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+        await settle();
+
+        expect(result.current.jobId).toBe("job-1");
+        // The fetch `applyCompletedJob` fires on completion, independent of the
+        // toggle -- a speaker named in an earlier session must still show up.
+        expect(mocks.getSpeakerNames).toHaveBeenCalledWith("job-1");
+
+        await act(async () => {
+            await result.current.renameSpeaker("SPEAKER_00", "Alice");
+        });
+
+        expect(mocks.setSpeakerName).toHaveBeenCalledWith(
+            "job-1",
+            "SPEAKER_00",
+            "Alice",
+        );
+        expect(mocks.getSpeakerNames).toHaveBeenCalledTimes(2);
+        expect(result.current.speakerNames).toEqual({ SPEAKER_00: "Alice" });
+    });
+
+    it("does not rename anything when no job is known yet", async () => {
+        const { result } = await renderTranscriber();
+
+        await act(async () => {
+            await result.current.renameSpeaker("SPEAKER_00", "Alice");
+        });
+
+        expect(mocks.setSpeakerName).not.toHaveBeenCalled();
     });
 });

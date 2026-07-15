@@ -22,11 +22,14 @@ import {
     consolidateWorkerTranscript,
     segmentsForPersistence,
 } from "../lib/workerTranscript";
+import type { SpeakerTurn } from "../lib/speakerAlignment";
 import {
     api,
+    DiarizationOutcome,
     Job,
     ModelStatusResponse,
     PersistTranscriptRequest,
+    SpeakerNames,
 } from "../services/api";
 
 interface ProgressItem {
@@ -122,6 +125,40 @@ export interface Transcriber {
     selectedModelId: string | null;
     presetOptions: typeof MODEL_PRESETS;
     languageOptions: typeof LANGUAGE_OPTIONS;
+    /**
+     * Speaker detection is OPT-IN per job, default OFF: it costs real time (a
+     * second CPU-bound child alongside Whisper) and most single-speaker content
+     * has nothing for it to label. Read at the moment a run STARTS — flipping it
+     * mid-run does not retroactively diarize or un-diarize the run in flight.
+     */
+    diarizeEnabled: boolean;
+    setDiarizeEnabled: (enabled: boolean) => void;
+    /**
+     * "I know there are N speakers" — a HINT passed as `DiarizeOptions.num_speakers`,
+     * not a guarantee: sherpa-onnx's own reference case shows asking for 4 can
+     * still return 3. `undefined` means auto-detect, which is the default and is
+     * NOT uniformly worse than a supplied count — do not coerce this to a number
+     * before the user has actually set one.
+     */
+    numSpeakersHint: number | undefined;
+    setNumSpeakersHint: (value: number | undefined) => void;
+    /**
+     * What the most recent `diarize_job` call answered, for THIS run —
+     * `null` when the toggle was off, or no run has completed yet. The three
+     * arms of {@link DiarizationOutcome} are handled, not collapsed: a
+     * `"degraded"` run and a `"succeeded"` run that happened to find nobody both
+     * end up with no speaker labels on screen, and this is the only thing that
+     * lets a caller tell those apart and say so.
+     */
+    diarizationOutcome: DiarizationOutcome | null;
+    /** Every speaker name set for the current job's source, keyed by its opaque label. */
+    speakerNames: SpeakerNames;
+    /**
+     * Rename a speaker for the current job. A metadata write — it does not
+     * re-transcribe or re-diarize — and `speakerNames` reflects it once the
+     * write and the subsequent re-fetch both land.
+     */
+    renameSpeaker: (speakerKey: string, displayName: string) => Promise<void>;
 }
 
 type PendingWorker = {
@@ -184,6 +221,13 @@ export function useTranscriber(): Transcriber {
     const [modelStatusError, setModelStatusError] = useState<string | null>(
         null,
     );
+    const [diarizeEnabled, setDiarizeEnabled] = useState(false);
+    const [numSpeakersHint, setNumSpeakersHint] = useState<number | undefined>(
+        undefined,
+    );
+    const [diarizationOutcome, setDiarizationOutcome] =
+        useState<DiarizationOutcome | null>(null);
+    const [speakerNames, setSpeakerNames] = useState<SpeakerNames>({});
 
     const pendingWorkerRef = useRef<PendingWorker | null>(null);
 
@@ -432,25 +476,117 @@ export function useTranscriber(): Transcriber {
         );
     }, [modelStatus, selectedModelId]);
 
-    const applyCompletedJob = useCallback((job: Job, modelLabel: string) => {
-        setTranscript({
-            isBusy: false,
-            text: job.full_text || "",
-            // The database stores RAW model segments as the source of truth, so a
-            // formatter improvement retroactively improves old transcripts. They
-            // must be consolidated on read, or the transcript at rest is one that
-            // never went through the formatter.
-            chunks: consolidateSegments(job.segments),
-            filename: job.filename || undefined,
-            persisted: true,
-            modelLabel,
-        });
-        setJobId(job.id);
-        setProgress(1);
-        setStatus("completed");
-        setError(null);
-        setIsBusy(false);
+    /**
+     * Every name given to the current job's speakers. Best-effort: a failed fetch
+     * leaves `speakerNames` at whatever it already was (usually `{}`, the normal
+     * "nobody has renamed anyone" case), which renders every speaker as its own
+     * opaque label — a safe fallback, and not an error worth surfacing.
+     */
+    const refreshSpeakerNames = useCallback(async (targetJobId: string) => {
+        try {
+            const names = await api.getSpeakerNames(targetJobId);
+            setSpeakerNames(names);
+        } catch {
+            // See above.
+        }
     }, []);
+
+    /**
+     * `SPEAKER_00` -> `"Alice"`, for the current job. A metadata write —
+     * `api.setSpeakerName` does not re-transcribe or re-diarize — so the only
+     * thing this does afterward is re-fetch the map that write landed in, which
+     * is what makes `speakerNames` reflect it.
+     */
+    const renameSpeaker = useCallback(
+        async (speakerKey: string, displayName: string) => {
+            if (!jobId) {
+                return;
+            }
+            await api.setSpeakerName(jobId, speakerKey, displayName);
+            await refreshSpeakerNames(jobId);
+        },
+        [jobId, refreshSpeakerNames],
+    );
+
+    /**
+     * Kick off diarization for a job's already-prepared audio, if the toggle is
+     * on, and resolve the turns to align against.
+     *
+     * Resolves `undefined` in three cases that a caller must NOT conflate:
+     * the toggle was off (no `diarizationOutcome` write at all — nothing ran);
+     * the sidecar answered `"succeeded"` with an empty turn list (a real
+     * success — silence, or one speaker); or it answered `"degraded"` /
+     * `"cancelled"`. `setDiarizationOutcome` is the one place that distinction
+     * survives, which is what lets the UI show each of those three differently
+     * rather than rendering all of them as the same unlabelled transcript.
+     *
+     * `api.diarizeJob` REJECTS only when the request itself was wrong — an
+     * unknown job, no prepared audio (a cache hit whose WAV has aged out is the
+     * realistic case), or an impossible `numSpeakers`. That is not one of the
+     * three outcomes `DiarizationOutcome` models, but it is exactly as invisible
+     * a failure if swallowed, so it is folded into `"degraded"` for display: the
+     * user does not care whether the sidecar crashed or the request that reached
+     * it never had a chance to, only that speaker labels did not happen and why.
+     */
+    const diarizeAudio = useCallback(
+        async (targetJobId: string): Promise<SpeakerTurn[] | undefined> => {
+            if (!diarizeEnabled) {
+                return undefined;
+            }
+            try {
+                const outcome = await api.diarizeJob(
+                    targetJobId,
+                    numSpeakersHint,
+                );
+                setDiarizationOutcome(outcome);
+                return outcome.status === "succeeded"
+                    ? outcome.turns
+                    : undefined;
+            } catch (diarizeError) {
+                setDiarizationOutcome({
+                    status: "degraded",
+                    reason:
+                        diarizeError instanceof Error
+                            ? diarizeError.message
+                            : "Speaker detection could not run",
+                });
+                return undefined;
+            }
+        },
+        [diarizeEnabled, numSpeakersHint],
+    );
+
+    const applyCompletedJob = useCallback(
+        (job: Job, modelLabel: string, turns?: readonly SpeakerTurn[]) => {
+            setTranscript({
+                isBusy: false,
+                text: job.full_text || "",
+                // The database stores RAW model segments as the source of truth, so a
+                // formatter improvement retroactively improves old transcripts. They
+                // must be consolidated on read, or the transcript at rest is one that
+                // never went through the formatter.
+                //
+                // `turns` is only ever passed here for a job whose segments do NOT
+                // already carry a `speaker` field (a fresh diarization of a cache hit
+                // or a not-yet-persisted job) — a job persisted THROUGH this run
+                // already has `speaker` baked into every row by
+                // `segmentsForPersistence`, and passing `undefined` here is what
+                // lets `consolidateSegments` fall through to its no-turns path and
+                // read that embedded label straight off the rows, unchanged.
+                chunks: consolidateSegments(job.segments, undefined, turns),
+                filename: job.filename || undefined,
+                persisted: true,
+                modelLabel,
+            });
+            setJobId(job.id);
+            setProgress(1);
+            setStatus("completed");
+            setError(null);
+            setIsBusy(false);
+            void refreshSpeakerNames(job.id);
+        },
+        [refreshSpeakerNames],
+    );
 
     const handleBackendJobUpdate = useCallback((job: Job) => {
         setJobId(job.id);
@@ -738,6 +874,14 @@ export function useTranscriber(): Transcriber {
      * Pinned by `useTranscriber.test.ts`: "does not repaint a finished run with a
      * dead run's persist" and "does not release the busy gate under a live run
      * when a dead run persists". Delete the guard below and both fail.
+     *
+     * `diarizationPromise` is where diarization's answer JOINS the transcript.
+     * It was kicked off by the caller as soon as the canonical WAV existed —
+     * concurrently with the Whisper transcription above, not after it, because
+     * Whisper (webview) and sherpa-onnx (Rust sidecar) share no runtime and
+     * diarizing a multi-minute file can take longer than transcribing it. By the
+     * time control reaches here the worker's `complete` has already fired, so
+     * this `await` is the one place both sides are known to have finished.
      */
     const persistWorkerTranscript = useCallback(
         async (
@@ -746,12 +890,43 @@ export function useTranscriber(): Transcriber {
             workerTranscript: WorkerTranscript,
             audioDuration: number,
             runId: number,
+            diarizationPromise: Promise<SpeakerTurn[] | undefined>,
         ) => {
             // Safe unguarded: the only caller reaches here in the microtask that
             // follows the worker's `complete`, and the token cannot move inside a
             // microtask (see `claimRun`).
             setStatus("persisting");
             setIsBusy(true);
+
+            // The join. This DOES cross an await, so the token can move here —
+            // unlike the two lines above, nothing after this point is safe
+            // unguarded.
+            const turns = await diarizationPromise;
+
+            if (runIdRef.current === runId) {
+                // Show the diarized transcript as soon as the turns are known,
+                // rather than making the user wait for the persist round-trip
+                // below (one row per segment — thousands for a lecture) just to
+                // see who is speaking. This is the LIVE display path picking up
+                // `turns`: same `consolidateWorkerTranscript` call the mid-stream
+                // preview already used, now carrying the fourth argument that
+                // used to have no production caller at all.
+                const displayTranscript = consolidateWorkerTranscript(
+                    workerTranscript,
+                    audioDuration,
+                    {},
+                    turns,
+                );
+                setTranscript({
+                    isBusy: true,
+                    text: displayTranscript.text,
+                    chunks: displayTranscript.chunks,
+                    filename: job.filename || undefined,
+                    persisted: false,
+                    modelLabel: config.presetLabel,
+                });
+            }
+
             const payload: PersistTranscriptRequest = {
                 model_id: config.modelId,
                 task: config.task,
@@ -760,6 +935,7 @@ export function useTranscriber(): Transcriber {
                 segments: segmentsForPersistence(
                     workerTranscript,
                     audioDuration,
+                    turns,
                 ),
             };
 
@@ -771,6 +947,10 @@ export function useTranscriber(): Transcriber {
                 return;
             }
 
+            // No `turns` here: `persistedJob.segments` already carries `speaker`
+            // baked into every row by `segmentsForPersistence` above, and
+            // `applyCompletedJob` reads it straight off them. See the comment
+            // there.
             applyCompletedJob(persistedJob, config.presetLabel);
         },
         [applyCompletedJob],
@@ -787,6 +967,11 @@ export function useTranscriber(): Transcriber {
             setError(null);
             setProgress(0);
             setStatus("checking-cache");
+            // A fresh run's diarization has not happened yet, so a stale
+            // outcome (or stale names) from the PREVIOUS job must not sit on
+            // screen looking like an answer for this one.
+            setDiarizationOutcome(null);
+            setSpeakerNames({});
 
             const caps = await ensureBrowserCaps();
             const config = resolveModelConfig(presetId, caps, task, language);
@@ -846,7 +1031,24 @@ export function useTranscriber(): Transcriber {
             cancelPendingWait();
 
             if (initialJob.status === "completed") {
-                applyCompletedJob(initialJob, config.presetLabel);
+                // A cache hit — the transcript already exists, but this run's
+                // diarization toggle has not been honoured yet. This IS the
+                // "legacy transcript" path a not-yet-word-granular cached row
+                // reaches: `diarizeAudio` returns turns (or doesn't) the same
+                // way regardless of granularity, and `consolidateSegments`
+                // inside `applyCompletedJob` decides word- vs segment-level
+                // alignment from the segments themselves.
+                //
+                // NOTE what this does NOT do: persist the turns. There is no
+                // command to write a new diarization run's speakers onto an
+                // already-persisted job's rows, so a cache hit's labels are
+                // shown for this session only, from `job.segments` as they
+                // already are. See the report for this task.
+                const turns = await diarizeAudio(initialJob.id);
+                if (runIdRef.current !== runId) {
+                    return;
+                }
+                applyCompletedJob(initialJob, config.presetLabel, turns);
                 return;
             }
 
@@ -864,11 +1066,26 @@ export function useTranscriber(): Transcriber {
             }
 
             if (readyJob.status === "completed") {
-                applyCompletedJob(readyJob, config.presetLabel);
+                // Same cache-hit case as above, reached via the polling path
+                // instead of the immediate one.
+                const turns = await diarizeAudio(readyJob.id);
+                if (runIdRef.current !== runId) {
+                    return;
+                }
+                applyCompletedJob(readyJob, config.presetLabel, turns);
                 return;
             }
 
             setStatus("loading-audio");
+
+            // Kicked off HERE — as soon as the canonical WAV exists — and run
+            // CONCURRENTLY with the whisper transcription below, not awaited
+            // until `persistWorkerTranscript` needs the answer. Whisper (webview)
+            // and sherpa-onnx (Rust sidecar) share no runtime, so there is
+            // nothing to gain from serializing them: diarizing a multi-minute
+            // file can take longer than transcribing it.
+            const diarizationPromise = diarizeAudio(readyJob.id);
+
             const audioUrl = await api.getAudioUrl(readyJob.id);
             const audioResponse = await fetch(audioUrl);
             if (!audioResponse.ok) {
@@ -922,11 +1139,13 @@ export function useTranscriber(): Transcriber {
                 workerTranscript,
                 audioBuffer.duration,
                 runId,
+                diarizationPromise,
             );
         },
         [
             applyCompletedJob,
             cancelPendingWait,
+            diarizeAudio,
             handleBackendJobUpdate,
             persistWorkerTranscript,
             runWorkerTranscription,
@@ -1061,6 +1280,8 @@ export function useTranscriber(): Transcriber {
         setError(null);
         setProgress(0);
         setStatus("idle");
+        setDiarizationOutcome(null);
+        setSpeakerNames({});
     }, []);
 
     const capabilityLabel = useMemo(() => {
@@ -1104,11 +1325,20 @@ export function useTranscriber(): Transcriber {
             selectedModelId,
             presetOptions: MODEL_PRESETS,
             languageOptions: LANGUAGE_OPTIONS,
+            diarizeEnabled,
+            setDiarizeEnabled,
+            numSpeakersHint,
+            setNumSpeakersHint,
+            diarizationOutcome,
+            speakerNames,
+            renameSpeaker,
         }),
         [
             browserCaps,
             cancel,
             capabilityLabel,
+            diarizeEnabled,
+            diarizationOutcome,
             effectivePresetLabel,
             error,
             isBusy,
@@ -1117,12 +1347,15 @@ export function useTranscriber(): Transcriber {
             language,
             modelStatus,
             modelStatusError,
+            numSpeakersHint,
             onInputChange,
             presetId,
             progress,
             progressItems,
+            renameSpeaker,
             selectedModelAvailable,
             selectedModelId,
+            speakerNames,
             startFromFile,
             startFromYouTube,
             status,

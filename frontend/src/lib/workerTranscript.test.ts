@@ -255,6 +255,45 @@ describe("consolidateWorkerTranscript", () => {
             ),
         ).toEqual({ text: " raw worker text", chunks: [] });
     });
+
+    /**
+     * `turns` used to have no production caller at all: `consolidateWorkerTranscript`
+     * had no such parameter, so a live diarized run rendered identically to an
+     * undiarized one however `diarize_job` answered. This pins that the parameter
+     * exists, is optional (an undiarized call is unaffected), and actually reaches
+     * `consolidateSegments` — the same join `assignSpeakers` proves at the unit
+     * level, exercised here through the real display entry point.
+     */
+    it("threads `turns` through to the cues, and leaves an undiarized call unchanged", () => {
+        const transcript = {
+            text: "",
+            chunks: [
+                {
+                    text: " Hello there.",
+                    timestamp: [0, 2] as [number, number],
+                },
+                {
+                    text: " Goodbye now.",
+                    timestamp: [3, 5] as [number, number],
+                },
+            ],
+        };
+        const turns: SpeakerTurn[] = [
+            { start: 0, end: 2, speaker: 0 },
+            { start: 3, end: 5, speaker: 1 },
+        ];
+
+        const undiarized = consolidateWorkerTranscript(transcript, 5, {});
+        const diarized = consolidateWorkerTranscript(transcript, 5, {}, turns);
+
+        expect(
+            undiarized.chunks.every((chunk) => chunk.speaker === undefined),
+        ).toBe(true);
+        expect(diarized.chunks.map((chunk) => chunk.speaker)).toEqual([
+            "SPEAKER_00",
+            "SPEAKER_01",
+        ]);
+    });
 });
 
 /**

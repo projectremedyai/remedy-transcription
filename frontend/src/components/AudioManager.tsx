@@ -425,66 +425,123 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
 function SettingsPanel(props: { transcriber: Transcriber }) {
     return (
-        <div className='grid grid-cols-1 md:grid-cols-3 gap-3 text-sm'>
-            <label className='flex flex-col text-slate-600'>
-                Model preset
-                <select
-                    value={props.transcriber.presetId}
+        <div className='flex flex-col gap-3 text-sm'>
+            <div className='grid grid-cols-1 md:grid-cols-3 gap-3'>
+                <label className='flex flex-col text-slate-600'>
+                    Model preset
+                    <select
+                        value={props.transcriber.presetId}
+                        onChange={(event) =>
+                            props.transcriber.setPresetId(
+                                event.target
+                                    .value as typeof props.transcriber.presetId,
+                            )
+                        }
+                        className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
+                    >
+                        {props.transcriber.presetOptions.map((preset) => (
+                            <option
+                                key={preset.id}
+                                value={preset.id}
+                                disabled={
+                                    preset.webgpuOnly &&
+                                    !props.transcriber.browserCaps?.canUseWebGPU
+                                }
+                            >
+                                {preset.label}
+                            </option>
+                        ))}
+                    </select>
+                </label>
+
+                <label className='flex flex-col text-slate-600'>
+                    Task
+                    <select
+                        value={props.transcriber.task}
+                        onChange={(event) =>
+                            props.transcriber.setTask(
+                                event.target.value as
+                                    | "transcribe"
+                                    | "translate",
+                            )
+                        }
+                        className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
+                    >
+                        <option value='transcribe'>Transcribe</option>
+                        <option value='translate'>Translate to English</option>
+                    </select>
+                </label>
+
+                <label className='flex flex-col text-slate-600'>
+                    Source language
+                    <select
+                        value={props.transcriber.language}
+                        onChange={(event) =>
+                            props.transcriber.setLanguage(event.target.value)
+                        }
+                        className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
+                    >
+                        {props.transcriber.languageOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                                {option.label}
+                            </option>
+                        ))}
+                    </select>
+                </label>
+            </div>
+            <DiarizationSettings transcriber={props.transcriber} />
+        </div>
+    );
+}
+
+/**
+ * Speaker detection is OPT-IN, default OFF — it runs a second, CPU-bound
+ * process alongside Whisper and most single-speaker content has nothing for it
+ * to label. The optional count is a HINT the engine may not honour exactly
+ * (asking for 4 speakers can still return 3), so it defaults to auto-detect
+ * rather than to any particular number, and the field is only offered once the
+ * toggle itself is on.
+ */
+function DiarizationSettings(props: { transcriber: Transcriber }) {
+    const { transcriber } = props;
+
+    return (
+        <div className='flex flex-wrap items-center gap-4 border-t border-slate-100 pt-3 text-slate-600'>
+            <label className='flex items-center gap-2'>
+                <input
+                    type='checkbox'
+                    checked={transcriber.diarizeEnabled}
                     onChange={(event) =>
-                        props.transcriber.setPresetId(
-                            event.target
-                                .value as typeof props.transcriber.presetId,
-                        )
+                        transcriber.setDiarizeEnabled(event.target.checked)
                     }
-                    className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
-                >
-                    {props.transcriber.presetOptions.map((preset) => (
-                        <option
-                            key={preset.id}
-                            value={preset.id}
-                            disabled={
-                                preset.webgpuOnly &&
-                                !props.transcriber.browserCaps?.canUseWebGPU
+                    className='rounded border-slate-300 text-indigo-600 focus:ring-indigo-500'
+                />
+                Identify speakers
+            </label>
+            {transcriber.diarizeEnabled && (
+                <label className='flex items-center gap-2'>
+                    Speaker count (optional)
+                    <input
+                        type='number'
+                        min={1}
+                        step={1}
+                        value={transcriber.numSpeakersHint ?? ""}
+                        onChange={(event) => {
+                            const raw = event.target.value;
+                            if (raw === "") {
+                                transcriber.setNumSpeakersHint(undefined);
+                                return;
                             }
-                        >
-                            {preset.label}
-                        </option>
-                    ))}
-                </select>
-            </label>
-
-            <label className='flex flex-col text-slate-600'>
-                Task
-                <select
-                    value={props.transcriber.task}
-                    onChange={(event) =>
-                        props.transcriber.setTask(
-                            event.target.value as "transcribe" | "translate",
-                        )
-                    }
-                    className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
-                >
-                    <option value='transcribe'>Transcribe</option>
-                    <option value='translate'>Translate to English</option>
-                </select>
-            </label>
-
-            <label className='flex flex-col text-slate-600'>
-                Source language
-                <select
-                    value={props.transcriber.language}
-                    onChange={(event) =>
-                        props.transcriber.setLanguage(event.target.value)
-                    }
-                    className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
-                >
-                    {props.transcriber.languageOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                            {option.label}
-                        </option>
-                    ))}
-                </select>
-            </label>
+                            const parsed = Math.max(1, Math.floor(Number(raw)));
+                            transcriber.setNumSpeakersHint(
+                                Number.isFinite(parsed) ? parsed : undefined,
+                            );
+                        }}
+                        placeholder='Auto-detect'
+                        className='w-24 rounded-lg border border-slate-300 px-2 py-1'
+                    />
+                </label>
+            )}
         </div>
     );
 }

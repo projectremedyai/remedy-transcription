@@ -13,7 +13,7 @@ members = ["diarize-sidecar"]
 
 [package]
 name = "remedy-transcription"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local-first video/audio transcription desktop app"
 authors = ["Remedy"]
 license = "MIT"

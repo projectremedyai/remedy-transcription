@@ -1052,6 +1052,11 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            // Diarization is EXPERIMENTAL and REQUIRES a count now -- the UI
+            // gate never lets `diarizeAudio` reach `api.diarizeJob` without
+            // one, so every test in this block that expects a real call sets
+            // one, same as a user would.
+            result.current.setNumSpeakersHint(3);
         });
 
         await act(async () => {
@@ -1062,10 +1067,10 @@ describe("useTranscriber's diarization wiring", () => {
         // `readyJob.status === "ready"` here (see `readyFile`), so this fires
         // before the worker has produced anything -- the WAV exists, the
         // transcript does not.
-        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", 3);
     });
 
-    it("passes the optional speaker-count hint through, and omits it (auto-detect) when unset", async () => {
+    it("passes the speaker-count hint through to diarizeJob", async () => {
         readyFile();
         mocks.diarizeJob.mockResolvedValue({
             status: "succeeded",
@@ -1085,6 +1090,79 @@ describe("useTranscriber's diarization wiring", () => {
         await settle();
 
         expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", 4);
+    });
+
+    /**
+     * THE NEW CONTRACT (speaker count now required). Diarization is
+     * EXPERIMENTAL: real-content testing found auto-detect alone produces
+     * dozens of phantom speakers, so the UI no longer offers it. If the toggle
+     * is somehow on with no valid count -- the UI gate in `AudioManager`
+     * should make this unreachable, but this hook does not trust that gate --
+     * `diarizeAudio` must NOT call `api.diarizeJob` (no silent auto-detect
+     * fallback) and must instead set a VISIBLE degraded outcome, so the
+     * degradation cannot be mistaken for "diarization is off" or "diarization
+     * found nobody".
+     *
+     * This is the discriminating test against the pre-patch hook: the old
+     * `diarizeAudio` had no count guard at all, so it called
+     * `api.diarizeJob("job-1", undefined)` (backend auto-detect) here, and
+     * `diarizationOutcome` would have come back from whatever the mock
+     * resolved -- not the `"no speaker count provided"` degraded reason this
+     * asserts.
+     */
+    it("does not call diarizeJob when the toggle is on with no valid speaker count, and surfaces a visible degraded outcome instead of silently skipping or falling back to auto-detect", async () => {
+        readyFile();
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+            // No `setNumSpeakersHint` call -- stays `undefined`, exactly the
+            // state the UI gate is meant to keep the Transcribe button from
+            // ever reaching `start` in.
+        });
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "hello there"));
+        await settle();
+
+        expect(mocks.diarizeJob).not.toHaveBeenCalled();
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "degraded",
+            reason: "no speaker count provided",
+        });
+        // The governing rule still holds: no speaker count must never fail
+        // the transcript itself.
+        expect(result.current.status).toBe("completed");
+        expect(result.current.error).toBeNull();
+        expect(
+            result.current.output?.chunks.every(
+                (chunk) => chunk.speaker === undefined,
+            ),
+        ).toBe(true);
+    });
+
+    it("does not call diarizeJob when the toggle is on with an out-of-range speaker count (0 or above the 64 cap)", async () => {
+        readyFile();
+
+        const { result } = await renderTranscriber();
+        act(() => {
+            result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(0);
+        });
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        expect(mocks.diarizeJob).not.toHaveBeenCalled();
+        expect(result.current.diarizationOutcome).toEqual({
+            status: "degraded",
+            reason: "no speaker count provided",
+        });
     });
 
     /**
@@ -1113,6 +1191,7 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(1);
         });
 
         await act(async () => {
@@ -1158,6 +1237,7 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(2);
         });
         await act(async () => {
             result.current.start("/tmp/lecture.mp3");
@@ -1187,6 +1267,7 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(2);
         });
         await act(async () => {
             result.current.start("/tmp/lecture.mp3");
@@ -1212,6 +1293,7 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(2);
         });
         await act(async () => {
             result.current.start("/tmp/lecture.mp3");
@@ -1244,6 +1326,7 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(2);
         });
         await act(async () => {
             result.current.start("/tmp/lecture.mp3");
@@ -1287,13 +1370,14 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(1);
         });
         await act(async () => {
             result.current.start("/tmp/lecture.mp3");
         });
         await settle();
 
-        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", 1);
         expect(result.current.status).toBe("completed");
         expect(
             result.current.output?.chunks.some(
@@ -1334,6 +1418,7 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(2);
         });
 
         await act(async () => {
@@ -1341,7 +1426,7 @@ describe("useTranscriber's diarization wiring", () => {
         });
         await settle();
 
-        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", 2);
         // Run 1's diarizeJob has not answered yet -- nothing to show.
         expect(result.current.diarizationOutcome).toBeNull();
 
@@ -1355,7 +1440,7 @@ describe("useTranscriber's diarization wiring", () => {
         await settle();
         await settle();
 
-        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-2", undefined);
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-2", 2);
         expect(result.current.jobId).toBe("job-2");
         expect(result.current.diarizationOutcome).toEqual({
             status: "succeeded",
@@ -1401,6 +1486,7 @@ describe("useTranscriber's diarization wiring", () => {
         const { result } = await renderTranscriber();
         act(() => {
             result.current.setDiarizeEnabled(true);
+            result.current.setNumSpeakersHint(2);
         });
 
         await act(async () => {
@@ -1408,7 +1494,7 @@ describe("useTranscriber's diarization wiring", () => {
         });
         await settle();
 
-        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", undefined);
+        expect(mocks.diarizeJob).toHaveBeenCalledWith("job-1", 2);
         expect(result.current.diarizationOutcome).toBeNull();
 
         // Run 2 supersedes run 1 with the toggle OFF.

@@ -10,7 +10,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 import Modal from "./modal/Modal";
 import { UrlInput } from "./modal/UrlInput";
-import { Transcriber } from "../hooks/useTranscriber";
+import {
+    MAX_SPEAKERS,
+    Transcriber,
+    isValidSpeakerCount,
+} from "../hooks/useTranscriber";
 import Progress from "./Progress";
 
 /**
@@ -59,6 +63,19 @@ export function AudioManager(props: { transcriber: Transcriber }) {
     const { transcriber } = props;
     const { onInputChange } = transcriber;
     const isBusy = transcriber.isBusy;
+
+    /**
+     * Diarization is EXPERIMENTAL and REQUIRES a user-supplied speaker count —
+     * real-content testing found auto-detect alone produces dozens of phantom
+     * speakers. When the toggle is off this is trivially true (nothing to
+     * gate); when it is on, both entry points below refuse to start without a
+     * valid count rather than silently falling back to auto-detect. This is
+     * the same predicate `diarizeAudio` in the hook guards on, so the two
+     * cannot disagree about what "valid" means.
+     */
+    const diarizeReady =
+        !transcriber.diarizeEnabled ||
+        isValidSpeakerCount(transcriber.numSpeakersHint);
 
     // The drop listener reads `isBusy`, but it must not DEPEND on it: Tauri's
     // `onDragDropEvent()` resolves asynchronously, so re-running the effect on
@@ -292,7 +309,9 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                         text='YouTube'
                         onUrlSubmit={handleYouTubeSubmit}
                         enabled={
-                            props.transcriber.selectedModelAvailable && !isBusy
+                            props.transcriber.selectedModelAvailable &&
+                            !isBusy &&
+                            diarizeReady
                         }
                         disabled={isBusy}
                     />
@@ -412,7 +431,10 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                     </div>
                     <button
                         onClick={handleTranscribe}
-                        disabled={!props.transcriber.selectedModelAvailable}
+                        disabled={
+                            !props.transcriber.selectedModelAvailable ||
+                            !diarizeReady
+                        }
                         className='bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-medium py-2 px-6 rounded-lg transition-colors duration-200'
                     >
                         Transcribe
@@ -495,52 +517,80 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
 }
 
 /**
- * Speaker detection is OPT-IN, default OFF — it runs a second, CPU-bound
- * process alongside Whisper and most single-speaker content has nothing for it
- * to label. The optional count is a HINT the engine may not honour exactly
- * (asking for 4 speakers can still return 3), so it defaults to auto-detect
- * rather than to any particular number, and the field is only offered once the
- * toggle itself is on.
+ * Speaker detection is EXPERIMENTAL and OPT-IN, default OFF — it runs a
+ * second, CPU-bound process alongside Whisper, and real-content testing found
+ * auto-detect alone unreliable: 52 phantom speakers on a 53-minute
+ * documentary. A user-supplied count makes results plausible, not accurate
+ * (the engine may still not honour it exactly — asking for 4 speakers can
+ * return 3), which is why the count is now REQUIRED rather than optional: the
+ * field is only offered once the toggle itself is on, and `AudioManager`
+ * disables Transcribe (and the YouTube tile) rather than silently running
+ * auto-detect when the toggle is on with no valid count entered.
  */
 function DiarizationSettings(props: { transcriber: Transcriber }) {
     const { transcriber } = props;
+    const hasValidCount = isValidSpeakerCount(transcriber.numSpeakersHint);
 
     return (
-        <div className='flex flex-wrap items-center gap-4 border-t border-slate-100 pt-3 text-slate-600'>
-            <label className='flex items-center gap-2'>
-                <input
-                    type='checkbox'
-                    checked={transcriber.diarizeEnabled}
-                    onChange={(event) =>
-                        transcriber.setDiarizeEnabled(event.target.checked)
-                    }
-                    className='rounded border-slate-300 text-indigo-600 focus:ring-indigo-500'
-                />
-                Identify speakers
-            </label>
-            {transcriber.diarizeEnabled && (
+        <div className='flex flex-col gap-2 border-t border-slate-100 pt-3 text-slate-600'>
+            <div className='flex flex-wrap items-center gap-4'>
                 <label className='flex items-center gap-2'>
-                    Speaker count (optional)
                     <input
-                        type='number'
-                        min={1}
-                        step={1}
-                        value={transcriber.numSpeakersHint ?? ""}
-                        onChange={(event) => {
-                            const raw = event.target.value;
-                            if (raw === "") {
-                                transcriber.setNumSpeakersHint(undefined);
-                                return;
-                            }
-                            const parsed = Math.max(1, Math.floor(Number(raw)));
-                            transcriber.setNumSpeakersHint(
-                                Number.isFinite(parsed) ? parsed : undefined,
-                            );
-                        }}
-                        placeholder='Auto-detect'
-                        className='w-24 rounded-lg border border-slate-300 px-2 py-1'
+                        type='checkbox'
+                        checked={transcriber.diarizeEnabled}
+                        onChange={(event) =>
+                            transcriber.setDiarizeEnabled(event.target.checked)
+                        }
+                        className='rounded border-slate-300 text-indigo-600 focus:ring-indigo-500'
                     />
+                    Identify speakers (experimental)
                 </label>
+                {transcriber.diarizeEnabled && (
+                    <label className='flex items-center gap-2'>
+                        Speaker count
+                        <input
+                            type='number'
+                            min={1}
+                            max={MAX_SPEAKERS}
+                            step={1}
+                            value={transcriber.numSpeakersHint ?? ""}
+                            onChange={(event) => {
+                                const raw = event.target.value;
+                                if (raw === "") {
+                                    transcriber.setNumSpeakersHint(undefined);
+                                    return;
+                                }
+                                // Deliberately NOT clamped to [1, MAX_SPEAKERS]
+                                // here: an out-of-range value is stored as-is
+                                // and caught by `isValidSpeakerCount`, which is
+                                // what disables Transcribe and shows the
+                                // warning below. Clamping silently would hide
+                                // the very state this gate exists to surface.
+                                const parsed = Math.floor(Number(raw));
+                                transcriber.setNumSpeakersHint(
+                                    Number.isFinite(parsed)
+                                        ? parsed
+                                        : undefined,
+                                );
+                            }}
+                            placeholder='e.g. 2'
+                            className='w-24 rounded-lg border border-slate-300 px-2 py-1'
+                        />
+                    </label>
+                )}
+            </div>
+            {transcriber.diarizeEnabled && (
+                <p className='text-xs text-slate-500'>
+                    Approximate. You must enter how many distinct speakers the
+                    audio has (best on shorter recordings with a few clear
+                    voices).
+                </p>
+            )}
+            {transcriber.diarizeEnabled && !hasValidCount && (
+                <p className='text-xs text-amber-600'>
+                    Enter the number of speakers to transcribe with speaker
+                    identification.
+                </p>
             )}
         </div>
     );

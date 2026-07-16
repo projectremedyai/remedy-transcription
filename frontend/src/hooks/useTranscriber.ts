@@ -126,19 +126,26 @@ export interface Transcriber {
     presetOptions: typeof MODEL_PRESETS;
     languageOptions: typeof LANGUAGE_OPTIONS;
     /**
-     * Speaker detection is OPT-IN per job, default OFF: it costs real time (a
-     * second CPU-bound child alongside Whisper) and most single-speaker content
-     * has nothing for it to label. Read at the moment a run STARTS — flipping it
-     * mid-run does not retroactively diarize or un-diarize the run in flight.
+     * Speaker detection is EXPERIMENTAL and OPT-IN per job, default OFF: it
+     * costs real time (a second CPU-bound child alongside Whisper), and
+     * real-content testing found auto-detect alone unreliable — 52 phantom
+     * speakers on a 53-minute documentary. Read at the moment a run STARTS —
+     * flipping it mid-run does not retroactively diarize or un-diarize the run
+     * in flight.
      */
     diarizeEnabled: boolean;
     setDiarizeEnabled: (enabled: boolean) => void;
     /**
      * "I know there are N speakers" — a HINT passed as `DiarizeOptions.num_speakers`,
      * not a guarantee: sherpa-onnx's own reference case shows asking for 4 can
-     * still return 3. `undefined` means auto-detect, which is the default and is
-     * NOT uniformly worse than a supplied count — do not coerce this to a number
-     * before the user has actually set one.
+     * still return 3.
+     *
+     * No longer optional in practice: with diarization now EXPERIMENTAL, the UI
+     * requires a valid count (an integer 1..{@link MAX_SPEAKERS}, see
+     * {@link isValidSpeakerCount}) whenever `diarizeEnabled` is on, and
+     * `diarizeAudio` below refuses to call `api.diarizeJob` without one rather
+     * than falling back to the auto-detect this omission used to trigger.
+     * `undefined` here means "no count entered yet", not "auto-detect".
      */
     numSpeakersHint: number | undefined;
     setNumSpeakersHint: (value: number | undefined) => void;
@@ -159,6 +166,30 @@ export interface Transcriber {
      * write and the subsequent re-fetch both land.
      */
     renameSpeaker: (speakerKey: string, displayName: string) => Promise<void>;
+}
+
+/**
+ * The backend's hard cap on a diarization speaker count (`MAX_SPEAKERS` in
+ * `src-tauri/src/diarize.rs`), mirrored here so the UI's gate agrees with what
+ * the sidecar will actually accept.
+ */
+export const MAX_SPEAKERS = 64;
+
+/**
+ * Is `value` a speaker count the sidecar can actually be asked for? The one
+ * predicate both `AudioManager`'s gate (disabling Transcribe and the YouTube
+ * tile) and `diarizeAudio` below's guard call, so the UI and the hook cannot
+ * silently disagree about what "valid" means.
+ */
+export function isValidSpeakerCount(
+    value: number | undefined,
+): value is number {
+    return (
+        typeof value === "number" &&
+        Number.isInteger(value) &&
+        value >= 1 &&
+        value <= MAX_SPEAKERS
+    );
 }
 
 type PendingWorker = {
@@ -512,18 +543,29 @@ export function useTranscriber(): Transcriber {
      * Kick off diarization for a job's already-prepared audio, if the toggle is
      * on, and resolve the turns to align against.
      *
-     * Resolves `undefined` in three cases that a caller must NOT conflate:
+     * Resolves `undefined` in FOUR cases that a caller must NOT conflate:
      * the toggle was off (no `diarizationOutcome` write at all — nothing ran);
-     * the sidecar answered `"succeeded"` with an empty turn list (a real
-     * success — silence, or one speaker); or it answered `"degraded"` /
-     * `"cancelled"`. `setDiarizationOutcome` is the one place that distinction
-     * survives, which is what lets the UI show each of those three differently
-     * rather than rendering all of them as the same unlabelled transcript.
+     * the toggle was on with no valid speaker count (see below); the sidecar
+     * answered `"succeeded"` with an empty turn list (a real success — silence,
+     * or one speaker); or it answered `"degraded"` / `"cancelled"`.
+     * `setDiarizationOutcome` is the one place that distinction survives, which
+     * is what lets the UI show each of those differently rather than rendering
+     * all of them as the same unlabelled transcript.
+     *
+     * THE MISSING-COUNT CASE is new: diarization is EXPERIMENTAL and requires a
+     * user-supplied speaker count now — real-content testing found auto-detect
+     * alone produces dozens of phantom speakers. `AudioManager`'s gate
+     * (`isValidSpeakerCount`) should make this branch unreachable — the
+     * Transcribe button and the YouTube tile are both disabled without a valid
+     * count — but this function does not TRUST that gate. If it is ever
+     * bypassed, `api.diarizeJob` is still never called with `numSpeakersHint`
+     * missing or out of range; the degradation is made VISIBLE via a
+     * `"degraded"` outcome instead of silently falling back to auto-detect.
      *
      * `api.diarizeJob` REJECTS only when the request itself was wrong — an
      * unknown job, no prepared audio (a cache hit whose WAV has aged out is the
      * realistic case), or an impossible `numSpeakers`. That is not one of the
-     * three outcomes `DiarizationOutcome` models, but it is exactly as invisible
+     * outcomes `DiarizationOutcome` models, but it is exactly as invisible
      * a failure if swallowed, so it is folded into `"degraded"` for display: the
      * user does not care whether the sidecar crashed or the request that reached
      * it never had a chance to, only that speaker labels did not happen and why.
@@ -545,6 +587,18 @@ export function useTranscriber(): Transcriber {
             runId: number,
         ): Promise<SpeakerTurn[] | undefined> => {
             if (!diarizeEnabled) {
+                return undefined;
+            }
+            if (!isValidSpeakerCount(numSpeakersHint)) {
+                // Unreachable through the UI gate — see the doc comment above
+                // — but this must not silently skip diarization or fall back
+                // to auto-detect if the gate is ever bypassed.
+                if (runIdRef.current === runId) {
+                    setDiarizationOutcome({
+                        status: "degraded",
+                        reason: "no speaker count provided",
+                    });
+                }
                 return undefined;
             }
             try {

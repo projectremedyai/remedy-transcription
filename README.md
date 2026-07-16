@@ -178,6 +178,24 @@ inside the installer even though `models/diarization/` is gitignored and never
 committed. `./scripts/fetch-sidecars.sh --models-only` re-fetches them from
 sherpa-onnx's own GitHub releases.
 
+### Speaker identification is experimental, and requires a speaker count
+
+Speaker identification ("Identify speakers") is opt-in and marked
+**experimental** in the UI. It now **requires** a speaker count — the app no
+longer offers auto-detect from the interface at all, because a real-content
+test found unattended auto-detect unreliable: a 53-minute documentary came
+back with 52 phantom speakers. Telling the engine how many speakers to expect
+makes the result *plausible*, not *accurate* (see the smoke test below for how
+far that goes, and where it still breaks down); the backend keeps its
+auto-detect capability, it just is not reachable from the UI.
+
+Set expectations accordingly: this works best on **shorter recordings** (a few
+minutes, not hours) with a **small number of clear, distinct voices** and
+little overlap. Long recordings, background music, and crosstalk confuse it.
+Treat speaker labels as a best-effort aid to skim a transcript by, not as a
+verified record of who said what — spot-check against the audio before relying
+on it for anything.
+
 ### Accuracy — smoke-tested, not benchmarked
 
 sherpa-onnx's ONNX port of pyannote/WeSpeaker is a different implementation

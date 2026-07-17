@@ -4,6 +4,7 @@ import { TranscriberData } from "../hooks/useTranscriber";
 import { formatAudioTimestamp } from "../utils/AudioUtils";
 import { api, DiarizationOutcome, SpeakerNames } from "../services/api";
 import { ConsolidatedSegment } from "../lib/captionFormatter";
+import { DIARIZATION_UI_ENABLED } from "../config/features";
 
 interface Props {
     transcribedData: TranscriberData | undefined;
@@ -46,6 +47,11 @@ function exportableCues(
  * screen. Every arm gets its own message, on purpose — see the prop doc above.
  * `null`/`undefined` renders nothing, which is exactly how an undiarized
  * transcript must look: unchanged.
+ *
+ * The call site below only renders this when `DIARIZATION_UI_ENABLED` is
+ * true. With the flag off no outcome can ever occur (diarization can't be
+ * kicked off), so the component itself is left as-is and simply unmounted at
+ * the call site — no outcome arm needs to know about the flag.
  */
 function DiarizationStatus({
     outcome,
@@ -238,7 +244,9 @@ export default function Transcript({
 
     return (
         <div className='w-full flex flex-col my-2'>
-            <DiarizationStatus outcome={diarizationOutcome} />
+            {DIARIZATION_UI_ENABLED && (
+                <DiarizationStatus outcome={diarizationOutcome} />
+            )}
             <div
                 ref={divRef}
                 className='w-full flex flex-col p-4 max-h-[20rem] overflow-y-auto'

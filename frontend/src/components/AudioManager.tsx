@@ -15,6 +15,7 @@ import {
     Transcriber,
     isValidSpeakerCount,
 } from "../hooks/useTranscriber";
+import { DIARIZATION_UI_ENABLED } from "../config/features";
 import Progress from "./Progress";
 
 /**
@@ -72,8 +73,14 @@ export function AudioManager(props: { transcriber: Transcriber }) {
      * valid count rather than silently falling back to auto-detect. This is
      * the same predicate `diarizeAudio` in the hook guards on, so the two
      * cannot disagree about what "valid" means.
+     *
+     * With `DIARIZATION_UI_ENABLED` false (the 1.1.0 default — see
+     * `../config/features`), the UI can never turn the toggle on in the first
+     * place, so this must always evaluate "ready" and never disable
+     * Transcribe/YouTube for a control the user cannot even see.
      */
     const diarizeReady =
+        !DIARIZATION_UI_ENABLED ||
         !transcriber.diarizeEnabled ||
         isValidSpeakerCount(transcriber.numSpeakersHint);
 
@@ -511,7 +518,9 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
                     </select>
                 </label>
             </div>
-            <DiarizationSettings transcriber={props.transcriber} />
+            {DIARIZATION_UI_ENABLED && (
+                <DiarizationSettings transcriber={props.transcriber} />
+            )}
         </div>
     );
 }

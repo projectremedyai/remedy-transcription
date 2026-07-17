@@ -64,6 +64,15 @@ vi.mock("../services/api", () => ({
     },
 }));
 
+// `DIARIZATION_UI_ENABLED` is off for the 1.1.0 release (see
+// `../config/features`), which forces `diarizeEnabled` to false and short-
+// circuits `diarizeAudio` before it ever calls `api.diarizeJob` — see
+// `useTranscriber.diarizationFlag.test.ts` for that (shipped) behaviour. This
+// suite exercises the diarization PLUMBING (the hook wiring this flag gates),
+// so it overrides the flag to `true`, exactly the way it will be flipped back
+// for a future release.
+vi.mock("../config/features", () => ({ DIARIZATION_UI_ENABLED: true }));
+
 vi.mock("../utils/detectBrowserCaps", () => ({
     detectBrowserCaps: async () => ({
         secureContext: true,

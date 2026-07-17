@@ -9,6 +9,7 @@ import {
     TaskMode,
     resolveModelConfig,
 } from "../config/transcription";
+import { DIARIZATION_UI_ENABLED } from "../config/features";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
@@ -132,6 +133,10 @@ export interface Transcriber {
      * speakers on a 53-minute documentary. Read at the moment a run STARTS —
      * flipping it mid-run does not retroactively diarize or un-diarize the run
      * in flight.
+     *
+     * As of 1.1.0, `DIARIZATION_UI_ENABLED` (`../config/features`) is false,
+     * and this value is forced to false whenever it is regardless of the
+     * underlying state — see the return-object comment in the implementation.
      */
     diarizeEnabled: boolean;
     setDiarizeEnabled: (enabled: boolean) => void;
@@ -580,13 +585,19 @@ export function useTranscriber(): Transcriber {
      * token has moved on since: `persistWorkerTranscript` guards its own state
      * write on `runIdRef.current === runId` right where its diarization promise
      * resolves, and this mirrors that, not a new mechanism.
+     *
+     * `DIARIZATION_UI_ENABLED` (1.1.0: off — see `../config/features`) is
+     * checked FIRST, ahead of `diarizeEnabled`. The UI cannot turn the toggle
+     * on while the flag is off, so this is belt-and-braces: no code path,
+     * including a stale/persisted `diarizeEnabled` state, can reach
+     * `api.diarizeJob` while the feature is flagged off.
      */
     const diarizeAudio = useCallback(
         async (
             targetJobId: string,
             runId: number,
         ): Promise<SpeakerTurn[] | undefined> => {
-            if (!diarizeEnabled) {
+            if (!DIARIZATION_UI_ENABLED || !diarizeEnabled) {
                 return undefined;
             }
             if (!isValidSpeakerCount(numSpeakersHint)) {
@@ -1397,7 +1408,12 @@ export function useTranscriber(): Transcriber {
             selectedModelId,
             presetOptions: MODEL_PRESETS,
             languageOptions: LANGUAGE_OPTIONS,
-            diarizeEnabled,
+            // Belt-and-braces, mirroring `diarizeAudio`'s own guard above: with
+            // the flag off, this must read as false regardless of the
+            // underlying `diarizeEnabled` state (which the UI cannot even set
+            // — `DiarizationSettings` is unrendered — but a stale value could
+            // in principle survive elsewhere).
+            diarizeEnabled: DIARIZATION_UI_ENABLED && diarizeEnabled,
             setDiarizeEnabled,
             numSpeakersHint,
             setNumSpeakersHint,

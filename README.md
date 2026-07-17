@@ -178,25 +178,45 @@ inside the installer even though `models/diarization/` is gitignored and never
 committed. `./scripts/fetch-sidecars.sh --models-only` re-fetches them from
 sherpa-onnx's own GitHub releases.
 
-### Speaker identification is experimental, and requires a speaker count
+### Speaker identification is disabled in this release (1.1.0)
 
-Speaker identification ("Identify speakers") is opt-in and marked
-**experimental** in the UI. It now **requires** a speaker count — the app no
-longer offers auto-detect from the interface at all, because a real-content
-test found unattended auto-detect unreliable: a 53-minute documentary came
-back with 52 phantom speakers. Telling the engine how many speakers to expect
-makes the result *plausible*, not *accurate* (see the smoke test below for how
-far that goes, and where it still breaks down); the backend keeps its
-auto-detect capability, it just is not reachable from the UI.
+Speaker identification ("Identify speakers") ships **disabled** in 1.1.0 —
+the toggle, the speaker-count input, and the status banner are all hidden
+behind a feature flag (`DIARIZATION_UI_ENABLED` in
+`frontend/src/config/features.ts`), currently `false`.
 
-Set expectations accordingly: this works best on **shorter recordings** (a few
-minutes, not hours) with a **small number of clear, distinct voices** and
-little overlap. Long recordings, background music, and crosstalk confuse it.
-Treat speaker labels as a best-effort aid to skim a transcript by, not as a
-verified record of who said what — spot-check against the audio before relying
-on it for anything.
+The reason is accuracy, not stability: further real-content testing, this
+time in the engine's own *count-required* mode — the one meant to be the
+reliable path, a speaker count supplied up front, no auto-detect guessing —
+still failed badly. A single-narrator documentary (music under narration,
+told there was exactly 1 speaker) came back with **4 distinct speaker
+labels**, flipping between them **19 times over a 10-minute sample**. That is
+consistent with the accuracy findings below (sherpa-onnx's speaker embeddings
+not holding up against real-world audio conditions), not a bug in this app's
+plumbing — there is no UI fix for an engine that can't tell one voice from
+itself under music. See the smoke-test findings below for the fuller picture,
+including the earlier 52-phantom-speaker auto-detect result that first made
+this experimental.
 
-### Accuracy — smoke-tested, not benchmarked
+**Nothing has been removed.** The diarization backend (sherpa-onnx sidecar),
+the `useTranscriber` hook's diarization wiring, speaker-alignment, rename, and
+export/persistence of `speaker` fields are all intact, tested, and green —
+see `cargo test --workspace` and the frontend test suite, including tests
+that mock the flag back to `true` to keep that plumbing exercised. Segments
+already carrying a persisted `speaker` field (from before this release, or
+from data migrated in) still render their speaker pills and support renaming
+in the transcript view; only the controls that would *start* a new diarized
+run are hidden. Flip `DIARIZATION_UI_ENABLED` to `true` to restore the UI once
+the engine (or a swappable one) clears this bar.
+
+Set expectations accordingly, for whenever the UI is re-enabled: this works
+best on **shorter recordings** (a few minutes, not hours) with a **small
+number of clear, distinct voices** and little overlap. Long recordings,
+background music, and crosstalk confuse it. Treat speaker labels as a
+best-effort aid to skim a transcript by, not as a verified record of who said
+what — spot-check against the audio before relying on it for anything.
+
+### Accuracy — smoke-tested, not benchmarked (why the UI is disabled)
 
 sherpa-onnx's ONNX port of pyannote/WeSpeaker is a different implementation
 from the upstream Python pipeline, and upstream issue #1708 reports it can

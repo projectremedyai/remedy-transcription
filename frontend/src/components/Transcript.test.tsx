@@ -18,6 +18,14 @@ vi.mock("../services/api", () => ({
     api: { exportTranscript: vi.fn() },
 }));
 
+// `DIARIZATION_UI_ENABLED` is off for the 1.1.0 release (see
+// `../config/features`), which unmounts `DiarizationStatus` entirely — see
+// `Transcript.diarizationFlag.test.tsx` for that (shipped) behaviour. This
+// suite exercises the DiarizationStatus PLUMBING (each `DiarizationOutcome`
+// arm rendering distinctly), so it overrides the flag to `true`, exactly the
+// way it will be flipped back for a future release.
+vi.mock("../config/features", () => ({ DIARIZATION_UI_ENABLED: true }));
+
 import Transcript from "./Transcript";
 
 afterEach(() => {

@@ -476,7 +476,18 @@ export function useTranscriber(): Transcriber {
     );
 
     const applyCompletedJob = useCallback(
-        (job: Job, modelLabel: string, turns?: readonly SpeakerTurn[]) => {
+        (
+            job: Job,
+            modelLabel: string,
+            /**
+             * Speaker turns, when the engine produced any. Always `undefined`
+             * in this phase: no caller here has an engine to diarize a cache
+             * hit's already-persisted (and possibly pre-diarization) segments
+             * with. The Gemini engine's cache-hit path is what supplies real
+             * turns here.
+             */
+            turns?: readonly SpeakerTurn[],
+        ) => {
             setTranscript({
                 isBusy: false,
                 text: job.full_text || "",
@@ -485,12 +496,10 @@ export function useTranscriber(): Transcriber {
                 // must be consolidated on read, or the transcript at rest is one that
                 // never went through the formatter.
                 //
-                // `turns` is only ever passed here for a job whose segments do NOT
-                // already carry a `speaker` field (a fresh diarization of a cache hit
-                // or a not-yet-persisted job) — a job persisted THROUGH this run
-                // already has `speaker` baked into every row by
-                // `segmentsForPersistence`, and passing `undefined` here is what
-                // lets `consolidateSegments` fall through to its no-turns path and
+                // A job persisted THROUGH this run already has `speaker` baked
+                // into every row by `segmentsForPersistence`, and passing
+                // `undefined` here (the only value in this phase) is what lets
+                // `consolidateSegments` fall through to its no-turns path and
                 // read that embedded label straight off the rows, unchanged.
                 chunks: consolidateSegments(job.segments, undefined, turns),
                 filename: job.filename || undefined,

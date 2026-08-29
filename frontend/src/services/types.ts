@@ -121,5 +121,24 @@ export interface ModelStatusResponse {
  * ```
  */
 export type SpeakerOutcome =
-    | { status: "identified"; turns: SpeakerTurn[]; speaker_count: number }
-    | { status: "unavailable"; reason: string };
+    | {
+          status: "identified";
+          /**
+           * MAY BE EMPTY, and that is a real success: silence has no speaker
+           * turns. Do not treat `[]` as a failure, and do not divide by
+           * `speaker_count`.
+           *
+           * Ids are dense (0..n-1), but treat the value as an opaque label;
+           * do not index arrays with it.
+           */
+          turns: SpeakerTurn[];
+          speaker_count: number;
+      }
+    | {
+          status: "unavailable";
+          /**
+           * User-facing, and already specific: it names what went wrong.
+           * Show it. The transcript itself is completely unaffected.
+           */
+          reason: string;
+      };

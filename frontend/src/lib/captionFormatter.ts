@@ -1081,19 +1081,19 @@ function labelOf(speaker: number | null): string | undefined {
  * precisely so that the export path cannot re-format.
  *
  * `turns` is diarization's answer, and it is deliberately typed `SpeakerTurn[]`
- * and NOT `DiarizationOutcome`. A caller cannot reach turns without narrowing
- * that union to its `succeeded` arm first, so the two things that both LOOK like
- * "no speakers" cannot arrive here as the same value:
+ * and NOT `SpeakerOutcome`. A caller cannot reach turns without narrowing
+ * that union to its `identified` arm first, so the two things that both LOOK
+ * like "no speakers" cannot arrive here as the same value:
  *
- *   - `succeeded { turns: [] }` — a real, measured answer (silence, or one
+ *   - `identified { turns: [] }` — a real, measured answer (silence, or one
  *     speaker). Passing `[]`, or nothing at all, is correct: no cue gets a
  *     speaker, and the transcript renders exactly as it did before diarization
  *     existed.
- *   - `degraded { reason }` — the sidecar crashed, or its model is missing. It
+ *   - `unavailable { reason }` — the engine failed, or its model is missing. It
  *     has NO `turns` key, cannot be coerced into one (`outcome.turns ?? []` does
  *     not compile, and a test pins that), and so cannot reach this function at
  *     all. It is not this function's answer to give; the caller must SHOW the
- *     reason. Silently consolidating with no turns would render a crash as
+ *     reason. Silently consolidating with no turns would render a failure as
  *     silence, which is the one failure the union exists to prevent.
  *
  * When turns ARE supplied, the alignment granularity is chosen by

@@ -2,21 +2,12 @@ import { useEffect, useRef, useState } from "react";
 
 import { TranscriberData } from "../hooks/useTranscriber";
 import { formatAudioTimestamp } from "../utils/AudioUtils";
-import { api, DiarizationOutcome, SpeakerNames } from "../services/api";
+import { api, SpeakerNames } from "../services/api";
 import { ConsolidatedSegment } from "../lib/captionFormatter";
-import { DIARIZATION_UI_ENABLED } from "../config/features";
 
 interface Props {
     transcribedData: TranscriberData | undefined;
     jobId?: string | null;
-    /**
-     * `null` (or omitted) means "diarization never ran for this job" — the
-     * toggle was off, or the run has not reached a result yet. That is its own
-     * state, distinct from all three arms of {@link DiarizationOutcome}: a
-     * crashed engine (`"degraded"`) must never render the same as "nobody
-     * asked".
-     */
-    diarizationOutcome?: DiarizationOutcome | null;
     /** What the user has called each speaker, keyed by the opaque label a cue carries. */
     speakerNames?: SpeakerNames;
     /**
@@ -40,78 +31,6 @@ function exportableCues(
 ): ConsolidatedSegment[] {
     if (!chunks) return [];
     return chunks.filter((chunk) => chunk.text.trim().length > 0);
-}
-
-/**
- * The one place a `DiarizationOutcome` (or its absence) becomes words on
- * screen. Every arm gets its own message, on purpose — see the prop doc above.
- * `null`/`undefined` renders nothing, which is exactly how an undiarized
- * transcript must look: unchanged.
- *
- * The call site below only renders this when `DIARIZATION_UI_ENABLED` is
- * true. With the flag off no outcome can ever occur (diarization can't be
- * kicked off), so the component itself is left as-is and simply unmounted at
- * the call site — no outcome arm needs to know about the flag.
- */
-function DiarizationStatus({
-    outcome,
-}: {
-    outcome: DiarizationOutcome | null | undefined;
-}) {
-    if (!outcome) {
-        return null;
-    }
-
-    if (outcome.status === "degraded") {
-        return (
-            <div
-                data-testid='diarization-status'
-                data-status='degraded'
-                className='w-full mb-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800'
-            >
-                Couldn&apos;t identify speakers: {outcome.reason}
-            </div>
-        );
-    }
-
-    if (outcome.status === "cancelled") {
-        return (
-            <div
-                data-testid='diarization-status'
-                data-status='cancelled'
-                className='w-full mb-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600'
-            >
-                Speaker detection was cancelled.
-            </div>
-        );
-    }
-
-    // "succeeded" — a real, measured answer. An empty turn list (silence, or
-    // one speaker) is success too, and it gets its own line rather than
-    // rendering identically to "diarization never ran".
-    if (outcome.turns.length === 0) {
-        return (
-            <div
-                data-testid='diarization-status'
-                data-status='succeeded-empty'
-                className='w-full mb-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600'
-            >
-                Speaker detection ran but did not find distinct speakers.
-            </div>
-        );
-    }
-
-    return (
-        <div
-            data-testid='diarization-status'
-            data-status='succeeded'
-            className='w-full mb-2 text-xs text-slate-500'
-        >
-            {outcome.speaker_count} speaker
-            {outcome.speaker_count === 1 ? "" : "s"} identified. Click a name
-            below to rename them.
-        </div>
-    );
 }
 
 /**
@@ -201,7 +120,6 @@ function SpeakerLabel({
 export default function Transcript({
     transcribedData,
     jobId,
-    diarizationOutcome,
     speakerNames,
     onRenameSpeaker,
 }: Props) {
@@ -244,9 +162,6 @@ export default function Transcript({
 
     return (
         <div className='w-full flex flex-col my-2'>
-            {DIARIZATION_UI_ENABLED && (
-                <DiarizationStatus outcome={diarizationOutcome} />
-            )}
             <div
                 ref={divRef}
                 className='w-full flex flex-col p-4 max-h-[20rem] overflow-y-auto'

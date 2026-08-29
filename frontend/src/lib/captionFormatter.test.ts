@@ -8,10 +8,7 @@ import {
     normalizeWordTokens,
 } from "./captionFormatter";
 import type { SpeakerTurn } from "./speakerAlignment";
-import type {
-    DiarizationOutcome,
-    TranscriptionSegment,
-} from "../services/types";
+import type { SpeakerOutcome, TranscriptionSegment } from "../services/types";
 
 const flat = (segs: TranscriptionSegment[]) =>
     segs.map((s) => s.text.replace(/\n/g, " ")).join(" ");
@@ -1148,11 +1145,11 @@ describe("speaker alignment granularity is detected, not assumed", () => {
 });
 
 /**
- * Hands back the WHOLE union, which is what `await api.diarizeJob(...)` gives a
+ * Hands back the WHOLE union, which is what an engine's outcome hands a
  * caller. An annotated `const` literal would be narrowed to its own arm by
  * control-flow analysis, quietly testing something easier.
  */
-const outcome = (o: DiarizationOutcome): DiarizationOutcome => o;
+const outcome = (o: SpeakerOutcome): SpeakerOutcome => o;
 
 describe("diarization is optional, and its absence is not a failure", () => {
     it("renders an undiarized transcript exactly as it did before speakers existed", () => {
@@ -1167,14 +1164,14 @@ describe("diarization is optional, and its absence is not a failure", () => {
     });
 
     it("treats a REAL zero-speaker success (silence) as 'no labels', identically to no diarization at all", () => {
-        // `succeeded { turns: [] }` is a MEASURED answer: the engine ran and heard
-        // nobody. It must render as today's transcript — not as an error.
+        // `identified { turns: [] }` is a MEASURED answer: the engine ran and
+        // heard nobody. It must render as today's transcript — not as an error.
         const silence = outcome({
-            status: "succeeded",
+            status: "identified",
             turns: [],
             speaker_count: 0,
         });
-        if (silence.status !== "succeeded") throw new Error("unreachable");
+        if (silence.status !== "identified") throw new Error("unreachable");
 
         expect(
             consolidateSegments(
@@ -1185,33 +1182,33 @@ describe("diarization is optional, and its absence is not a failure", () => {
         ).toEqual(consolidateSegments(WHISPER_WINDOW_SEGMENTS));
     });
 
-    it("cannot be handed a DEGRADED outcome at all — a crash cannot be laundered into silence here", () => {
+    it("cannot be handed an UNAVAILABLE outcome at all — a crash cannot be laundered into silence here", () => {
         // Built through a function, not an annotated literal: an annotated literal
         // is narrowed to its own arm by control-flow analysis, which would test
         // something easier than the union a caller actually holds.
         const broken = outcome({
-            status: "degraded",
-            reason: "the diarization sidecar was killed by signal 6 (SIGABRT)",
+            status: "unavailable",
+            reason: "the speaker-identification request timed out",
         });
 
-        // @ts-expect-error `turns` is not on the degraded arm. THIS is the line
-        // that would render a crashed engine as "0 speakers found", and `tsc`
-        // fails here if it ever starts compiling. `consolidateSegments` takes
-        // `SpeakerTurn[]`, never a `DiarizationOutcome`, precisely so that the
-        // only way to reach it is to narrow — which forces the degraded arm to be
-        // handled, which means the reason gets shown.
+        // @ts-expect-error `turns` is not on the unavailable arm. THIS is the
+        // line that would render a crashed engine as "0 speakers found", and
+        // `tsc` fails here if it ever starts compiling. `consolidateSegments`
+        // takes `SpeakerTurn[]`, never a `SpeakerOutcome`, precisely so that the
+        // only way to reach it is to narrow — which forces the unavailable arm
+        // to be handled, which means the reason gets shown.
         const smuggled = broken.turns ?? [];
         expect(smuggled).toEqual([]);
 
-        if (broken.status === "succeeded") {
+        if (broken.status === "identified") {
             throw new Error("narrowed to the wrong arm");
         }
         // The reason survives, and it is what the user has to see. It is NOT the
         // empty turn list a zero-speaker success hands over — the two are
         // different values of different shapes, and stay that way.
-        expect(broken.status).toBe("degraded");
-        if (broken.status !== "degraded") throw new Error("unreachable");
-        expect(broken.reason).toContain("SIGABRT");
+        expect(broken.status).toBe("unavailable");
+        if (broken.status !== "unavailable") throw new Error("unreachable");
+        expect(broken.reason).toContain("timed out");
     });
 });
 

@@ -1,30 +1,22 @@
 // @vitest-environment jsdom
 /**
- * Task 12: rendering the three `DiarizationOutcome` arms (plus "never ran") as
- * genuinely different UI, and the click-to-rename flow writing through to
- * `onRenameSpeaker`. These are the properties a headless `tsc`/lint pass cannot
- * see — a previous task on this branch shipped a dead button behind a passing
- * headless check, which is exactly why this renders the real component (jsdom
- * + @testing-library/react) instead of asserting on hand-built props.
+ * The click-to-rename flow writing through to `onRenameSpeaker`, and the
+ * speaker label rendering itself. These are properties a headless `tsc`/lint
+ * pass cannot see — a previous task on this branch shipped a dead button
+ * behind a passing headless check, which is exactly why this renders the real
+ * component (jsdom + @testing-library/react) instead of asserting on
+ * hand-built props.
  */
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ConsolidatedSegment } from "../lib/captionFormatter";
-import { api, DiarizationOutcome, SpeakerNames } from "../services/api";
+import { api, SpeakerNames } from "../services/api";
 import type { TranscriberData } from "../hooks/useTranscriber";
 
 vi.mock("../services/api", () => ({
     api: { exportTranscript: vi.fn() },
 }));
-
-// `DIARIZATION_UI_ENABLED` is off for the 1.1.0 release (see
-// `../config/features`), which unmounts `DiarizationStatus` entirely — see
-// `Transcript.diarizationFlag.test.tsx` for that (shipped) behaviour. This
-// suite exercises the DiarizationStatus PLUMBING (each `DiarizationOutcome`
-// arm rendering distinctly), so it overrides the flag to `true`, exactly the
-// way it will be flipped back for a future release.
-vi.mock("../config/features", () => ({ DIARIZATION_UI_ENABLED: true }));
 
 import Transcript from "./Transcript";
 
@@ -63,21 +55,6 @@ describe("Transcript: an undiarized transcript is unchanged", () => {
         // No speaker pill of any kind — only the (unrelated) export buttons.
         expect(
             document.querySelector('[data-testid^="speaker-label-"]'),
-        ).toBeNull();
-    });
-
-    it("shows no status banner when `diarizationOutcome` is null — the toggle-off state", () => {
-        const data = transcriptWith([cue(0, 2, "Hello there.")]);
-        render(
-            <Transcript
-                transcribedData={data}
-                jobId='job-1'
-                diarizationOutcome={null}
-            />,
-        );
-
-        expect(
-            document.querySelector('[data-testid="diarization-status"]'),
         ).toBeNull();
     });
 });
@@ -222,88 +199,6 @@ describe("Transcript: click-to-rename", () => {
         fireEvent.blur(input);
 
         expect(onRenameSpeaker).not.toHaveBeenCalled();
-    });
-});
-
-describe("Transcript: each DiarizationOutcome arm renders distinctly", () => {
-    const data = transcriptWith([cue(0, 2, "Hello there.")]);
-
-    it("degraded shows the reason, and is never mistaken for silence", () => {
-        const outcome: DiarizationOutcome = {
-            status: "degraded",
-            reason: "the segmentation model is not installed",
-        };
-        render(
-            <Transcript
-                transcribedData={data}
-                jobId='job-1'
-                diarizationOutcome={outcome}
-            />,
-        );
-
-        const banner = screen.getByTestId("diarization-status");
-        expect(banner.getAttribute("data-status")).toBe("degraded");
-        expect(banner.textContent).toContain(
-            "the segmentation model is not installed",
-        );
-    });
-
-    it("cancelled renders different text from degraded", () => {
-        const outcome: DiarizationOutcome = { status: "cancelled" };
-        render(
-            <Transcript
-                transcribedData={data}
-                jobId='job-1'
-                diarizationOutcome={outcome}
-            />,
-        );
-
-        const banner = screen.getByTestId("diarization-status");
-        expect(banner.getAttribute("data-status")).toBe("cancelled");
-        expect(banner.textContent).not.toContain("model");
-        expect(banner.textContent?.toLowerCase()).toContain("cancelled");
-    });
-
-    it("succeeded with an empty turn list is distinct from both degraded and cancelled", () => {
-        const outcome: DiarizationOutcome = {
-            status: "succeeded",
-            turns: [],
-            speaker_count: 0,
-        };
-        render(
-            <Transcript
-                transcribedData={data}
-                jobId='job-1'
-                diarizationOutcome={outcome}
-            />,
-        );
-
-        const banner = screen.getByTestId("diarization-status");
-        expect(banner.getAttribute("data-status")).toBe("succeeded-empty");
-        expect(banner.getAttribute("data-status")).not.toBe("degraded");
-        expect(banner.getAttribute("data-status")).not.toBe("cancelled");
-    });
-
-    it("succeeded with turns reports the speaker count", () => {
-        const outcome: DiarizationOutcome = {
-            status: "succeeded",
-            turns: [
-                { start: 0, end: 2, speaker: 0 },
-                { start: 3, end: 5, speaker: 1 },
-            ],
-            speaker_count: 2,
-        };
-        render(
-            <Transcript
-                transcribedData={data}
-                jobId='job-1'
-                diarizationOutcome={outcome}
-            />,
-        );
-
-        const banner = screen.getByTestId("diarization-status");
-        expect(banner.getAttribute("data-status")).toBe("succeeded");
-        expect(banner.textContent).toContain("2 speakers");
     });
 });
 

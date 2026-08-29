@@ -18,7 +18,6 @@ function App() {
                 <Transcript
                     transcribedData={transcriber.output}
                     jobId={transcriber.jobId}
-                    diarizationOutcome={transcriber.diarizationOutcome}
                     speakerNames={transcriber.speakerNames}
                     onRenameSpeaker={transcriber.renameSpeaker}
                 />

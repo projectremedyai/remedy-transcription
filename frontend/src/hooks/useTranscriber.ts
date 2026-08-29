@@ -9,7 +9,6 @@ import {
     TaskMode,
     resolveModelConfig,
 } from "../config/transcription";
-import { DIARIZATION_UI_ENABLED } from "../config/features";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
@@ -26,7 +25,6 @@ import {
 import type { SpeakerTurn } from "../lib/speakerAlignment";
 import {
     api,
-    DiarizationOutcome,
     Job,
     ModelStatusResponse,
     PersistTranscriptRequest,
@@ -126,43 +124,6 @@ export interface Transcriber {
     selectedModelId: string | null;
     presetOptions: typeof MODEL_PRESETS;
     languageOptions: typeof LANGUAGE_OPTIONS;
-    /**
-     * Speaker detection is EXPERIMENTAL and OPT-IN per job, default OFF: it
-     * costs real time (a second CPU-bound child alongside Whisper), and
-     * real-content testing found auto-detect alone unreliable — 52 phantom
-     * speakers on a 53-minute documentary. Read at the moment a run STARTS —
-     * flipping it mid-run does not retroactively diarize or un-diarize the run
-     * in flight.
-     *
-     * As of 1.1.0, `DIARIZATION_UI_ENABLED` (`../config/features`) is false,
-     * and this value is forced to false whenever it is regardless of the
-     * underlying state — see the return-object comment in the implementation.
-     */
-    diarizeEnabled: boolean;
-    setDiarizeEnabled: (enabled: boolean) => void;
-    /**
-     * "I know there are N speakers" — a HINT passed as `DiarizeOptions.num_speakers`,
-     * not a guarantee: sherpa-onnx's own reference case shows asking for 4 can
-     * still return 3.
-     *
-     * No longer optional in practice: with diarization now EXPERIMENTAL, the UI
-     * requires a valid count (an integer 1..{@link MAX_SPEAKERS}, see
-     * {@link isValidSpeakerCount}) whenever `diarizeEnabled` is on, and
-     * `diarizeAudio` below refuses to call `api.diarizeJob` without one rather
-     * than falling back to the auto-detect this omission used to trigger.
-     * `undefined` here means "no count entered yet", not "auto-detect".
-     */
-    numSpeakersHint: number | undefined;
-    setNumSpeakersHint: (value: number | undefined) => void;
-    /**
-     * What the most recent `diarize_job` call answered, for THIS run —
-     * `null` when the toggle was off, or no run has completed yet. The three
-     * arms of {@link DiarizationOutcome} are handled, not collapsed: a
-     * `"degraded"` run and a `"succeeded"` run that happened to find nobody both
-     * end up with no speaker labels on screen, and this is the only thing that
-     * lets a caller tell those apart and say so.
-     */
-    diarizationOutcome: DiarizationOutcome | null;
     /** Every speaker name set for the current job's source, keyed by its opaque label. */
     speakerNames: SpeakerNames;
     /**
@@ -171,30 +132,6 @@ export interface Transcriber {
      * write and the subsequent re-fetch both land.
      */
     renameSpeaker: (speakerKey: string, displayName: string) => Promise<void>;
-}
-
-/**
- * The backend's hard cap on a diarization speaker count (`MAX_SPEAKERS` in
- * `src-tauri/src/diarize.rs`), mirrored here so the UI's gate agrees with what
- * the sidecar will actually accept.
- */
-export const MAX_SPEAKERS = 64;
-
-/**
- * Is `value` a speaker count the sidecar can actually be asked for? The one
- * predicate both `AudioManager`'s gate (disabling Transcribe and the YouTube
- * tile) and `diarizeAudio` below's guard call, so the UI and the hook cannot
- * silently disagree about what "valid" means.
- */
-export function isValidSpeakerCount(
-    value: number | undefined,
-): value is number {
-    return (
-        typeof value === "number" &&
-        Number.isInteger(value) &&
-        value >= 1 &&
-        value <= MAX_SPEAKERS
-    );
 }
 
 type PendingWorker = {
@@ -257,12 +194,6 @@ export function useTranscriber(): Transcriber {
     const [modelStatusError, setModelStatusError] = useState<string | null>(
         null,
     );
-    const [diarizeEnabled, setDiarizeEnabled] = useState(false);
-    const [numSpeakersHint, setNumSpeakersHint] = useState<number | undefined>(
-        undefined,
-    );
-    const [diarizationOutcome, setDiarizationOutcome] =
-        useState<DiarizationOutcome | null>(null);
     const [speakerNames, setSpeakerNames] = useState<SpeakerNames>({});
 
     const pendingWorkerRef = useRef<PendingWorker | null>(null);
@@ -542,101 +473,6 @@ export function useTranscriber(): Transcriber {
             await refreshSpeakerNames(jobId);
         },
         [jobId, refreshSpeakerNames],
-    );
-
-    /**
-     * Kick off diarization for a job's already-prepared audio, if the toggle is
-     * on, and resolve the turns to align against.
-     *
-     * Resolves `undefined` in FOUR cases that a caller must NOT conflate:
-     * the toggle was off (no `diarizationOutcome` write at all — nothing ran);
-     * the toggle was on with no valid speaker count (see below); the sidecar
-     * answered `"succeeded"` with an empty turn list (a real success — silence,
-     * or one speaker); or it answered `"degraded"` / `"cancelled"`.
-     * `setDiarizationOutcome` is the one place that distinction survives, which
-     * is what lets the UI show each of those differently rather than rendering
-     * all of them as the same unlabelled transcript.
-     *
-     * THE MISSING-COUNT CASE is new: diarization is EXPERIMENTAL and requires a
-     * user-supplied speaker count now — real-content testing found auto-detect
-     * alone produces dozens of phantom speakers. `AudioManager`'s gate
-     * (`isValidSpeakerCount`) should make this branch unreachable — the
-     * Transcribe button and the YouTube tile are both disabled without a valid
-     * count — but this function does not TRUST that gate. If it is ever
-     * bypassed, `api.diarizeJob` is still never called with `numSpeakersHint`
-     * missing or out of range; the degradation is made VISIBLE via a
-     * `"degraded"` outcome instead of silently falling back to auto-detect.
-     *
-     * `api.diarizeJob` REJECTS only when the request itself was wrong — an
-     * unknown job, no prepared audio (a cache hit whose WAV has aged out is the
-     * realistic case), or an impossible `numSpeakers`. That is not one of the
-     * outcomes `DiarizationOutcome` models, but it is exactly as invisible
-     * a failure if swallowed, so it is folded into `"degraded"` for display: the
-     * user does not care whether the sidecar crashed or the request that reached
-     * it never had a chance to, only that speaker labels did not happen and why.
-     *
-     * `runId` is the caller's token, threaded through the exact same way
-     * `persistWorkerTranscript` gets one — every caller here already has it in
-     * scope. `api.diarizeJob` is an async round-trip, so the run that kicked it
-     * off can be superseded (cancel, or a second file) before it answers. The
-     * KICKOFF may happen for a run that is still current at the time it is
-     * called — that part needs no guard. The `setDiarizationOutcome` WRITE, at
-     * the moment the promise resolves, is the one that must be dropped if the
-     * token has moved on since: `persistWorkerTranscript` guards its own state
-     * write on `runIdRef.current === runId` right where its diarization promise
-     * resolves, and this mirrors that, not a new mechanism.
-     *
-     * `DIARIZATION_UI_ENABLED` (1.1.0: off — see `../config/features`) is
-     * checked FIRST, ahead of `diarizeEnabled`. The UI cannot turn the toggle
-     * on while the flag is off, so this is belt-and-braces: no code path,
-     * including a stale/persisted `diarizeEnabled` state, can reach
-     * `api.diarizeJob` while the feature is flagged off.
-     */
-    const diarizeAudio = useCallback(
-        async (
-            targetJobId: string,
-            runId: number,
-        ): Promise<SpeakerTurn[] | undefined> => {
-            if (!DIARIZATION_UI_ENABLED || !diarizeEnabled) {
-                return undefined;
-            }
-            if (!isValidSpeakerCount(numSpeakersHint)) {
-                // Unreachable through the UI gate — see the doc comment above
-                // — but this must not silently skip diarization or fall back
-                // to auto-detect if the gate is ever bypassed.
-                if (runIdRef.current === runId) {
-                    setDiarizationOutcome({
-                        status: "degraded",
-                        reason: "no speaker count provided",
-                    });
-                }
-                return undefined;
-            }
-            try {
-                const outcome = await api.diarizeJob(
-                    targetJobId,
-                    numSpeakersHint,
-                );
-                if (runIdRef.current === runId) {
-                    setDiarizationOutcome(outcome);
-                }
-                return outcome.status === "succeeded"
-                    ? outcome.turns
-                    : undefined;
-            } catch (diarizeError) {
-                if (runIdRef.current === runId) {
-                    setDiarizationOutcome({
-                        status: "degraded",
-                        reason:
-                            diarizeError instanceof Error
-                                ? diarizeError.message
-                                : "Speaker detection could not run",
-                    });
-                }
-                return undefined;
-            }
-        },
-        [diarizeEnabled, numSpeakersHint],
     );
 
     const applyCompletedJob = useCallback(
@@ -944,9 +780,9 @@ export function useTranscriber(): Transcriber {
      * Unguarded, `applyCompletedJob` then wrote `setJobId`, `setTranscript`,
      * `setStatus("completed")` and `setIsBusy(false)` for that dead run: the user
      * is left looking at the transcript they cancelled, under the wrong job id
-     * (which every jobId-keyed action downstream — export, the diarizer — then
-     * targets), and under a LIVE second run the `setIsBusy(false)` takes the busy
-     * panel and the Cancel button off the screen while Whisper is still grinding.
+     * (which every jobId-keyed action downstream, like export, then targets),
+     * and under a LIVE second run the `setIsBusy(false)` takes the busy panel and
+     * the Cancel button off the screen while Whisper is still grinding.
      *
      * THE PERSIST ITSELF STILL COMPLETES, deliberately. The transcript is written
      * under ITS OWN job, which is correct, and the cache is content-keyed, so the
@@ -957,14 +793,6 @@ export function useTranscriber(): Transcriber {
      * Pinned by `useTranscriber.test.ts`: "does not repaint a finished run with a
      * dead run's persist" and "does not release the busy gate under a live run
      * when a dead run persists". Delete the guard below and both fail.
-     *
-     * `diarizationPromise` is where diarization's answer JOINS the transcript.
-     * It was kicked off by the caller as soon as the canonical WAV existed —
-     * concurrently with the Whisper transcription above, not after it, because
-     * Whisper (webview) and sherpa-onnx (Rust sidecar) share no runtime and
-     * diarizing a multi-minute file can take longer than transcribing it. By the
-     * time control reaches here the worker's `complete` has already fired, so
-     * this `await` is the one place both sides are known to have finished.
      */
     const persistWorkerTranscript = useCallback(
         async (
@@ -973,18 +801,18 @@ export function useTranscriber(): Transcriber {
             workerTranscript: WorkerTranscript,
             audioDuration: number,
             runId: number,
-            diarizationPromise: Promise<SpeakerTurn[] | undefined>,
+            /**
+             * Speaker turns, when the engine produced any. Always `undefined` on
+             * the local engine, which has no diarizer. The Gemini engine supplies
+             * real turns for single-chunk audio.
+             */
+            turns: readonly SpeakerTurn[] | undefined,
         ) => {
             // Safe unguarded: the only caller reaches here in the microtask that
             // follows the worker's `complete`, and the token cannot move inside a
             // microtask (see `claimRun`).
             setStatus("persisting");
             setIsBusy(true);
-
-            // The join. This DOES cross an await, so the token can move here —
-            // unlike the two lines above, nothing after this point is safe
-            // unguarded.
-            const turns = await diarizationPromise;
 
             if (runIdRef.current === runId) {
                 // Show the diarized transcript as soon as the turns are known,
@@ -1050,10 +878,9 @@ export function useTranscriber(): Transcriber {
             setError(null);
             setProgress(0);
             setStatus("checking-cache");
-            // A fresh run's diarization has not happened yet, so a stale
-            // outcome (or stale names) from the PREVIOUS job must not sit on
-            // screen looking like an answer for this one.
-            setDiarizationOutcome(null);
+            // A fresh run's speaker names have not been re-fetched yet, so a
+            // stale set from the PREVIOUS job must not sit on screen looking
+            // like an answer for this one.
             setSpeakerNames({});
 
             const caps = await ensureBrowserCaps();
@@ -1114,24 +941,13 @@ export function useTranscriber(): Transcriber {
             cancelPendingWait();
 
             if (initialJob.status === "completed") {
-                // A cache hit — the transcript already exists, but this run's
-                // diarization toggle has not been honoured yet. This IS the
-                // "legacy transcript" path a not-yet-word-granular cached row
-                // reaches: `diarizeAudio` returns turns (or doesn't) the same
-                // way regardless of granularity, and `consolidateSegments`
-                // inside `applyCompletedJob` decides word- vs segment-level
-                // alignment from the segments themselves.
-                //
-                // NOTE what this does NOT do: persist the turns. There is no
-                // command to write a new diarization run's speakers onto an
-                // already-persisted job's rows, so a cache hit's labels are
-                // shown for this session only, from `job.segments` as they
-                // already are. See the report for this task.
-                const turns = await diarizeAudio(initialJob.id, runId);
+                // A cache hit — the transcript already exists, and its
+                // segments already carry whatever speaker labels they were
+                // persisted with.
                 if (runIdRef.current !== runId) {
                     return;
                 }
-                applyCompletedJob(initialJob, config.presetLabel, turns);
+                applyCompletedJob(initialJob, config.presetLabel);
                 return;
             }
 
@@ -1151,23 +967,14 @@ export function useTranscriber(): Transcriber {
             if (readyJob.status === "completed") {
                 // Same cache-hit case as above, reached via the polling path
                 // instead of the immediate one.
-                const turns = await diarizeAudio(readyJob.id, runId);
                 if (runIdRef.current !== runId) {
                     return;
                 }
-                applyCompletedJob(readyJob, config.presetLabel, turns);
+                applyCompletedJob(readyJob, config.presetLabel);
                 return;
             }
 
             setStatus("loading-audio");
-
-            // Kicked off HERE — as soon as the canonical WAV exists — and run
-            // CONCURRENTLY with the whisper transcription below, not awaited
-            // until `persistWorkerTranscript` needs the answer. Whisper (webview)
-            // and sherpa-onnx (Rust sidecar) share no runtime, so there is
-            // nothing to gain from serializing them: diarizing a multi-minute
-            // file can take longer than transcribing it.
-            const diarizationPromise = diarizeAudio(readyJob.id, runId);
 
             const audioUrl = await api.getAudioUrl(readyJob.id);
             const audioResponse = await fetch(audioUrl);
@@ -1222,13 +1029,12 @@ export function useTranscriber(): Transcriber {
                 workerTranscript,
                 audioBuffer.duration,
                 runId,
-                diarizationPromise,
+                undefined,
             );
         },
         [
             applyCompletedJob,
             cancelPendingWait,
-            diarizeAudio,
             handleBackendJobUpdate,
             persistWorkerTranscript,
             runWorkerTranscription,
@@ -1325,13 +1131,6 @@ export function useTranscriber(): Transcriber {
      * is not. That is tolerable ONLY because an abandoned ffmpeg finishes on its
      * own, in seconds to a minute.
      *
-     * The diarization sidecar is NOT like that, which is why it is the one child
-     * this does kill: it is a CPU-bound ONNX process with a 30-minute backstop
-     * timeout, so leaving it to "finish on its own" means pinning a core for up to
-     * half an hour behind an idle-looking app. `cancel_diarization` is a no-op for
-     * a job that is not diarizing, and it is fire-and-forget: a cancel that cannot
-     * reach the backend must still clear the UI.
-     *
      * Nor does it stop a `persistTranscript` already in flight — and cancelling
      * inside that window is exactly how the last bug was reached, because the app
      * is `isBusy` while persisting, so the Cancel button is on screen. The persist
@@ -1341,12 +1140,6 @@ export function useTranscriber(): Transcriber {
      */
     const cancel = useCallback(() => {
         claimRun();
-        if (jobId) {
-            void api.cancelDiarization(jobId).catch(() => {
-                // Best effort. The UI is being torn down either way, and there is
-                // nothing a user could do with "the cancel request failed".
-            });
-        }
         setTranscript((previous) =>
             previous ? { ...previous, isBusy: false } : previous,
         );
@@ -1356,14 +1149,13 @@ export function useTranscriber(): Transcriber {
         setProgress(0);
         setStatus("idle");
         setError(null);
-    }, [claimRun, jobId]);
+    }, [claimRun]);
 
     const onInputChange = useCallback(() => {
         setTranscript(undefined);
         setError(null);
         setProgress(0);
         setStatus("idle");
-        setDiarizationOutcome(null);
         setSpeakerNames({});
     }, []);
 
@@ -1408,16 +1200,6 @@ export function useTranscriber(): Transcriber {
             selectedModelId,
             presetOptions: MODEL_PRESETS,
             languageOptions: LANGUAGE_OPTIONS,
-            // Belt-and-braces, mirroring `diarizeAudio`'s own guard above: with
-            // the flag off, this must read as false regardless of the
-            // underlying `diarizeEnabled` state (which the UI cannot even set
-            // — `DiarizationSettings` is unrendered — but a stale value could
-            // in principle survive elsewhere).
-            diarizeEnabled: DIARIZATION_UI_ENABLED && diarizeEnabled,
-            setDiarizeEnabled,
-            numSpeakersHint,
-            setNumSpeakersHint,
-            diarizationOutcome,
             speakerNames,
             renameSpeaker,
         }),
@@ -1425,8 +1207,6 @@ export function useTranscriber(): Transcriber {
             browserCaps,
             cancel,
             capabilityLabel,
-            diarizeEnabled,
-            diarizationOutcome,
             effectivePresetLabel,
             error,
             isBusy,
@@ -1435,7 +1215,6 @@ export function useTranscriber(): Transcriber {
             language,
             modelStatus,
             modelStatusError,
-            numSpeakersHint,
             onInputChange,
             presetId,
             progress,

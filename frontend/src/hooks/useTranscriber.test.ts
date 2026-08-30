@@ -28,6 +28,10 @@ const mocks = vi.hoisted(() => ({
     unsubscribe: vi.fn(),
     setSpeakerName: vi.fn(),
     getSpeakerNames: vi.fn(),
+    /** The gemini engine's own api surface — see R8's "engine-aware readiness gates". */
+    transcribeWithGemini: vi.fn(),
+    subscribeToGeminiProgress: vi.fn(),
+    cancelGeminiTranscription: vi.fn(),
 }));
 
 /**
@@ -57,6 +61,9 @@ vi.mock("../services/api", () => ({
         subscribeToProgress: mocks.subscribeToProgress,
         setSpeakerName: mocks.setSpeakerName,
         getSpeakerNames: mocks.getSpeakerNames,
+        transcribeWithGemini: mocks.transcribeWithGemini,
+        subscribeToGeminiProgress: mocks.subscribeToGeminiProgress,
+        cancelGeminiTranscription: mocks.cancelGeminiTranscription,
     },
 }));
 
@@ -153,6 +160,7 @@ beforeEach(() => {
     }
 
     mocks.subscribeToProgress.mockReturnValue(mocks.unsubscribe);
+    mocks.subscribeToGeminiProgress.mockReturnValue(() => undefined);
     mocks.getModelStatus.mockResolvedValue({
         models_ready: true,
         missing_models: [],
@@ -1055,5 +1063,67 @@ describe("useTranscriber's speaker renaming", () => {
         });
 
         expect(mocks.setSpeakerName).not.toHaveBeenCalled();
+    });
+});
+
+/**
+ * R8 (Task 13's controller ruling): `modelStatus` (from Rust's `list_models`)
+ * reports LOCAL Whisper download status only, and `gemini-3.5-transcribe`
+ * never appears in it — `beforeEach` above seeds `modelStatus.items` with
+ * nothing but `MODEL_PRESETS`. Both gates below are the ones that used to read
+ * that absence as "not ready" for every engine, not just the local one.
+ */
+describe("R8: engine-aware readiness gates", () => {
+    it("selectedModelAvailable is true for the gemini engine (gate 1)", async () => {
+        const { result } = await renderTranscriber();
+
+        await act(async () => {
+            result.current.setEngine("gemini");
+        });
+        await settle();
+
+        // Pre-fix, this fell through to `modelStatus.items.some(...)`, which
+        // can never match `gemini-3.5-transcribe`, and stayed `false` forever.
+        expect(result.current.selectedModelAvailable).toBe(true);
+    });
+
+    it("a gemini run is not blocked by the local-install check, and reaches the engine (gate 2)", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({
+                id: "job-1",
+                status: "ready",
+                progress: 1,
+                model_id: "gemini-3.5-transcribe",
+            }),
+        );
+        mocks.transcribeWithGemini.mockResolvedValue({
+            text: "hello there",
+            words: [
+                { text: "hello", start: 0, end: 1 },
+                { text: "there", start: 1, end: 2 },
+            ],
+            speakers: { status: "unavailable", reason: "chunked audio" },
+            audio_duration: 2,
+        });
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.setEngine("gemini");
+        });
+        await settle();
+
+        await act(async () => {
+            result.current.start("/tmp/talk.mp4");
+        });
+        await settle();
+
+        // Pre-fix, `beginRun` threw "Model files for ... are not installed on
+        // the server" BEFORE `createFileJob` was ever called. Reaching
+        // `createFileJob` at all is gate 2 not firing; reaching `completed`
+        // is confirmation the gemini engine actually ran.
+        expect(mocks.createFileJob).toHaveBeenCalled();
+        expect(mocks.transcribeWithGemini).toHaveBeenCalledWith("job-1");
+        expect(result.current.status).toBe("completed");
+        expect(result.current.error).toBeNull();
     });
 });

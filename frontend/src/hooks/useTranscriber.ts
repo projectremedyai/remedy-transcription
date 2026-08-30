@@ -9,7 +9,7 @@ import {
     TaskMode,
     resolveModelConfig,
 } from "../config/transcription";
-import { EngineId } from "../config/engines";
+import { EngineId, engineById } from "../config/engines";
 import { createLocalEngine } from "./engines/localEngine";
 import { createGeminiEngine } from "./engines/geminiEngine";
 import type { EngineSpeakers, TranscriptionEngine } from "./engines/types";
@@ -446,6 +446,13 @@ export function useTranscriber(): Transcriber {
 
     const selectedModelId = selectedModelConfig?.modelId ?? null;
     const selectedModelAvailable = useMemo(() => {
+        // `list_models` reports LOCAL Whisper download status only. A cloud
+        // engine (descriptor `modelId !== null`) has no local model to
+        // download — its readiness is "a key is stored" (`engineReady` in
+        // `AudioManager`), which `list_models` cannot see and must not gate.
+        if (engineById(engine).modelId !== null) {
+            return true;
+        }
         if (!selectedModelId) {
             return true;
         }
@@ -455,7 +462,7 @@ export function useTranscriber(): Transcriber {
         return modelStatus.items.some(
             (item) => item.model_id === selectedModelId && item.ready,
         );
-    }, [modelStatus, selectedModelId]);
+    }, [engine, modelStatus, selectedModelId]);
 
     /**
      * Every name given to the current job's speakers. Best-effort: a failed fetch
@@ -951,7 +958,12 @@ export function useTranscriber(): Transcriber {
                 task,
                 language,
             );
+            // Same branch as `selectedModelAvailable` above, and for the same
+            // reason: a cloud engine's model is never in `list_models`, so
+            // this check is only meaningful for an engine that resolves to a
+            // model file on THIS machine.
             if (
+                engineById(engine).modelId === null &&
                 modelStatus &&
                 !modelStatus.items.some(
                     (item) => item.model_id === config.modelId && item.ready,

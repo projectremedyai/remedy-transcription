@@ -12,6 +12,9 @@ import Modal from "./modal/Modal";
 import { UrlInput } from "./modal/UrlInput";
 import { Transcriber } from "../hooks/useTranscriber";
 import Progress from "./Progress";
+import GeminiKeyDialog from "./GeminiKeyDialog";
+import { ENGINES, EngineId, engineById } from "../config/engines";
+import { api } from "../services/api";
 
 /**
  * What ffmpeg is willing to be pointed at. Used for BOTH the file picker's filter
@@ -55,10 +58,31 @@ export function AudioManager(props: { transcriber: Transcriber }) {
     const [isDragging, setIsDragging] = useState(false);
     const [dropError, setDropError] = useState<string | null>(null);
     const [dropNotice, setDropNotice] = useState<string | null>(null);
+    const [geminiKeyConfigured, setGeminiKeyConfigured] = useState(false);
+    const [keyDialogOpen, setKeyDialogOpen] = useState(false);
+
+    useEffect(() => {
+        let live = true;
+        api.geminiKeyStatus()
+            .then((configured) => {
+                if (live) setGeminiKeyConfigured(configured);
+            })
+            .catch(() => {
+                // A keychain that will not answer reads as "no key", which
+                // routes the user to Add-key rather than into a doomed run.
+            });
+        return () => {
+            live = false;
+        };
+    }, []);
 
     const { transcriber } = props;
     const { onInputChange } = transcriber;
     const isBusy = transcriber.isBusy;
+
+    const engine = engineById(transcriber.engine);
+    /** A cloud engine with no credential cannot start. Say so before the run. */
+    const engineReady = !engine.requiresKey || geminiKeyConfigured;
 
     // The drop listener reads `isBusy`, but it must not DEPEND on it: Tauri's
     // `onDragDropEvent()` resolves asynchronously, so re-running the effect on
@@ -192,6 +216,15 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 return "Downloading from YouTube...";
             case "extracting":
                 return "Extracting audio...";
+            // The backend's own job-status string, on screen for the window
+            // between prepared audio going "ready" and the engine's first
+            // progress event. The local engine closes that window itself
+            // (its `run()` posts "loading-audio" before its first `await`),
+            // but Gemini's first event waits on a Rust-side silence-detection
+            // pass, so without this case the spinner would sit next to blank
+            // text for a couple of seconds.
+            case "ready":
+                return "Preparing transcription...";
             case "loading-audio":
                 return "Loading prepared audio...";
             case "transcribing":
@@ -289,7 +322,9 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                         text='YouTube'
                         onUrlSubmit={handleYouTubeSubmit}
                         enabled={
-                            props.transcriber.selectedModelAvailable && !isBusy
+                            props.transcriber.selectedModelAvailable &&
+                            engineReady &&
+                            !isBusy
                         }
                         disabled={isBusy}
                     />
@@ -306,7 +341,86 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                         Drop an audio or video file to transcribe it
                     </div>
                 )}
-                <div className='w-full px-4 pb-4'>
+                <div className='w-full px-4 pb-4 flex flex-col gap-3'>
+                    <fieldset className='flex flex-col gap-2 border-b border-slate-100 pb-3'>
+                        <legend className='sr-only'>
+                            Transcription engine
+                        </legend>
+                        {ENGINES.map((candidate) => (
+                            <label
+                                key={candidate.id}
+                                className='flex items-start gap-2'
+                            >
+                                <input
+                                    type='radio'
+                                    name='engine'
+                                    value={candidate.id}
+                                    checked={
+                                        transcriber.engine === candidate.id
+                                    }
+                                    disabled={transcriber.isBusy}
+                                    onChange={() =>
+                                        transcriber.setEngine(
+                                            candidate.id as EngineId,
+                                        )
+                                    }
+                                    className='mt-1 border-slate-300 text-indigo-600 focus:ring-indigo-500'
+                                />
+                                <span className='flex flex-col'>
+                                    <span className='text-slate-700'>
+                                        {candidate.label}
+                                    </span>
+                                    <span className='text-xs text-slate-500'>
+                                        {candidate.description}
+                                    </span>
+                                </span>
+                            </label>
+                        ))}
+
+                        {engine.requiresKey && (
+                            <div className='flex items-center gap-3 pl-6 text-xs'>
+                                {geminiKeyConfigured ? (
+                                    <>
+                                        <span className='text-emerald-700'>
+                                            Key saved
+                                        </span>
+                                        <button
+                                            type='button'
+                                            onClick={() =>
+                                                setKeyDialogOpen(true)
+                                            }
+                                            className='text-slate-500 underline underline-offset-2 hover:text-indigo-600'
+                                        >
+                                            Change
+                                        </button>
+                                    </>
+                                ) : (
+                                    <>
+                                        <span className='text-amber-700'>
+                                            Gemini needs an API key
+                                        </span>
+                                        <button
+                                            type='button'
+                                            onClick={() =>
+                                                setKeyDialogOpen(true)
+                                            }
+                                            className='text-indigo-600 underline underline-offset-2'
+                                        >
+                                            Add key
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+                        )}
+                    </fieldset>
+
+                    <GeminiKeyDialog
+                        show={keyDialogOpen}
+                        configured={geminiKeyConfigured}
+                        onClose={() => setKeyDialogOpen(false)}
+                        onSaved={setGeminiKeyConfigured}
+                    />
+
                     <SettingsPanel transcriber={props.transcriber} />
                 </div>
                 {!props.transcriber.modelsStatusLoaded && (
@@ -409,7 +523,10 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                     </div>
                     <button
                         onClick={handleTranscribe}
-                        disabled={!props.transcriber.selectedModelAvailable}
+                        disabled={
+                            !props.transcriber.selectedModelAvailable ||
+                            !engineReady
+                        }
                         className='bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-medium py-2 px-6 rounded-lg transition-colors duration-200'
                     >
                         Transcribe
@@ -421,35 +538,47 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 }
 
 function SettingsPanel(props: { transcriber: Transcriber }) {
+    const engine = engineById(props.transcriber.engine);
+
     return (
         <div className='flex flex-col gap-3 text-sm'>
             <div className='grid grid-cols-1 md:grid-cols-3 gap-3'>
-                <label className='flex flex-col text-slate-600'>
-                    Model preset
-                    <select
-                        value={props.transcriber.presetId}
-                        onChange={(event) =>
-                            props.transcriber.setPresetId(
-                                event.target
-                                    .value as typeof props.transcriber.presetId,
-                            )
-                        }
-                        className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
-                    >
-                        {props.transcriber.presetOptions.map((preset) => (
-                            <option
-                                key={preset.id}
-                                value={preset.id}
-                                disabled={
-                                    preset.webgpuOnly &&
-                                    !props.transcriber.browserCaps?.canUseWebGPU
-                                }
-                            >
-                                {preset.label}
-                            </option>
-                        ))}
-                    </select>
-                </label>
+                {engine.modelId === null ? (
+                    <label className='flex flex-col text-slate-600'>
+                        Model
+                        <select
+                            value={props.transcriber.presetId}
+                            onChange={(event) =>
+                                props.transcriber.setPresetId(
+                                    event.target
+                                        .value as typeof props.transcriber.presetId,
+                                )
+                            }
+                            className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
+                        >
+                            {props.transcriber.presetOptions.map((preset) => (
+                                <option
+                                    key={preset.id}
+                                    value={preset.id}
+                                    disabled={
+                                        preset.webgpuOnly &&
+                                        !props.transcriber.browserCaps
+                                            ?.canUseWebGPU
+                                    }
+                                >
+                                    {preset.label}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                ) : (
+                    <div className='flex flex-col text-slate-600'>
+                        Model
+                        <span className='mt-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700'>
+                            Gemini 3.5 Transcribe
+                        </span>
+                    </div>
+                )}
 
                 <label className='flex flex-col text-slate-600'>
                     Task
@@ -462,6 +591,7 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
                                     | "translate",
                             )
                         }
+                        disabled={!engine.supportsTranslate}
                         className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
                     >
                         <option value='transcribe'>Transcribe</option>
@@ -470,12 +600,13 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
                 </label>
 
                 <label className='flex flex-col text-slate-600'>
-                    Source language
+                    Language
                     <select
                         value={props.transcriber.language}
                         onChange={(event) =>
                             props.transcriber.setLanguage(event.target.value)
                         }
+                        disabled={!engine.supportsLanguageChoice}
                         className='mt-1 rounded-lg border border-slate-300 px-3 py-2'
                     >
                         {props.transcriber.languageOptions.map((option) => (
@@ -486,6 +617,14 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
                     </select>
                 </label>
             </div>
+
+            {!engine.supportsLanguageChoice && (
+                <p className='text-xs text-slate-500'>
+                    Gemini detects the language automatically across 85+ locales
+                    and has no translation mode, so Task and Language do not
+                    apply.
+                </p>
+            )}
         </div>
     );
 }

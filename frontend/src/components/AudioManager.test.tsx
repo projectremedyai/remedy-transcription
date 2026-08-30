@@ -14,7 +14,13 @@
  * valid YouTube URL, is never blocked by something unrelated) still holds,
  * and is still worth a real render to prove.
  */
-import { render, screen, cleanup, fireEvent } from "@testing-library/react";
+import {
+    render,
+    screen,
+    cleanup,
+    fireEvent,
+    act,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LANGUAGE_OPTIONS, MODEL_PRESETS } from "../config/transcription";
@@ -22,6 +28,7 @@ import type { Transcriber } from "../hooks/useTranscriber";
 
 const mocks = vi.hoisted(() => ({
     open: vi.fn(),
+    geminiKeyStatus: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -37,6 +44,19 @@ vi.mock("@tauri-apps/api/webview", () => ({
     }),
 }));
 
+// `AudioManager` reads `api.geminiKeyStatus` directly (not through the
+// `Transcriber` prop), and mounts the real `GeminiKeyDialog`, which reads
+// `api.setGeminiKey`/`api.clearGeminiKey`. Neither Save nor Remove is
+// exercised here, so both are inert stubs — only `geminiKeyStatus` needs a
+// per-test resolved value.
+vi.mock("../services/api", () => ({
+    api: {
+        geminiKeyStatus: (...args: unknown[]) => mocks.geminiKeyStatus(...args),
+        setGeminiKey: vi.fn().mockResolvedValue(undefined),
+        clearGeminiKey: vi.fn().mockResolvedValue(undefined),
+    },
+}));
+
 import { AudioManager } from "./AudioManager";
 
 afterEach(() => {
@@ -45,8 +65,9 @@ afterEach(() => {
 
 beforeEach(() => {
     mocks.open.mockReset();
+    mocks.geminiKeyStatus.mockReset();
     // jsdom has no `ResizeObserver`; Headless UI's `Dialog` (used by the
-    // YouTube modal) reads it on mount.
+    // YouTube modal and the Gemini key dialog) reads it on mount.
     vi.stubGlobal(
         "ResizeObserver",
         class {
@@ -63,8 +84,32 @@ beforeEach(() => {
  * so a later caller can add new override fields (an engine selector, a
  * key-configured flag, a selected path) without touching every existing
  * call site.
+ *
+ * `geminiKeyConfigured` and `selectedPath` are not `Transcriber` fields —
+ * the former drives the `api.geminiKeyStatus()` mock `AudioManager` fetches
+ * for itself, the latter seeds the component's own internal `selectedPath`
+ * state (there is no prop for it) by driving the same file-picker path
+ * `selectAFile` below already used.
+ *
+ * This is `async` and must be awaited by any caller whose assertions depend
+ * on `geminiKeyConfigured`: the value only reaches the screen after the
+ * mocked promise's `.then()` runs, which — being a real microtask — cannot
+ * have happened yet by the statement right after a bare `render()`. The
+ * `act(() => Promise.resolve())` below is what flushes it.
  */
-function renderAudioManager(overrides: Partial<Transcriber> = {}) {
+async function renderAudioManager(
+    overrides: Partial<Transcriber> & {
+        geminiKeyConfigured?: boolean;
+        selectedPath?: string;
+    } = {},
+) {
+    const {
+        geminiKeyConfigured = false,
+        selectedPath,
+        ...transcriberOverrides
+    } = overrides;
+    mocks.geminiKeyStatus.mockResolvedValue(geminiKeyConfigured);
+
     const transcriber: Transcriber = {
         onInputChange: vi.fn(),
         isBusy: false,
@@ -100,10 +145,23 @@ function renderAudioManager(overrides: Partial<Transcriber> = {}) {
         speakerNames: {},
         renameSpeaker: vi.fn(),
         speakerOutcome: null,
-        ...overrides,
+        ...transcriberOverrides,
     };
 
-    return render(<AudioManager transcriber={transcriber} />);
+    const result = render(<AudioManager transcriber={transcriber} />);
+    // Flushes the `api.geminiKeyStatus()` effect's pending `.then()` — see
+    // the doc comment above.
+    await act(() => Promise.resolve());
+
+    if (selectedPath) {
+        mocks.open.mockResolvedValueOnce(selectedPath);
+        fireEvent.click(screen.getByText("From file"));
+        // `open()` resolves asynchronously; `findByRole` polls until the
+        // Transcribe button the resolution reveals actually appears.
+        await screen.findByRole("button", { name: /transcribe/i });
+    }
+
+    return result;
 }
 
 async function selectAFile() {
@@ -114,9 +172,16 @@ async function selectAFile() {
     return screen.findByRole("button", { name: "Transcribe" });
 }
 
+// `@testing-library/jest-dom` (the usual home of `toBeDisabled()`) is not a
+// dependency of this project — every other test in this file reads the DOM
+// `disabled` property directly instead, and this keeps that same style.
+function isDisabled(element: HTMLElement): boolean {
+    return (element as HTMLButtonElement | HTMLSelectElement).disabled;
+}
+
 describe("AudioManager: Transcribe / YouTube submit stay enabled", () => {
     it("leaves Transcribe enabled once a file is selected and the model is available", async () => {
-        renderAudioManager();
+        await renderAudioManager();
         await selectAFile();
 
         expect(
@@ -126,8 +191,8 @@ describe("AudioManager: Transcribe / YouTube submit stay enabled", () => {
         ).toHaveProperty("disabled", false);
     });
 
-    it("leaves the YouTube modal's submit enabled once a valid URL is entered", () => {
-        renderAudioManager();
+    it("leaves the YouTube modal's submit enabled once a valid URL is entered", async () => {
+        await renderAudioManager();
 
         fireEvent.click(screen.getByText("YouTube"));
         fireEvent.change(screen.getByPlaceholderText("www.example.com"), {
@@ -137,5 +202,81 @@ describe("AudioManager: Transcribe / YouTube submit stay enabled", () => {
         expect(
             screen.getByText("Prepare Audio") as HTMLButtonElement,
         ).toHaveProperty("disabled", false);
+    });
+});
+
+describe("the engine selector", () => {
+    it("offers both engines", async () => {
+        await renderAudioManager();
+        expect(screen.getByLabelText(/on-device/i)).toBeTruthy();
+        expect(screen.getByLabelText(/google gemini/i)).toBeTruthy();
+    });
+
+    /**
+     * gemini-3.5-transcribe has no translation mode and no language-forcing
+     * parameter. Leaving these enabled would let the user set a value that
+     * silently does nothing.
+     */
+    it("disables Task and Language on the gemini engine, with a reason", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+        });
+        expect(isDisabled(screen.getByLabelText(/^task$/i))).toBe(true);
+        expect(isDisabled(screen.getByLabelText(/^language$/i))).toBe(true);
+        expect(
+            screen.getByText(/detects the language automatically/i),
+        ).toBeTruthy();
+    });
+
+    it("leaves Task and Language enabled on the local engine", async () => {
+        await renderAudioManager({ engine: "local" });
+        expect(isDisabled(screen.getByLabelText(/^task$/i))).toBe(false);
+        expect(isDisabled(screen.getByLabelText(/^language$/i))).toBe(false);
+    });
+
+    it("shows the fixed Gemini model instead of the local preset dropdown", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+        });
+        expect(screen.queryByLabelText(/^model$/i)).toBeNull();
+        expect(screen.getByText(/Gemini 3\.5 Transcribe/)).toBeTruthy();
+    });
+
+    /**
+     * The no-key gate. Starting a run that can only fail at the first API call
+     * wastes an ffmpeg pass and tells the user nothing useful.
+     */
+    it("blocks transcription and prompts for a key when none is stored", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: false,
+            selectedPath: "/a.mp4",
+        });
+        expect(
+            isDisabled(screen.getByRole("button", { name: /transcribe/i })),
+        ).toBe(true);
+        expect(screen.getByRole("button", { name: /add key/i })).toBeTruthy();
+    });
+
+    it("allows transcription once a key is stored", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+            selectedPath: "/a.mp4",
+        });
+        expect(
+            isDisabled(screen.getByRole("button", { name: /transcribe/i })),
+        ).toBe(false);
+    });
+
+    /** The privacy trade must be stated where the choice is made. */
+    it("warns that audio leaves the machine on the gemini engine", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+        });
+        expect(screen.getByText(/uploaded to Google/i)).toBeTruthy();
     });
 });

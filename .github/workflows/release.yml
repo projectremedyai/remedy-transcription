@@ -12,8 +12,13 @@ on:
   # The check that needs NOTHING configured, and so actually runs. Whoever
   # built the artifact and however they built it, a published release is
   # inspected here and the notarization is proven rather than trusted.
+  # `published` alone is not enough. Toggling an already-published release to
+  # draft and back emits no `published` at all -- that was tried, and produced
+  # zero runs -- so `released` is listed too, and `workflow_dispatch` below can
+  # run this against the current latest release on demand. A verification job
+  # nobody can trigger is a verification job nobody trusts.
   release:
-    types: [published]
+    types: [published, released]
   # Full automated build, but only where the signing secrets exist; see
   # `preflight`. Without them this is SKIPPED, not failed -- a workflow that
   # goes red on every tag teaches people to ignore it.
@@ -61,15 +66,22 @@ jobs:
   # evidence and the wrong script exits 0.
   verify-release:
     name: Verify the published installer is notarized
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - name: Download the release's installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Empty on a manual run, which is what the fallback below is for.
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          gh release download "${{ github.event.release.tag_name }}" \
+          tag="$RELEASE_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            echo "::notice::manual run -- verifying the latest release, $tag"
+          fi
+          gh release download "$tag" \
             --repo "$GITHUB_REPOSITORY" --pattern '*.dmg' --dir .
           ls -la ./*.dmg
 

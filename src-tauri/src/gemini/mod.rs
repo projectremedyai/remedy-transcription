@@ -433,4 +433,206 @@ mod tests {
             ),
         }
     }
+
+    /// The MULTI-CHUNK live probe. Also `#[ignore]`d, also spends real money.
+    ///
+    /// The single-chunk probe above proves the service is up; it proves nothing
+    /// about the path that only long audio takes. Everything interesting about
+    /// this engine lives past the 28-minute cap: `plan` splitting the file,
+    /// `snap_to_silence` moving the seams off mid-word, per-chunk slicing,
+    /// `shift` rebasing each chunk into whole-file time, and the stitch. None of
+    /// that had ever run against the real API -- the fixtures are single
+    /// responses, and a 20-minute file is one chunk.
+    ///
+    ///     GEMINI_PROBE_WAV=/path/to/canonical-16k-mono.wav \
+    ///     cargo test --manifest-path src-tauri/Cargo.toml \
+    ///         gemini_multi_chunk -- --ignored --nocapture
+    ///
+    /// The WAV must be the canonical 16 kHz mono the app produces, and longer
+    /// than `MAX_CHUNK_SECS`, or there is nothing here to test.
+    ///
+    /// THE ASSERTION THAT MATTERS is monotonic time across the whole stitched
+    /// transcript. Word order IS the transcript: a `shift` applied with the
+    /// wrong offset, or chunks appended out of order, produces a file that
+    /// still parses, still has plausible word counts, and is quietly scrambled
+    /// at the seams. Only ordering catches that.
+    #[tokio::test]
+    #[ignore = "live: spends money and needs GEMINI_API_KEY + GEMINI_PROBE_WAV"]
+    async fn gemini_multi_chunk_probe() {
+        let key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+        let wav = std::path::PathBuf::from(
+            std::env::var("GEMINI_PROBE_WAV").expect("GEMINI_PROBE_WAV"),
+        );
+
+        let probed = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
+            .arg(&wav)
+            .output()
+            .expect("ffprobe runs");
+        let duration: f64 = String::from_utf8_lossy(&probed.stdout).trim().parse().unwrap();
+
+        let mut specs = chunking::plan(duration);
+        assert!(
+            specs.len() > 1,
+            "this probe needs audio longer than {} s; got {duration:.0} s",
+            chunking::MAX_CHUNK_SECS
+        );
+
+        // Snap the interior seams, exactly as `transcribe_with_gemini` does.
+        let silenced = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostats", "-i"])
+            .arg(&wav)
+            .args(["-af", "silencedetect=noise=-30dB:d=0.5", "-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        let silences = chunking::parse_silencedetect(&String::from_utf8_lossy(&silenced.stderr));
+        let interior: Vec<f64> = specs.iter().skip(1).map(|s| s.start_secs).collect();
+        let planned = interior.clone();
+        let snapped = chunking::snap_to_silence(&interior, &silences, SILENCE_SNAP_WINDOW_SECS);
+        for (index, boundary) in snapped.iter().enumerate() {
+            specs[index].end_secs = *boundary;
+            specs[index + 1].start_secs = *boundary;
+        }
+        println!(
+            "{duration:.0}s -> {} chunks; {} silences found; seams {planned:?} -> {snapped:?}",
+            specs.len(),
+            silences.len()
+        );
+
+        let client = client::GeminiClient::new(key);
+        // The sender stays bound: anything but `Empty` from `try_recv` ends the
+        // run, so dropping it would cancel the probe before it sent a byte.
+        let (_tx, mut cancel) = tokio::sync::oneshot::channel();
+        let mut all_words: Vec<Word> = Vec::new();
+        let mut per_chunk: Vec<Vec<Word>> = Vec::new();
+
+        for spec in &specs {
+            let chunk = std::env::temp_dir().join(format!("probe-chunk-{}.flac", spec.index));
+            let sliced = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-ss"])
+                .arg(format!("{}", spec.start_secs))
+                .arg("-t")
+                .arg(format!("{}", spec.end_secs - spec.start_secs))
+                .arg("-i")
+                .arg(&wav)
+                .args(["-vn", "-c:a", "flac", "-y"])
+                .arg(&chunk)
+                .status()
+                .expect("ffmpeg runs");
+            assert!(sliced.success(), "slicing chunk {} failed", spec.index);
+
+            let started = std::time::Instant::now();
+            let outcome = transcribe_chunk(
+                &client,
+                &chunk,
+                &format!("probe-{}", spec.index),
+                false,
+                &mut cancel,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let _ = std::fs::remove_file(&chunk);
+
+            let mut words = outcome
+                .unwrap_or_else(|e| panic!("chunk {} failed: {e}", spec.index));
+            println!(
+                "  chunk {} [{:>7.1}..{:>7.1}] {:>6.1}s  {:>5} words",
+                spec.index,
+                spec.start_secs,
+                spec.end_secs,
+                elapsed.as_secs_f64(),
+                words.len()
+            );
+            assert!(!words.is_empty(), "chunk {} came back empty", spec.index);
+
+            transcript::shift(&mut words, spec.start_secs);
+            per_chunk.push(words.clone());
+            all_words.extend(words);
+        }
+
+        // Monotonic across every seam, in whole-file time. This is the check.
+        for pair in all_words.windows(2) {
+            assert!(
+                pair[1].start >= pair[0].start - 0.001,
+                "time went backwards at the seam: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // And the seams line up with the plan rather than restarting at zero,
+        // which is what a missing or doubled `shift` would look like.
+        for (index, spec) in specs.iter().enumerate().skip(1) {
+            let first = &per_chunk[index][0];
+            assert!(
+                first.start >= spec.start_secs - 1.0,
+                "chunk {index} was not shifted into whole-file time: first word at {:.1}s, chunk starts at {:.1}s",
+                first.start,
+                spec.start_secs
+            );
+        }
+
+        let text = transcript::full_text(&all_words);
+        println!(
+            "STITCHED {} words, {} chars, {:.1}s..{:.1}s",
+            all_words.len(),
+            text.len(),
+            all_words.first().unwrap().start,
+            all_words.last().unwrap().end
+        );
+
+        // The resume cache, against real words and the real plan rather than
+        // the synthetic bounds the unit tests use. Everything just bought is
+        // banked, then a fresh `resolve_resume` must reuse ALL of it -- which is
+        // the difference between a re-run costing nothing and costing again.
+        let db = std::env::temp_dir().join(format!("probe-store-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = crate::store::Store::open(&db).expect("open store");
+        let source = store
+            .get_or_create_source(crate::store::SourceType::File, "probe-key", None, None, None)
+            .expect("create source");
+        for (index, spec) in specs.iter().enumerate() {
+            store
+                .save_chunk_result(
+                    source.id,
+                    MODEL_ID,
+                    spec.index,
+                    spec.start_secs,
+                    spec.end_secs,
+                    &serde_json::to_string(&per_chunk[index]).unwrap(),
+                )
+                .expect("bank the chunk");
+        }
+        let cached = store.chunk_results(source.id, MODEL_ID).expect("read back");
+        let bounds: Vec<chunking::CachedBounds> = cached
+            .iter()
+            .map(|row| chunking::CachedBounds {
+                index: row.index,
+                start_secs: row.start_secs,
+                end_secs: row.end_secs,
+            })
+            .collect();
+        let resume = chunking::resolve_resume(&specs, &bounds);
+        assert!(
+            resume.iter().all(Option::is_some),
+            "a re-run would have paid for these chunks again: {resume:?}"
+        );
+
+        let restored: Vec<Word> = cached
+            .iter()
+            .flat_map(|row| serde_json::from_str::<Vec<Word>>(&row.words_json).unwrap())
+            .collect();
+        assert_eq!(
+            restored.len(),
+            all_words.len(),
+            "the resume cache did not round-trip every word"
+        );
+        assert_eq!(
+            transcript::full_text(&restored),
+            text,
+            "a resumed run would produce a different transcript"
+        );
+        println!("RESUME  all {} chunks reusable, {} words round-tripped", specs.len(), restored.len());
+        let _ = std::fs::remove_file(&db);
+    }
 }

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use serde::Serialize;
+use tokio::sync::oneshot::error::TryRecvError;
 
 use crate::gemini::client::GeminiClient;
 use crate::gemini::transcript::{SpeakerTurn, Word};
@@ -102,7 +103,17 @@ pub async fn transcribe_chunk(
     // Before the upload, not only in the select below: a cancel that landed
     // while ffmpeg was slicing would otherwise be honoured only after a whole
     // chunk had been sent to Google and immediately deleted again.
-    if cancel.try_recv().is_ok() {
+    //
+    // ANYTHING but `Empty` ends the run, including a dropped sender. Two
+    // reasons, and the first is not optional: `try_recv` clears the receiver's
+    // inner state on every outcome except `Empty`, and polling a cleared
+    // receiver -- which the `select!` below does -- panics with "called after
+    // complete". That panic would land between the upload and `delete_file`,
+    // leaving the user's audio in Google's storage for the full 48-hour expiry,
+    // which is the one thing this function's shape exists to prevent. The
+    // second: a dropped sender means whoever registered this run is gone, so
+    // nobody is waiting for the transcript anyway.
+    if !matches!(cancel.try_recv(), Err(TryRecvError::Empty)) {
         return Err(anyhow!("cancelled"));
     }
 
@@ -191,5 +202,60 @@ mod tests {
             with["generation_config"]["transcription_config"]["mode"]["diarization_mode"],
             "speaker"
         );
+    }
+
+    /// A client that would fail loudly if it were ever reached: nothing is
+    /// listening on port 1, and the path does not exist. Both cancel tests
+    /// below assert on the error, so this is what proves the run stopped
+    /// BEFORE the upload rather than at it.
+    fn unreachable_client() -> GeminiClient {
+        GeminiClient::with_base_url("KEY".into(), "http://127.0.0.1:1".into())
+    }
+
+    /// A DROPPED cancel sender must read as a cancel, not as "no cancel yet".
+    ///
+    /// `try_recv` clears the receiver's inner state on `Closed` exactly as it
+    /// does on a real send, and `select!` polling a cleared receiver panics
+    /// with "called after complete". Under the old `.is_ok()` check that panic
+    /// landed between the upload and `delete_file` -- so the regression this
+    /// guards is not a wrong answer, it is a user's audio left sitting in
+    /// Google's storage for the full 48-hour expiry.
+    #[tokio::test]
+    async fn a_dropped_cancel_sender_stops_the_chunk_instead_of_waving_it_through() {
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        drop(cancel_tx);
+
+        let err = transcribe_chunk(
+            &unreachable_client(),
+            Path::new("/nonexistent/chunk.flac"),
+            "chunk",
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "cancelled");
+    }
+
+    /// The ordinary cancel, for the same reason it must be decided before the
+    /// upload: a chunk already sent to Google is one that has to be deleted
+    /// again, and the user is charged for the transfer either way.
+    #[tokio::test]
+    async fn a_cancel_delivered_before_the_upload_stops_the_chunk() {
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        cancel_tx.send(()).expect("the receiver is alive");
+
+        let err = transcribe_chunk(
+            &unreachable_client(),
+            Path::new("/nonexistent/chunk.flac"),
+            "chunk",
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "cancelled");
     }
 }

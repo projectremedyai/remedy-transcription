@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_shell::process::CommandEvent;
+use tokio::sync::oneshot::error::TryRecvError;
 
 use crate::events::HealthStatus;
 use crate::gemini::chunking::ChunkSpec;
@@ -324,11 +325,16 @@ fn ffmpeg_chunk_args<'a>(
 /// Probe silences so chunk boundaries can avoid cutting mid-word.
 /// `-f null -` because only the stderr report is wanted, not an output file.
 ///
-/// The default `info` log level stands: `silencedetect`'s report IS a log line,
-/// so quieting ffmpeg here would leave nothing to parse.
+/// `-nostats` for the reason `run_ffmpeg_extract` passes it: the default stats
+/// line is `\r`-updated, so the sidecar's line-oriented reader holds it back as
+/// one unbroken line -- on a two-hour file that is thousands of updates' worth
+/// of noise buffered around the handful of reports actually being parsed.
+///
+/// The default `info` log level stands, though: `silencedetect`'s report IS a
+/// log line, so quieting ffmpeg here would leave nothing to parse.
 fn ffmpeg_silencedetect_args<'a>(input: &'a str) -> Vec<&'a str> {
     vec![
-        "-hide_banner", "-i", input,
+        "-hide_banner", "-nostats", "-i", input,
         "-af", "silencedetect=noise=-30dB:d=0.5",
         "-f", "null", "-",
     ]
@@ -1480,7 +1486,22 @@ pub async fn transcribe_with_gemini(
     }
 
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
-    state.gemini_runs.lock().unwrap().insert(job_id.clone(), cancel_tx);
+    {
+        // ONE run per job id, decided under a single lock.
+        //
+        // Nothing upstream stops this command being invoked twice for one job
+        // -- a double click, React's double-invoked effects, a retry issued
+        // before the first attempt settles. Two runs sharing a registry slot
+        // is not a tidiness problem: the second `insert` would DROP the first
+        // run's sender mid-flight, and whichever run finished first would
+        // deregister the OTHER's cancel handle. Refusing the second run is the
+        // only version of this with no cross-talk.
+        let mut runs = state.gemini_runs.lock().unwrap();
+        if runs.contains_key(&job_id) {
+            return Err("this job is already transcribing".into());
+        }
+        runs.insert(job_id.clone(), cancel_tx);
+    }
 
     let client = crate::gemini::client::GeminiClient::new(api_key);
     // Diarization ONLY for a single chunk: spk_1 in chunk 2 is not the same
@@ -1492,8 +1513,10 @@ pub async fn transcribe_with_gemini(
 
     for spec in &specs {
         // Checked before slicing as well as inside `transcribe_chunk`, so a
-        // cancel between chunks does not first spend an ffmpeg pass.
-        if cancel_rx.try_recv().is_ok() {
+        // cancel between chunks does not first spend an ffmpeg pass. Anything
+        // but `Empty` ends the run -- see `transcribe_chunk`, which must never
+        // poll a receiver `try_recv` has already emptied.
+        if !matches!(cancel_rx.try_recv(), Err(TryRecvError::Empty)) {
             run_error = Some("cancelled".into());
             break;
         }

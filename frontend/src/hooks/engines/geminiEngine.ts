@@ -95,8 +95,28 @@ export function createGeminiEngine(): TranscriptionEngine {
                         // streaming-preview fallback and there is no stream
                         // here. `words` carries the real times.
                         chunks: [],
+                        // LEADING SPACE, deliberately. `WordToken.text` carries
+                        // transformers.js's convention, where
+                        // `splitTokensOnSpaces` marks every word boundary with
+                        // one and `normalizeWordTokens` reads its ABSENCE as
+                        // "this token continues the previous word" — the fold
+                        // that glues the local engine's sub-word pieces back
+                        // together. Gemini emits whole, bare words instead
+                        // ("Hello"), so passing them through unchanged made
+                        // every word continue the last one and folded the
+                        // transcript into a single token, which
+                        // `cleanCaptionText` then re-split only at `,.;:!?`:
+                        // "Helloeveryone. JohnnyFunghere". This engine is the
+                        // adapter between the two conventions, so restoring the
+                        // boundary belongs HERE — the normalizer's fold cannot
+                        // be relaxed without breaking the local engine.
+                        //
+                        // Safe for CJK: the space stops the fold (which is what
+                        // no-space scripts want too), `normalizeWordTokens`
+                        // trims it away, and `joinCaptionTexts` then re-joins
+                        // CJK words with no space of its own.
                         words: result.words.map((word) => ({
-                            text: word.text,
+                            text: ` ${word.text.trim()}`,
                             start: word.start,
                             end: word.end,
                         })),

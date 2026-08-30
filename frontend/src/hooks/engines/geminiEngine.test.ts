@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createGeminiEngine } from "./geminiEngine";
+import { normalizeWordTokens } from "../../lib/captionFormatter";
 import { RUN_DECLINED, type CostConfirmation } from "./types";
 import type { ResolvedModelConfig } from "../../config/transcription";
 import type { Job } from "../../services/types";
@@ -118,6 +119,42 @@ describe("the gemini engine", () => {
             status: "unavailable",
             reason: "split into 4 parts",
         });
+    });
+
+    /**
+     * Gemini's `word_info.text` is a BARE word ("Hello"). `normalizeWordTokens`
+     * reads a MISSING leading space as "this token continues the previous word"
+     * — the convention transformers.js sets, where `splitTokensOnSpaces` marks
+     * every word boundary with one. Hand it Gemini's words unchanged and the
+     * whole transcript folds into a single token; `cleanCaptionText` then
+     * re-inserts a space only after `,.;:!?`, which is what shipped
+     * "Helloeveryone. JohnnyFunghere" into the SRT/VTT/TXT/JSON exports.
+     *
+     * This engine is the adapter between the two conventions, so restoring the
+     * boundary is ITS job, not the normalizer's: the folding is load-bearing for
+     * the local engine, where transformers.js really does emit sub-word pieces
+     * that must be glued back together.
+     */
+    it("hands on words the token normalizer will keep separate", async () => {
+        transcribeWithGemini.mockResolvedValue({
+            text: "Hello everyone. Johnny here",
+            words: [
+                { text: "Hello", start: 0, end: 1 },
+                { text: "everyone.", start: 1, end: 2 },
+                { text: "Johnny", start: 2, end: 3 },
+                { text: "here", start: 3, end: 4 },
+            ],
+            speakers: { status: "unavailable", reason: "n/a" },
+            audio_duration: 4,
+        });
+
+        const result = await run(createGeminiEngine());
+
+        expect(
+            normalizeWordTokens(result.transcript.words ?? []).map(
+                (token) => token.text,
+            ),
+        ).toEqual(["Hello", "everyone.", "Johnny", "here"]);
     });
 
     /** Gemini has no token stream, so `chunks` must be empty, never undefined. */

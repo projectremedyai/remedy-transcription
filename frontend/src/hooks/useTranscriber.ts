@@ -95,6 +95,20 @@ export interface Transcriber {
     start: (path: string) => void;
     startFromYouTube: (url: string) => void;
     /**
+     * Run the LAST source again, skipping the transcript cache.
+     *
+     * A cached row is a permanent hit on the Rust side -- `find_transcript`
+     * serves it forever and no engine runs -- so before this there was no way to
+     * replace a transcript a buggy run had persisted. That is not hypothetical:
+     * a Gemini bug stored whole transcripts with every word glued to the last
+     * one, and every reopen served the damage back.
+     *
+     * A NO-OP when nothing has run yet: the button that calls this is rendered
+     * from transcript state, and a stale render must not start a run against a
+     * source that does not exist.
+     */
+    retranscribe: () => void;
+    /**
      * Abandon the run in flight and return the app to idle: the wait dies, the
      * worker is terminated, and the run token is bumped so that nothing still in
      * flight can PAINT the UI — every point at which a dead run can resume
@@ -1297,13 +1311,26 @@ export function useTranscriber(): Transcriber {
         ],
     );
 
+    /**
+     * The source the last run was started from, so `retranscribe` can replay it.
+     *
+     * A REF, not state: nothing renders from it, and a re-render between the run
+     * and the button press must not be able to drop it. It is set before the
+     * first `await` for the same reason `claimRun` is -- so an abandoned run
+     * cannot overwrite it later with a source the user has moved on from.
+     */
+    const lastSourceRef = useRef<
+        { kind: "file"; path: string } | { kind: "youtube"; url: string } | null
+    >(null);
+
     const startFromFile = useCallback(
-        async (path: string) => {
+        async (path: string, options?: { force?: boolean }) => {
             // Synchronously, before ANY await: this run takes the UI, and the
             // previous run's listener and poll die now — not after `beginRun` and
             // a full-file sha256 have had their say. See `cancelPendingWait`.
             const runId = claimRun();
             runEngineRef.current = engine;
+            lastSourceRef.current = { kind: "file", path };
             try {
                 const config = await beginRun(runId);
                 const job = await api.createFileJob({
@@ -1311,6 +1338,7 @@ export function useTranscriber(): Transcriber {
                     model_id: config.modelId,
                     task: config.task,
                     language: config.language,
+                    force: options?.force ?? false,
                 });
                 if (runIdRef.current !== runId) {
                     return;
@@ -1328,9 +1356,10 @@ export function useTranscriber(): Transcriber {
     );
 
     const startFromYouTube = useCallback(
-        async (url: string) => {
+        async (url: string, options?: { force?: boolean }) => {
             const runId = claimRun();
             runEngineRef.current = engine;
+            lastSourceRef.current = { kind: "youtube", url };
             try {
                 const config = await beginRun(runId);
                 const job = await api.createYouTubeJob({
@@ -1338,6 +1367,7 @@ export function useTranscriber(): Transcriber {
                     model_id: config.modelId,
                     task: config.task,
                     language: config.language,
+                    force: options?.force ?? false,
                 });
                 if (runIdRef.current !== runId) {
                     return;
@@ -1353,6 +1383,26 @@ export function useTranscriber(): Transcriber {
         },
         [beginRun, claimRun, engine, failRun, transcribePreparedJob],
     );
+
+    /**
+     * Run the last source again with the transcript cache skipped.
+     *
+     * This dispatches on the SOURCE KIND rather than keeping a stored callback,
+     * so the run goes through the very same `startFromFile`/`startFromYouTube`
+     * every other run does -- same run token, same readiness gates, same cost
+     * confirmation. A re-transcribe must not be a second, thinner code path.
+     */
+    const retranscribe = useCallback(() => {
+        const source = lastSourceRef.current;
+        if (!source) {
+            return;
+        }
+        if (source.kind === "file") {
+            void startFromFile(source.path, { force: true });
+            return;
+        }
+        void startFromYouTube(source.url, { force: true });
+    }, [startFromFile, startFromYouTube]);
 
     /**
      * The escape hatch. Both entry points are gated on `isBusy` and the
@@ -1459,6 +1509,7 @@ export function useTranscriber(): Transcriber {
             progressItems,
             start: startFromFile,
             startFromYouTube,
+            retranscribe,
             cancel,
             output: transcript,
             jobId,
@@ -1513,6 +1564,7 @@ export function useTranscriber(): Transcriber {
             progress,
             progressItems,
             renameSpeaker,
+            retranscribe,
             selectedModelAvailable,
             selectedModelId,
             speakerNames,

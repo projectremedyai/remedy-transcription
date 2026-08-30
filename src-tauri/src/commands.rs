@@ -16,7 +16,9 @@ use crate::gemini::chunking::ChunkSpec;
 // `transcribe_with_gemini`.
 use crate::gemini::{chunking, transcript};
 use crate::sidecar::spawn_sidecar;
-use crate::store::{Job, JobStatus, JobUpdate, SourceType, TaskType, TranscriptionSegment};
+use crate::store::{
+    CachedTranscript, Job, JobStatus, JobUpdate, SourceType, Store, TaskType, TranscriptionSegment,
+};
 use crate::AppState;
 
 /// The frontend's model config, embedded at COMPILE time.
@@ -130,6 +132,13 @@ pub struct YouTubeJobRequest {
     pub task: TaskType,
     #[serde(default = "default_language")]
     pub language: String,
+    /// Skip the transcript cache and run the engine again. See
+    /// [`cached_transcript`] for why this exists.
+    ///
+    /// `#[serde(default)]` -- false -- so every caller that predates the
+    /// Re-transcribe button keeps hitting the cache exactly as it did.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +157,47 @@ pub struct FileJobRequest {
     pub task: TaskType,
     #[serde(default = "default_language")]
     pub language: String,
+    /// Skip the transcript cache and run the engine again. See
+    /// [`cached_transcript`] for why this exists.
+    ///
+    /// `#[serde(default)]` -- false -- so every caller that predates the
+    /// Re-transcribe button keeps hitting the cache exactly as it did.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// The cache lookup job creation does -- or, when the user asked to
+/// re-transcribe, deliberately does not.
+///
+/// A cached row is a PERMANENT hit. `Store::find_transcript` serves it forever,
+/// and before this there was no force, bypass or re-transcribe path anywhere in
+/// the UI, so a transcript written by a buggy run could never be replaced from
+/// inside the app -- the only cure was deleting the row with `sqlite3`. That is
+/// not a hypothetical: a Gemini bug persisted whole transcripts with every word
+/// glued to the last one, and every reopen served the damage back.
+///
+/// Skipping the lookup is the WHOLE mechanism. Nothing downstream needs to
+/// change, because `persist_transcript` upserts on
+/// (source_id, model_id, task, language) and overwrites the stale row when the
+/// fresh run finishes.
+///
+/// This is a free function taking `&Store` rather than a method on it, and
+/// rather than an `if` inlined at the two call sites, so that the decision is
+/// testable without a Tauri `State`.
+fn cached_transcript(
+    store: &Store,
+    source_id: i64,
+    model_id: &str,
+    task: TaskType,
+    language: &str,
+    force: bool,
+) -> Result<Option<CachedTranscript>, String> {
+    if force {
+        return Ok(None);
+    }
+    store
+        .find_transcript(source_id, model_id, task, language)
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,11 +506,14 @@ pub async fn create_youtube_job(
         )
         .map_err(|e| e.to_string())?;
 
-    if let Some(transcript) = state
-        .store
-        .find_transcript(source.id, &request.model_id, request.task, &language)
-        .map_err(|e| e.to_string())?
-    {
+    if let Some(transcript) = cached_transcript(
+        &state.store,
+        source.id,
+        &request.model_id,
+        request.task,
+        &language,
+        request.force,
+    )? {
         let job = state
             .store
             .create_job_from_cache(
@@ -1071,11 +1124,14 @@ pub async fn create_file_job(
         )
         .map_err(|e| e.to_string())?;
 
-    if let Some(transcript) = state
-        .store
-        .find_transcript(source.id, &request.model_id, request.task, &language)
-        .map_err(|e| e.to_string())?
-    {
+    if let Some(transcript) = cached_transcript(
+        &state.store,
+        source.id,
+        &request.model_id,
+        request.task,
+        &language,
+        request.force,
+    )? {
         return state
             .store
             .create_job_from_cache(
@@ -2304,6 +2360,76 @@ mod gemini_resume_tests {
             .expect("create job");
         let source_id = source.id;
         (TempStore { store, path }, job.id, source_id)
+    }
+
+    /// A cached transcript is a PERMANENT hit: `find_transcript` serves the row
+    /// forever, and until `force` existed there was no re-transcribe, bypass or
+    /// cache-clear path anywhere in the UI. A transcript persisted by a buggy run
+    /// -- the glued-word Gemini bug, say -- could therefore never be replaced from
+    /// inside the app; the only cure was deleting the row with `sqlite3`.
+    ///
+    /// Skipping the lookup is the WHOLE escape hatch. Nothing else has to change:
+    /// `persist_transcript` upserts on (source_id, model_id, task, language), so
+    /// the fresh run overwrites the stale row when it finishes.
+    #[test]
+    fn a_forced_run_does_not_see_the_cached_transcript() {
+        let (temp, _job_id, source_id) = store_with_job();
+        temp.store
+            .persist_transcript(
+                &_job_id,
+                crate::gemini::MODEL_ID,
+                TaskType::Transcribe,
+                "english",
+                "cached text",
+                &[],
+            )
+            .expect("persist");
+
+        let forced = cached_transcript(
+            &temp.store,
+            source_id,
+            crate::gemini::MODEL_ID,
+            TaskType::Transcribe,
+            "english",
+            true,
+        )
+        .expect("lookup");
+
+        assert!(
+            forced.is_none(),
+            "force must skip the cache so the engine actually runs again"
+        );
+    }
+
+    /// The other half, and the reason `force` defaults to false: an ordinary run
+    /// must still be free. If this ever fails, every re-open of an already
+    /// transcribed file starts paying Gemini again.
+    #[test]
+    fn an_ordinary_run_still_hits_the_cache() {
+        let (temp, job_id, source_id) = store_with_job();
+        temp.store
+            .persist_transcript(
+                &job_id,
+                crate::gemini::MODEL_ID,
+                TaskType::Transcribe,
+                "english",
+                "cached text",
+                &[],
+            )
+            .expect("persist");
+
+        let hit = cached_transcript(
+            &temp.store,
+            source_id,
+            crate::gemini::MODEL_ID,
+            TaskType::Transcribe,
+            "english",
+            false,
+        )
+        .expect("lookup")
+        .expect("the row just written must be a hit");
+
+        assert_eq!(hit.full_text, "cached text");
     }
 
     fn word(text: &str, start: f64) -> transcript::Word {

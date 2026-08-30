@@ -53,6 +53,15 @@ export interface FileJobRequest {
     model_id: string;
     task: TaskMode;
     language: string;
+    /**
+     * Skip the transcript cache and run the engine again.
+     *
+     * A cached row is a PERMANENT hit on the Rust side, so without this a
+     * transcript written by a buggy run could never be replaced from inside the
+     * app. Optional, and absent means false: every existing caller keeps hitting
+     * the cache, and only the Re-transcribe button sets it.
+     */
+    force?: boolean;
 }
 
 export interface YouTubeJobRequest {
@@ -60,6 +69,15 @@ export interface YouTubeJobRequest {
     model_id: string;
     task: TaskMode;
     language: string;
+    /**
+     * Skip the transcript cache and run the engine again.
+     *
+     * A cached row is a PERMANENT hit on the Rust side, so without this a
+     * transcript written by a buggy run could never be replaced from inside the
+     * app. Optional, and absent means false: every existing caller keeps hitting
+     * the cache, and only the Re-transcribe button sets it.
+     */
+    force?: boolean;
 }
 
 export interface PersistTranscriptRequest {

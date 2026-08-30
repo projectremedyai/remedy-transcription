@@ -117,6 +117,7 @@ async function renderAudioManager(
         progressItems: [],
         start: vi.fn(),
         startFromYouTube: vi.fn(),
+        retranscribe: vi.fn(),
         cancel: vi.fn(),
         pendingCost: null,
         approveCost: vi.fn(),

@@ -28,9 +28,6 @@ impl GeminiError {
     ///
     /// A 400 is our malformed request and a 401 is the user's key: retrying
     /// either just makes the same mistake again, more slowly.
-    // Not called yet: Task 11's orchestration reads this to decide whether to
-    // retry a chunk. Allowed dead here rather than adding a premature caller.
-    #[allow(dead_code)]
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -58,9 +55,6 @@ pub fn classify_status(status: u16, retry_after: Option<u64>) -> Option<GeminiEr
     }
 }
 
-// Not constructed outside tests yet: `upload` returns this to Task 11's
-// orchestration, which is also the future caller of `upload` itself.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct UploadedFile {
     pub uri: String,
@@ -132,10 +126,6 @@ impl GeminiClient {
     /// Step one declares the size and type and gets back a one-shot URL in the
     /// `x-goog-upload-url` RESPONSE HEADER -- not in the body, which is empty.
     /// Step two sends the bytes to that URL.
-    // Not called yet: Task 11's orchestration uploads each chunk before
-    // handing its URI to `interact`. Allowed dead here rather than adding a
-    // premature caller; only the tests call it until then.
-    #[allow(dead_code)]
     pub async fn upload(
         &self,
         path: &Path,
@@ -195,9 +185,6 @@ impl GeminiClient {
         })
     }
 
-    // Not called yet: Task 10 parses what this returns, and Task 11 is the
-    // orchestration that will actually call it with a real request body.
-    #[allow(dead_code)]
     pub async fn interact(&self, body: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let response = self
             .http
@@ -219,9 +206,6 @@ impl GeminiClient {
     /// Best effort by contract. Cleanup runs on the failure and cancel paths,
     /// where turning one error into two helps nobody -- and the file expires in
     /// 48 hours regardless.
-    // Not called yet: Task 11's orchestration calls this on the failure and
-    // cancel paths described above.
-    #[allow(dead_code)]
     pub async fn delete_file(&self, name: &str) -> anyhow::Result<()> {
         let _ = self
             .http

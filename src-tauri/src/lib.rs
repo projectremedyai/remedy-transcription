@@ -16,6 +16,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub events: Arc<JobEvents>,
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
+    pub gemini_runs: crate::gemini::GeminiRegistry,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -39,6 +40,7 @@ pub fn run() {
                 store,
                 events,
                 download_semaphore,
+                gemini_runs: Default::default(),
             });
 
             Ok(())
@@ -59,6 +61,8 @@ pub fn run() {
             commands::set_gemini_key,
             commands::clear_gemini_key,
             commands::gemini_key_status,
+            commands::transcribe_with_gemini,
+            commands::cancel_gemini_transcription,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

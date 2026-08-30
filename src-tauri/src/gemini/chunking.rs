@@ -4,13 +4,6 @@
 //! point: the arithmetic that decides whether a run gets speaker labels is
 //! testable without ffmpeg, a network, or a key.
 
-// Not called yet: Task 11 wires ffmpeg's segmentation pass to `plan`,
-// `snap_to_silence`, and `parse_silencedetect`. Allowed dead here rather than
-// adding a premature caller (out of scope for this task), so `cargo check`
-// stays warning-clean at this checkpoint; the tests are the only caller until
-// then.
-#![allow(dead_code)]
-
 /// Gemini caps a request at 30 minutes once word timestamps or diarization are
 /// enabled. 28 leaves margin for a duration probe that disagrees slightly with
 /// what the API measures.

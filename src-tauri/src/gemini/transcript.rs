@@ -3,13 +3,6 @@
 //! Pure: no HTTP, no filesystem, no Tauri. Everything here is exercised by
 //! `cargo test` with hand-written JSON.
 
-// Not called yet: Task 11's orchestration is what stitches per-chunk client
-// responses through this module to build the final transcript. Allowed dead
-// here rather than adding a premature caller (out of scope for this task), so
-// `cargo check` stays warning-clean at this checkpoint; the tests are the
-// only caller until then. Task 11 must remove this attribute.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail};
 use serde::Serialize;
 

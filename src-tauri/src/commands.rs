@@ -10,6 +10,7 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_shell::process::CommandEvent;
 
 use crate::events::HealthStatus;
+use crate::gemini::chunking::ChunkSpec;
 use crate::sidecar::spawn_sidecar;
 use crate::store::{Job, JobStatus, JobUpdate, SourceType, TaskType, TranscriptionSegment};
 use crate::AppState;
@@ -302,6 +303,34 @@ fn hash_file(path: &Path) -> Result<String, String> {
 fn ffmpeg_canonical_wav_args<'a>(input: &'a str, output: &'a str) -> Vec<&'a str> {
     vec![
         "-i", input, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", output,
+    ]
+}
+
+/// Slice `[start, end)` out of the canonical WAV and encode it as FLAC in one
+/// pass. Lossless, so no quality risk, and roughly half the bytes to upload.
+fn ffmpeg_chunk_args<'a>(
+    input: &'a str,
+    output: &'a str,
+    start: &'a str,
+    duration: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "-hide_banner", "-loglevel", "error",
+        "-ss", start, "-t", duration,
+        "-i", input, "-vn", "-c:a", "flac", "-y", output,
+    ]
+}
+
+/// Probe silences so chunk boundaries can avoid cutting mid-word.
+/// `-f null -` because only the stderr report is wanted, not an output file.
+///
+/// The default `info` log level stands: `silencedetect`'s report IS a log line,
+/// so quieting ffmpeg here would leave nothing to parse.
+fn ffmpeg_silencedetect_args<'a>(input: &'a str) -> Vec<&'a str> {
+    vec![
+        "-hide_banner", "-i", input,
+        "-af", "silencedetect=noise=-30dB:d=0.5",
+        "-f", "null", "-",
     ]
 }
 
@@ -920,6 +949,48 @@ async fn drain_until_exit(mut handle: crate::sidecar::SidecarHandle) -> Result<(
     Ok(())
 }
 
+/// `drain_until_exit`, but hands back what the process wrote.
+///
+/// The two Gemini probes need the OUTPUT of a SUCCESSFUL run, which neither
+/// existing drain keeps: `drain_until_exit` holds stderr only to quote it in a
+/// failure, and `collect_json_output` reads stdout but requires all of it to
+/// be JSON. ffprobe answers on stdout and `silencedetect` reports on stderr,
+/// so both streams come back.
+async fn drain_capturing_output(
+    mut handle: crate::sidecar::SidecarHandle,
+) -> Result<(String, String), String> {
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+    let mut code: Option<i32> = None;
+
+    while let Some(event) = handle.rx.recv().await {
+        match event {
+            CommandEvent::Stdout(line) => {
+                stdout_text.push_str(&String::from_utf8_lossy(&line));
+                stdout_text.push('\n');
+            }
+            CommandEvent::Stderr(line) => {
+                stderr_text.push_str(&String::from_utf8_lossy(&line));
+                stderr_text.push('\n');
+            }
+            CommandEvent::Terminated(payload) => {
+                code = payload.code;
+                break;
+            }
+            CommandEvent::Error(err) => return Err(err),
+            _ => {}
+        }
+    }
+    if !matches!(code, Some(0)) {
+        return Err(format!(
+            "sidecar exited with code {:?}: {}",
+            code,
+            stderr_text.trim()
+        ));
+    }
+    Ok((stdout_text, stderr_text))
+}
+
 fn find_downloaded_file(downloads_dir: &Path, stem: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(downloads_dir).ok()?;
     for entry in entries.flatten() {
@@ -1095,7 +1166,7 @@ pub async fn get_prepared_audio_path(
 /// The canonical WAV for a job, or a REAL error.
 ///
 /// Used by `get_prepared_audio_path`, which the webview uses to fetch the
-/// audio.
+/// audio, and by `transcribe_with_gemini`, which slices it into chunks.
 ///
 /// Both failures here are genuine errors: a job id nobody has heard of, or a
 /// job whose audio has been cleaned up (see `PREPARED_AUDIO_TTL_HOURS`).
@@ -1365,6 +1436,253 @@ pub fn clear_gemini_key() -> Result<(), String> {
 #[tauri::command]
 pub fn gemini_key_status() -> bool {
     crate::gemini::credentials::is_configured()
+}
+
+/// Transcribe a job's prepared audio with Gemini.
+///
+/// REJECTS when the REQUEST was wrong (unknown job, no prepared audio, no key
+/// stored) or when any chunk fails after its retries. A partial transcript is
+/// NOT returned: a silent 25-minute hole would be persisted and content-cached,
+/// and the user would get the hole back every time they reopened that file.
+#[tauri::command]
+pub async fn transcribe_with_gemini(
+    job_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::gemini::GeminiTranscriptionResult, String> {
+    use crate::gemini::{chunking, transcript, Speakers};
+
+    let api_key = crate::gemini::credentials::load().map_err(|e| e.to_string())?;
+    let wav_path = prepared_audio_for_job(&job_id, &state, &app)?;
+    let duration = probe_duration(&app, &wav_path).await?;
+
+    let mut specs = chunking::plan(duration);
+    if specs.is_empty() {
+        return Err("this audio has no duration".into());
+    }
+
+    // Snap interior boundaries into silence. Chunk 0's start and the last
+    // chunk's end are the file's own edges and must not move.
+    if specs.len() > 1 {
+        // A failed or unparseable silence pass is not fatal: the planned
+        // boundaries stand, which is the same cut `plan` alone would make.
+        let silences = detect_silences(&app, &wav_path).await.unwrap_or_default();
+        let interior: Vec<f64> = specs.iter().skip(1).map(|s| s.start_secs).collect();
+        let snapped = chunking::snap_to_silence(
+            &interior,
+            &silences,
+            crate::gemini::SILENCE_SNAP_WINDOW_SECS,
+        );
+        for (index, boundary) in snapped.into_iter().enumerate() {
+            specs[index].end_secs = boundary;
+            specs[index + 1].start_secs = boundary;
+        }
+    }
+
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+    state.gemini_runs.lock().unwrap().insert(job_id.clone(), cancel_tx);
+
+    let client = crate::gemini::client::GeminiClient::new(api_key);
+    // Diarization ONLY for a single chunk: spk_1 in chunk 2 is not the same
+    // person as spk_1 in chunk 1, and there is no honest way to bridge that.
+    let diarize = specs.len() == 1;
+    let chunk_count = specs.len();
+    let mut all_words: Vec<transcript::Word> = Vec::new();
+    let mut run_error: Option<String> = None;
+
+    for spec in &specs {
+        // Checked before slicing as well as inside `transcribe_chunk`, so a
+        // cancel between chunks does not first spend an ffmpeg pass.
+        if cancel_rx.try_recv().is_ok() {
+            run_error = Some("cancelled".into());
+            break;
+        }
+
+        emit_gemini_progress(&app, &job_id, "slicing", spec.index, chunk_count);
+        let chunk_path = match slice_chunk(&app, &wav_path, spec, &job_id).await {
+            Ok(path) => path,
+            Err(e) => {
+                run_error = Some(e);
+                break;
+            }
+        };
+
+        emit_gemini_progress(&app, &job_id, "transcribing", spec.index, chunk_count);
+        let outcome = crate::gemini::transcribe_chunk(
+            &client,
+            &chunk_path,
+            &format!("{job_id}-{}", spec.index),
+            diarize,
+            &mut cancel_rx,
+        )
+        .await
+        .map_err(|e| e.to_string());
+        let _ = tokio::fs::remove_file(&chunk_path).await;
+
+        match outcome {
+            Ok(mut words) => {
+                transcript::shift(&mut words, spec.start_secs);
+                all_words.extend(words);
+            }
+            Err(e) => {
+                run_error = Some(e);
+                break;
+            }
+        }
+    }
+
+    // Deregistered on EVERY exit from the loop -- success, failure and cancel.
+    // A leaked entry means a later cancel targets a run that is already gone.
+    state.gemini_runs.lock().unwrap().remove(&job_id);
+
+    if let Some(error) = run_error {
+        return Err(error);
+    }
+
+    emit_gemini_progress(&app, &job_id, "stitching", chunk_count, chunk_count);
+
+    let speakers = if diarize {
+        let (turns, speaker_count) = transcript::turns_from_words(&all_words);
+        if turns.is_empty() {
+            Speakers::Unavailable {
+                reason: "Gemini returned no speaker information for this audio".into(),
+            }
+        } else {
+            Speakers::Identified {
+                turns,
+                speaker_count,
+            }
+        }
+    } else {
+        Speakers::Unavailable {
+            reason: format!(
+                "this audio was split into {chunk_count} parts to fit Gemini's \
+                 30-minute limit, and speaker identities cannot be matched across parts"
+            ),
+        }
+    };
+
+    Ok(crate::gemini::GeminiTranscriptionResult {
+        text: transcript::full_text(&all_words),
+        words: all_words,
+        speakers,
+        audio_duration: duration,
+    })
+}
+
+/// Stop a Gemini run. Resolves `false` when the job was not running, which is
+/// the common case and not an error.
+///
+/// Stronger motivation than the deleted `cancel_diarization` had: an abandoned
+/// run costs real money and parks the user's audio in Google's storage.
+#[tauri::command]
+pub fn cancel_gemini_transcription(state: State<'_, AppState>, job_id: String) -> bool {
+    match state.gemini_runs.lock().unwrap().remove(&job_id) {
+        Some(tx) => tx.send(()).is_ok(),
+        None => false,
+    }
+}
+
+fn emit_gemini_progress(
+    app: &AppHandle,
+    job_id: &str,
+    phase: &'static str,
+    chunk_index: usize,
+    chunk_count: usize,
+) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        &format!("gemini-progress::{job_id}"),
+        crate::gemini::GeminiProgress {
+            phase,
+            chunk_index,
+            chunk_count,
+            fraction: chunk_index as f64 / chunk_count.max(1) as f64,
+        },
+    );
+}
+
+/// The audio's length in seconds, from ffprobe.
+///
+/// ffprobe rather than the `Duration:` banner `drain_ffmpeg` already reads: the
+/// whole chunk plan is derived from this number, and the banner is rounded to
+/// hundredths and missing entirely on some containers.
+async fn probe_duration(app: &AppHandle, input: &Path) -> Result<f64, String> {
+    let input_str = input.to_string_lossy().to_string();
+    let handle = spawn_sidecar(
+        app,
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            &input_str,
+        ],
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let (stdout, _) = drain_capturing_output(handle).await?;
+    let raw = stdout.trim().to_string();
+    let seconds: f64 = raw
+        .parse()
+        .map_err(|_| format!("ffprobe could not measure this audio: {raw:?}"))?;
+    // `"nan"` and `"inf"` are values `f64::from_str` ACCEPTS, and either would
+    // walk straight past `plan`'s `<= 0.0` guard into a plan of nonsense
+    // boundaries. A zero or negative duration is left to `plan`, which has a
+    // user-facing answer for it.
+    if !seconds.is_finite() {
+        return Err(format!("ffprobe could not measure this audio: {raw:?}"));
+    }
+    Ok(seconds)
+}
+
+/// Silent stretches in the prepared WAV, as `(start, end)` second pairs.
+async fn detect_silences(app: &AppHandle, input: &Path) -> Result<Vec<(f64, f64)>, String> {
+    let input_str = input.to_string_lossy().to_string();
+    let handle = spawn_sidecar(app, "ffmpeg", &ffmpeg_silencedetect_args(&input_str), None)
+        .map_err(|e| e.to_string())?;
+    let (_, stderr) = drain_capturing_output(handle).await?;
+    Ok(crate::gemini::chunking::parse_silencedetect(&stderr))
+}
+
+/// Cut one chunk out of the prepared WAV as FLAC, returning where it landed.
+///
+/// Named for the JOB, not for the WAV: two jobs can share one prepared WAV --
+/// the same video queued twice resolves to the same source -- and a name taken
+/// from the WAV would have two runs overwriting each other's chunks. Lives in
+/// `audio_dir`; the caller deletes it as soon as the chunk is transcribed.
+async fn slice_chunk(
+    app: &AppHandle,
+    input: &Path,
+    spec: &ChunkSpec,
+    job_id: &str,
+) -> Result<PathBuf, String> {
+    let output = audio_dir(app)?.join(format!("gemini-{job_id}-{}.flac", spec.index));
+
+    let input_str = input.to_string_lossy().to_string();
+    let output_str = output.to_string_lossy().to_string();
+    let start = format!("{:.3}", spec.start_secs);
+    let duration = format!("{:.3}", (spec.end_secs - spec.start_secs).max(0.0));
+
+    let handle = spawn_sidecar(
+        app,
+        "ffmpeg",
+        &ffmpeg_chunk_args(&input_str, &output_str, &start, &duration),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    if let Err(e) = drain_until_exit(handle).await {
+        // ffmpeg can have written a partial FLAC before it failed, and the
+        // caller only deletes chunks it was handed. Nothing else would ever
+        // clean this one up.
+        let _ = tokio::fs::remove_file(&output).await;
+        return Err(e);
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1680,5 +1998,39 @@ mod tests {
 
         let too_long = "A".repeat(101);
         assert!(validated_speaker_name("SPEAKER_00", &too_long).is_err());
+    }
+}
+
+#[cfg(test)]
+mod gemini_ffmpeg_tests {
+    use super::*;
+
+    #[test]
+    fn a_chunk_is_cut_losslessly_to_flac_with_the_output_last() {
+        let args = ffmpeg_chunk_args("/in.wav", "/out.flac", "1500", "1500");
+        let flag = |name: &str| {
+            args.iter().position(|a| *a == name).map(|i| args[i + 1].to_string())
+        };
+        assert_eq!(flag("-ss").as_deref(), Some("1500"));
+        assert_eq!(flag("-t").as_deref(), Some("1500"));
+        assert_eq!(flag("-c:a").as_deref(), Some("flac"));
+        assert_eq!(args.last().copied(), Some("/out.flac"));
+    }
+
+    /// `-ss` BEFORE `-i` is an input seek: ffmpeg jumps straight to the offset
+    /// instead of decoding everything before it. On chunk 5 of a 2-hour file
+    /// that is the difference between instant and a minute.
+    #[test]
+    fn the_seek_precedes_the_input_so_it_is_an_input_seek() {
+        let args = ffmpeg_chunk_args("/in.wav", "/out.flac", "10", "20");
+        let ss = args.iter().position(|a| *a == "-ss").unwrap();
+        let i = args.iter().position(|a| *a == "-i").unwrap();
+        assert!(ss < i, "-ss must precede -i");
+    }
+
+    #[test]
+    fn silencedetect_writes_no_output_file() {
+        let args = ffmpeg_silencedetect_args("/in.wav");
+        assert!(args.windows(2).any(|w| w == ["-f", "null"]));
     }
 }

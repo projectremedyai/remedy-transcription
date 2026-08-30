@@ -378,4 +378,59 @@ mod tests {
     fn the_estimate_is_linear_in_duration() {
         assert!((estimate_usd(1800.0) * 2.0 - estimate_usd(3600.0)).abs() < 1e-9);
     }
+    /// LIVE PROBE, not part of the suite — `#[ignore]`d, so `cargo test` skips
+    /// it and CI never sees it. It spends real money and needs a real key.
+    ///
+    /// It exists because the release checklist ends on a judgement call that no
+    /// mocked test can make: on 29 Aug 2026 `gemini-3.5-transcribe` was shedding
+    /// load badly, with 1.8-minute requests succeeding every time while 11-to-26
+    /// minute ones failed more than 60% of attempts and got worse over hours.
+    /// Shipping while that holds means a user's first long transcription
+    /// probably fails. The question "has the service recovered?" can only be
+    /// answered by asking the service.
+    ///
+    ///     GEMINI_PROBE_FLAC=/path/to/chunk.flac \
+    ///     cargo test --manifest-path src-tauri/Cargo.toml \
+    ///         gemini_load_shedding -- --ignored --nocapture
+    ///
+    /// Run it against a ~20 minute chunk AND a ~2 minute one: "long fails while
+    /// short succeeds" is the actual signature of shedding, and a long run that
+    /// fails on its own tells you nothing about whether the service or the file
+    /// is at fault.
+    ///
+    /// Wall time is the read on retries. `transcribe_chunk` backs off 5/10/20s
+    /// internally, so a first-attempt success looks like one request's latency
+    /// and a retried one is visibly longer.
+    #[tokio::test]
+    #[ignore = "live: spends money and needs GEMINI_API_KEY + GEMINI_PROBE_FLAC"]
+    async fn gemini_load_shedding_probe() {
+        let key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+        let path = std::env::var("GEMINI_PROBE_FLAC").expect("GEMINI_PROBE_FLAC");
+        let path = std::path::PathBuf::from(path);
+
+        let client = client::GeminiClient::new(key);
+        // The SENDER stays bound. Dropping it closes the channel, and anything
+        // but `Empty` from `try_recv` ends the run — a dropped sender would
+        // cancel the probe before it sent a byte.
+        let (_tx, mut cancel) = tokio::sync::oneshot::channel();
+
+        let started = std::time::Instant::now();
+        let outcome = transcribe_chunk(&client, &path, "probe", false, &mut cancel).await;
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Ok(words) => println!(
+                "PROBE OK   {:>7.1}s  {} words  {}",
+                elapsed.as_secs_f64(),
+                words.len(),
+                path.display()
+            ),
+            Err(e) => println!(
+                "PROBE FAIL {:>7.1}s  {}  {}",
+                elapsed.as_secs_f64(),
+                e,
+                path.display()
+            ),
+        }
+    }
 }

@@ -109,6 +109,53 @@ pub fn parse_silencedetect(stderr: &str) -> Vec<(f64, f64)> {
     intervals
 }
 
+/// How far a cached chunk's boundaries may sit from the freshly planned ones
+/// and still be treated as the same cut.
+///
+/// Not zero: `plan` rebuilds its boundaries with float division every run, and
+/// `snap_to_silence` re-derives interior ones from a fresh ffmpeg pass, so
+/// bit-exact equality would miss on drift far below the length of a syllable. A
+/// false miss costs a chunk paid for twice, which is the exact thing resuming
+/// exists to prevent. A millisecond is far tighter than any real re-cut and far
+/// looser than float noise.
+pub const BOUNDARY_EPSILON_SECS: f64 = 0.001;
+
+/// Where a cached chunk claims to have been cut from.
+///
+/// The boundaries travel WITH the row rather than being trusted from the index,
+/// because the index alone cannot tell "chunk 2 of the same plan" from "chunk 2
+/// of a plan that has since moved". Reusing the second would splice the wrong
+/// stretch of audio into the transcript and still report success.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CachedBounds {
+    pub index: usize,
+    pub start_secs: f64,
+    pub end_secs: f64,
+}
+
+/// For each chunk in `plan`, which cached row (if any) may be reused for it.
+///
+/// Returns one entry per planned chunk, in plan order: `Some(i)` means
+/// `cached[i]` describes the same cut and its words can stand in for a request;
+/// `None` means the chunk has to be transcribed.
+///
+/// Pure, and deliberately free of any transcript type: it answers only "is this
+/// the same cut?", and the caller maps the answer onto whatever payload it
+/// stored. That is what lets the whole resume decision be tested without
+/// ffmpeg, a network, or a key -- the same reason the rest of this module is
+/// pure.
+pub fn resolve_resume(plan: &[ChunkSpec], cached: &[CachedBounds]) -> Vec<Option<usize>> {
+    plan.iter()
+        .map(|spec| {
+            cached.iter().position(|row| {
+                row.index == spec.index
+                    && (row.start_secs - spec.start_secs).abs() <= BOUNDARY_EPSILON_SECS
+                    && (row.end_secs - spec.end_secs).abs() <= BOUNDARY_EPSILON_SECS
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +253,105 @@ mod tests {
     fn an_unterminated_silence_is_dropped() {
         let stderr = "[silencedetect @ 0x7f] silence_start: 99.0\n";
         assert!(parse_silencedetect(stderr).is_empty());
+    }
+
+    /// An empty cache is the ordinary first run: everything is fetched.
+    #[test]
+    fn nothing_cached_means_every_chunk_is_fetched() {
+        let plan = plan(5000.0);
+        assert_eq!(resolve_resume(&plan, &[]), vec![None; plan.len()]);
+    }
+
+    /// The whole point: a chunk already paid for is not paid for twice.
+    #[test]
+    fn a_chunk_cut_at_the_same_boundaries_is_reused() {
+        let plan = plan(5000.0);
+        let cached: Vec<CachedBounds> = plan
+            .iter()
+            .map(|spec| CachedBounds {
+                index: spec.index,
+                start_secs: spec.start_secs,
+                end_secs: spec.end_secs,
+            })
+            .collect();
+        assert_eq!(
+            resolve_resume(&plan, &cached),
+            (0..plan.len()).map(Some).collect::<Vec<_>>()
+        );
+    }
+
+    /// `plan` rebuilds boundaries with float arithmetic every run, and
+    /// `snap_to_silence` re-derives them from a fresh ffmpeg pass. Bit-exact
+    /// equality would miss on drift far too small to misalign a word, and the
+    /// cost of a false miss is a chunk paid for twice.
+    #[test]
+    fn sub_millisecond_drift_still_counts_as_the_same_chunk() {
+        let plan = plan(3000.0);
+        let cached: Vec<CachedBounds> = plan
+            .iter()
+            .map(|spec| CachedBounds {
+                index: spec.index,
+                start_secs: spec.start_secs + 0.0001,
+                end_secs: spec.end_secs - 0.0001,
+            })
+            .collect();
+        assert!(resolve_resume(&plan, &cached).iter().all(Option::is_some));
+    }
+
+    /// THE MISALIGNMENT GUARD. A boundary that genuinely moved -- a different
+    /// duration probe, a silence pass that landed elsewhere -- means the cached
+    /// words describe DIFFERENT AUDIO than the chunk now planned at that index.
+    /// Reusing it would splice one stretch of speech in where another belongs,
+    /// and the run would succeed while being quietly wrong. Re-transcribing is
+    /// the only honest answer, and it is why each row carries its own
+    /// boundaries instead of trusting the index.
+    #[test]
+    fn a_chunk_whose_boundary_moved_is_refetched_not_reused() {
+        let plan = plan(5000.0);
+        let mut cached: Vec<CachedBounds> = plan
+            .iter()
+            .map(|spec| CachedBounds {
+                index: spec.index,
+                start_secs: spec.start_secs,
+                end_secs: spec.end_secs,
+            })
+            .collect();
+        cached[1].end_secs += 12.0;
+        assert_eq!(resolve_resume(&plan, &cached)[1], None);
+    }
+
+    /// Per-row boundaries rather than one whole-plan hash, and this is what it
+    /// buys: a plan that shifts near the END still resumes everything BEFORE
+    /// the shift. Under a plan hash a single moved boundary would discard every
+    /// chunk, which on a bad API day is exactly the money this feature exists
+    /// to stop losing.
+    #[test]
+    fn a_late_boundary_shift_leaves_the_earlier_chunks_reusable() {
+        let plan = plan(7500.0);
+        let mut cached: Vec<CachedBounds> = plan
+            .iter()
+            .map(|spec| CachedBounds {
+                index: spec.index,
+                start_secs: spec.start_secs,
+                end_secs: spec.end_secs,
+            })
+            .collect();
+        cached[4].start_secs += 9.0;
+
+        let resolved = resolve_resume(&plan, &cached);
+        assert!(resolved[..4].iter().all(Option::is_some));
+        assert_eq!(resolved[4], None);
+    }
+
+    /// A shorter re-probe leaves rows for chunks the plan no longer has. They
+    /// must be ignored rather than indexed into.
+    #[test]
+    fn cached_rows_beyond_the_end_of_the_plan_are_ignored() {
+        let plan = plan(1000.0);
+        let cached = [
+            CachedBounds { index: 0, start_secs: 0.0, end_secs: 1000.0 },
+            CachedBounds { index: 1, start_secs: 1000.0, end_secs: 2000.0 },
+        ];
+        assert_eq!(resolve_resume(&plan, &cached), vec![Some(0)]);
     }
 }

@@ -11,6 +11,7 @@ import {
 } from "../lib/srtGenerator";
 import {
     FileJobRequest,
+    GeminiCostEstimate,
     GeminiProgressEvent,
     GeminiTranscriptionResult,
     HealthResponse,
@@ -250,6 +251,16 @@ class TauriApiClient {
         return invoke<GeminiTranscriptionResult>("transcribe_with_gemini", {
             jobId,
         });
+    }
+
+    /**
+     * What a Gemini run on this job would cost, before any of it is spent.
+     *
+     * Needs no API key and sends no request — an ffprobe of audio already on
+     * disk — so it is safe to call before the user has committed to anything.
+     */
+    async estimateGeminiCost(jobId: string): Promise<GeminiCostEstimate> {
+        return invoke<GeminiCostEstimate>("estimate_gemini_cost", { jobId });
     }
 
     /**

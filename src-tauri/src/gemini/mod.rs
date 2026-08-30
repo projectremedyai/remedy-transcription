@@ -82,6 +82,43 @@ pub struct GeminiTranscriptionResult {
     pub audio_duration: f64,
 }
 
+/// Dollars per hour of audio, for telling the user what a run will cost BEFORE
+/// they commit to it.
+///
+/// DERIVED, NOT AUTHORITATIVE. It comes from the single measured data point
+/// this project has -- a 6-hour file, planned as ~15 chunks, put at roughly
+/// $1.80 -- and nothing here has been checked against Google's published
+/// pricing. It drives a confirmation dialog and never a bill, so being wrong
+/// shows the user a wrong number and does nothing worse; but check it before
+/// treating the figure as real.
+///
+/// Per HOUR OF AUDIO, deliberately, not per chunk: chunking exists because of
+/// the 30-minute request cap, and is not something the user buys.
+pub const USD_PER_AUDIO_HOUR: f64 = 0.30;
+
+/// What `duration_secs` of audio is expected to cost.
+pub fn estimate_usd(duration_secs: f64) -> f64 {
+    if duration_secs <= 0.0 {
+        return 0.0;
+    }
+    (duration_secs / 3600.0) * USD_PER_AUDIO_HOUR
+}
+
+/// What a Gemini run would cost and what it would give up, answered before a
+/// single request is sent.
+///
+/// `diarization_available` is here rather than being left for the user to infer
+/// from `chunk_count`: losing speaker labels is a consequence of the 30-minute
+/// cap that nothing in the UI would otherwise mention until after the money was
+/// spent, when it surfaces as a `Speakers::Unavailable` reason.
+#[derive(Debug, Clone, Serialize)]
+pub struct GeminiCostEstimate {
+    pub duration_secs: f64,
+    pub chunk_count: usize,
+    pub estimated_usd: f64,
+    pub diarization_available: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GeminiProgress {
     pub phase: &'static str,
@@ -319,5 +356,26 @@ mod tests {
     fn a_full_retry_budget_sleeps_for_under_three_minutes() {
         let total: u64 = (1..MAX_ATTEMPTS).map(retry_backoff_secs).sum();
         assert!(total < 180, "total backoff was {total}s");
+    }
+
+    /// The one measured data point this project has: the release notes put a
+    /// 6-hour file at roughly $1.80. If this drifts, the dialog is lying to the
+    /// user about what they are about to spend.
+    #[test]
+    fn six_hours_estimates_at_about_one_eighty() {
+        assert!((estimate_usd(6.0 * 3600.0) - 1.80).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_zero_length_file_costs_nothing() {
+        assert_eq!(estimate_usd(0.0), 0.0);
+    }
+
+    /// Linear in duration, so half the audio is half the bill. Guards against
+    /// someone "improving" this into a per-chunk price -- chunking is an
+    /// artifact of the 30-minute request cap, not something the user buys.
+    #[test]
+    fn the_estimate_is_linear_in_duration() {
+        assert!((estimate_usd(1800.0) * 2.0 - estimate_usd(3600.0)).abs() < 1e-9);
     }
 }

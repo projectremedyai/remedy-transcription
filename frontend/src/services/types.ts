@@ -179,6 +179,19 @@ export interface GeminiProgressEvent {
  * if (result.speakers.status === "identified") ...    // ✓ the only way in
  * ```
  */
+/**
+ * What Rust says a Gemini run would cost, from the SAME probe and the same
+ * chunk plan the run itself uses — so the number shown is the run that happens.
+ *
+ * `snake_case` because it crosses the IPC boundary verbatim.
+ */
+export interface GeminiCostEstimate {
+    duration_secs: number;
+    chunk_count: number;
+    estimated_usd: number;
+    diarization_available: boolean;
+}
+
 export interface GeminiTranscriptionResult {
     text: string;
     words: GeminiWord[];

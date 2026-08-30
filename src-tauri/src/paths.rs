@@ -6,6 +6,15 @@ pub const PREPARED_AUDIO_TTL_HOURS: i64 = 24 * 7;
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 pub const MAX_DURATION_HOURS: u64 = 2;
 
+/// How long an unfinished Gemini run's paid-for chunks are kept.
+///
+/// Longer than `PREPARED_AUDIO_TTL_HOURS` on purpose. A prepared WAV is a
+/// derived artifact that ffmpeg can rebuild for free; these rows stand for
+/// money already spent with Google, and cannot be rebuilt at all. Discarding
+/// them early is the expensive direction to be wrong in, and they are words
+/// rather than audio, so keeping them is nearly free.
+pub const CHUNK_RESULT_TTL_HOURS: i64 = 24 * 30;
+
 pub fn resolve_app_data_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let dir = app.path().app_data_dir()?;
     std::fs::create_dir_all(&dir)?;

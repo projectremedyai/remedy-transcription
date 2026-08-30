@@ -434,6 +434,9 @@ pub async fn create_youtube_job(
     state
         .store
         .cleanup_expired_audio(crate::paths::PREPARED_AUDIO_TTL_HOURS, &audio_root);
+    state
+        .store
+        .cleanup_expired_chunk_results(crate::paths::CHUNK_RESULT_TTL_HOURS);
 
     let source_key = extract_youtube_id(&request.url)?;
     let language = normalize_language(&request.language);
@@ -1030,6 +1033,9 @@ pub async fn create_file_job(
     state
         .store
         .cleanup_expired_audio(crate::paths::PREPARED_AUDIO_TTL_HOURS, &audio_root);
+    state
+        .store
+        .cleanup_expired_chunk_results(crate::paths::CHUNK_RESULT_TTL_HOURS);
 
     let input = PathBuf::from(&request.path);
     if !input.is_file() {
@@ -1441,12 +1447,48 @@ pub fn gemini_key_status() -> bool {
     crate::gemini::credentials::is_configured()
 }
 
+/// What a Gemini run on this job would cost, before anything is spent.
+///
+/// Same probe and same `chunking::plan` the run itself uses, so the chunk count
+/// shown is the chunk count that will happen -- an estimate derived a different
+/// way could disagree with the run and quietly become a lie.
+///
+/// Cheap: an ffprobe of audio already on disk. No key is required and no
+/// request is made, so this is safe to call before the user has committed to
+/// anything.
+#[tauri::command]
+pub async fn estimate_gemini_cost(
+    job_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::gemini::GeminiCostEstimate, String> {
+    let wav_path = prepared_audio_for_job(&job_id, &state, &app)?;
+    let duration = probe_duration(&app, &wav_path).await?;
+    let chunk_count = crate::gemini::chunking::plan(duration).len();
+
+    Ok(crate::gemini::GeminiCostEstimate {
+        duration_secs: duration,
+        chunk_count,
+        estimated_usd: crate::gemini::estimate_usd(duration),
+        // The same rule the run applies, stated once here so the dialog cannot
+        // drift from what actually happens.
+        diarization_available: chunk_count == 1,
+    })
+}
+
 /// Transcribe a job's prepared audio with Gemini.
 ///
 /// REJECTS when the REQUEST was wrong (unknown job, no prepared audio, no key
 /// stored) or when any chunk fails after its retries. A partial transcript is
 /// NOT returned: a silent 25-minute hole would be persisted and content-cached,
 /// and the user would get the hole back every time they reopened that file.
+///
+/// That rule is UNCHANGED by resuming, and the distinction is the whole safety
+/// argument. Each chunk is banked in `gemini_chunk_results` the moment Gemini
+/// answers it, so a run that dies on chunk 9 of 15 does not throw away the
+/// eight the user has already paid for -- but a resumed run still has to hold
+/// every chunk in the plan before it returns anything. Partial work lives in
+/// the resume cache and nowhere else; it never reaches `transcripts`.
 #[tauri::command]
 pub async fn transcribe_with_gemini(
     job_id: String,
@@ -1508,7 +1550,37 @@ pub async fn transcribe_with_gemini(
     let mut all_words: Vec<transcript::Word> = Vec::new();
     let mut run_error: Option<String> = None;
 
-    for spec in &specs {
+    // What this audio has already been billed for.
+    //
+    // MULTI-chunk runs only, and that restriction does two jobs at once. A
+    // single-chunk run has no partial progress worth saving -- the one chunk IS
+    // the run, so there is never a surviving prefix to resume from. It is also
+    // the only shape that asks for diarization, and speaker ids do not survive
+    // the round trip (see `transcript::Word`). Confining the cache to
+    // `chunk_count > 1` keeps those two facts from ever meeting: no cached row
+    // can be reused by a run that wanted speaker labels, because such a run is
+    // never cached in the first place.
+    let source_id = if chunk_count > 1 {
+        state.store.source_id_for_job(&job_id).ok().flatten()
+    } else {
+        None
+    };
+    let cached: Vec<crate::store::StoredChunk> = source_id
+        .and_then(|id| state.store.chunk_results(id, crate::gemini::MODEL_ID).ok())
+        .unwrap_or_default();
+    let resume = chunking::resolve_resume(
+        &specs,
+        &cached
+            .iter()
+            .map(|row| chunking::CachedBounds {
+                index: row.index,
+                start_secs: row.start_secs,
+                end_secs: row.end_secs,
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    for (position, spec) in specs.iter().enumerate() {
         // Checked before slicing as well as inside `transcribe_chunk`, so a
         // cancel between chunks does not first spend an ffmpeg pass. Anything
         // but `Empty` ends the run -- see `transcribe_chunk`, which must never
@@ -1516,6 +1588,21 @@ pub async fn transcribe_with_gemini(
         if !matches!(cancel_rx.try_recv(), Err(TryRecvError::Empty)) {
             run_error = Some("cancelled".into());
             break;
+        }
+
+        // Already bought. Skip the request AND the ffmpeg slice: the slice is
+        // the cheaper half, but a resumed run should cost nothing at all for
+        // what it already holds. Progress is still emitted so the UI advances
+        // through the chunks it is skipping rather than appearing to hang.
+        if let Some(hit) = resume[position].and_then(|index| cached.get(index)) {
+            if let Ok(words) = serde_json::from_str::<Vec<transcript::Word>>(&hit.words_json) {
+                emit_gemini_progress(&app, &job_id, "transcribing", spec.index, chunk_count);
+                all_words.extend(words);
+                continue;
+            }
+            // A row that will not parse is a row not to trust. Falling through
+            // re-transcribes it: that costs money but cannot be WRONG, whereas
+            // believing a half-read chunk could silently corrupt the seam.
         }
 
         emit_gemini_progress(&app, &job_id, "slicing", spec.index, chunk_count);
@@ -1542,6 +1629,33 @@ pub async fn transcribe_with_gemini(
         match outcome {
             Ok(mut words) => {
                 transcript::shift(&mut words, spec.start_secs);
+
+                // THE LINE THIS FEATURE IS. Bank the chunk before the next one
+                // is attempted, so everything earlier in the run survives
+                // whatever happens later -- a failure, a crash, a cancel, or
+                // the app being closed.
+                //
+                // Stored with times ALREADY SHIFTED, which makes a reuse a
+                // plain `extend` with no second shift to get wrong. Sound
+                // because a row is reused only when its boundaries match the
+                // fresh plan to within a millisecond.
+                //
+                // Best-effort: a store that will not write is not a reason to
+                // fail a run whose words are in hand. The cost of losing this
+                // row is paying for the chunk again later, not a wrong answer.
+                if let Some(id) = source_id {
+                    if let Ok(json) = serde_json::to_string(&words) {
+                        let _ = state.store.save_chunk_result(
+                            id,
+                            crate::gemini::MODEL_ID,
+                            spec.index,
+                            spec.start_secs,
+                            spec.end_secs,
+                            &json,
+                        );
+                    }
+                }
+
                 all_words.extend(words);
             }
             Err(e) => {

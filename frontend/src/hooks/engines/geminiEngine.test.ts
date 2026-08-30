@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createGeminiEngine } from "./geminiEngine";
+import { RUN_DECLINED, type CostConfirmation } from "./types";
 import type { ResolvedModelConfig } from "../../config/transcription";
 import type { Job } from "../../services/types";
 
 const transcribeWithGemini = vi.fn();
 const cancelGeminiTranscription = vi.fn();
+const estimateGeminiCost = vi.fn();
 // Typed explicitly (rather than inferred from the zero-arg implementation
 // below) so the two-argument call in the `vi.mock` factory typechecks; the
 // implementation itself still ignores both arguments. Vitest 4 takes the whole
@@ -19,6 +21,7 @@ vi.mock("../../services/api", () => ({
         transcribeWithGemini: (jobId: string) => transcribeWithGemini(jobId),
         cancelGeminiTranscription: (jobId: string) =>
             cancelGeminiTranscription(jobId),
+        estimateGeminiCost: (jobId: string) => estimateGeminiCost(jobId),
         subscribeToGeminiProgress: (jobId: string, onProgress: unknown) =>
             subscribeToGeminiProgress(jobId, onProgress),
     },
@@ -42,6 +45,8 @@ const run = (
         fraction: number | null;
         status: string;
     }) => void = () => undefined,
+    confirmCost: (details: CostConfirmation) => Promise<boolean> = async () =>
+        true,
 ) =>
     engine.run({
         job,
@@ -49,6 +54,7 @@ const run = (
         runId: 1,
         onProgress,
         onPartial: () => undefined,
+        confirmCost,
     });
 
 describe("the gemini engine", () => {
@@ -56,6 +62,15 @@ describe("the gemini engine", () => {
         transcribeWithGemini.mockReset();
         cancelGeminiTranscription.mockReset();
         subscribeToGeminiProgress.mockClear();
+        estimateGeminiCost.mockReset();
+        // One chunk unless a test says otherwise: the shape that costs least
+        // and asks nothing.
+        estimateGeminiCost.mockResolvedValue({
+            duration_secs: 300,
+            chunk_count: 1,
+            estimated_usd: 0.025,
+            diarization_available: true,
+        });
     });
 
     it("maps identified speakers straight onto SpeakerTurn[]", async () => {
@@ -216,5 +231,92 @@ describe("the gemini engine", () => {
         cancelGeminiTranscription.mockResolvedValue(true);
         createGeminiEngine().abandon("job-1");
         expect(cancelGeminiTranscription).toHaveBeenCalledWith("job-1");
+    });
+
+    /**
+     * THE MONEY GATE. `MAX_DURATION_HOURS` has only ever guarded the YouTube
+     * path, so a long LOCAL file reached Gemini with nothing between it and the
+     * bill. A dropped 6-hour file is ~15 chunks and roughly $1.80, spent
+     * silently, on a mis-drop the user cannot take back.
+     *
+     * The order asserted here is the whole point: the question has to be
+     * answered BEFORE `transcribeWithGemini`, because after it the money is
+     * gone.
+     */
+    it("asks what a chunked run will cost before spending anything", async () => {
+        estimateGeminiCost.mockResolvedValue({
+            duration_secs: 21600,
+            chunk_count: 15,
+            estimated_usd: 1.8,
+            diarization_available: false,
+        });
+        transcribeWithGemini.mockResolvedValue({
+            text: "hello",
+            words: [{ text: "hello", start: 0, end: 1 }],
+            speakers: { status: "unavailable", reason: "split into 15 parts" },
+            audio_duration: 21600,
+        });
+
+        const seen: CostConfirmation[] = [];
+        await run(
+            createGeminiEngine(),
+            () => undefined,
+            async (details) => {
+                seen.push(details);
+                // Nothing may have been bought at the moment we are asked.
+                expect(transcribeWithGemini).not.toHaveBeenCalled();
+                return true;
+            },
+        );
+
+        expect(seen).toEqual([
+            {
+                durationSecs: 21600,
+                chunkCount: 15,
+                estimatedUsd: 1.8,
+                diarizationAvailable: false,
+            },
+        ]);
+        expect(transcribeWithGemini).toHaveBeenCalledWith("job-1");
+    });
+
+    /**
+     * A short file is the ordinary case and must stay a single click. Chunking
+     * is what makes a run expensive AND what costs it its speaker labels, so
+     * `chunk_count > 1` is the one honest trigger for interrupting the user.
+     */
+    it("does not interrupt a single-chunk run", async () => {
+        transcribeWithGemini.mockResolvedValue({
+            text: "hello",
+            words: [{ text: "hello", start: 0, end: 1 }],
+            speakers: { status: "identified", turns: [], speaker_count: 1 },
+            audio_duration: 300,
+        });
+
+        const confirmCost = vi.fn(async () => true);
+        await run(createGeminiEngine(), () => undefined, confirmCost);
+
+        expect(confirmCost).not.toHaveBeenCalled();
+        expect(transcribeWithGemini).toHaveBeenCalledWith("job-1");
+    });
+
+    /** Declining must cost nothing at all — not one chunk, not one upload. */
+    it("spends nothing when the user declines", async () => {
+        estimateGeminiCost.mockResolvedValue({
+            duration_secs: 21600,
+            chunk_count: 15,
+            estimated_usd: 1.8,
+            diarization_available: false,
+        });
+
+        await expect(
+            run(
+                createGeminiEngine(),
+                () => undefined,
+                async () => false,
+            ),
+        ).rejects.toThrow(RUN_DECLINED);
+
+        expect(transcribeWithGemini).not.toHaveBeenCalled();
     });
 });

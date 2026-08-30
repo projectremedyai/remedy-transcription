@@ -4,9 +4,17 @@
 //! `cargo test` with hand-written JSON.
 
 use anyhow::{anyhow, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// `Deserialize` as well as `Serialize`, because a `Word` now has to survive a
+/// round trip through the resume cache -- see `store::StoredChunk`.
+///
+/// `speaker` stays `#[serde(skip)]`, so it comes back `None`. That is sound
+/// only because the resume cache is never written for a single-chunk run, and
+/// `diarize` is true ONLY for a single chunk: no cached row can ever be reused
+/// by a run that wanted speaker labels. `transcribe_with_gemini` states the
+/// same rule where it enforces it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Word {
     pub text: String,
     pub start: f64,

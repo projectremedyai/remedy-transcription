@@ -37,6 +37,7 @@ describe("the local engine", () => {
             runId: 1,
             onProgress: () => undefined,
             onPartial: () => undefined,
+            confirmCost: async () => true,
         });
 
         expect(result.speakers.status).toBe("unavailable");
@@ -60,6 +61,7 @@ describe("the local engine", () => {
             runId: 1,
             onProgress: () => undefined,
             onPartial: () => undefined,
+            confirmCost: async () => true,
         });
 
         expect(result.audioDuration).toBe(3600.25);
@@ -78,7 +80,43 @@ describe("the local engine", () => {
                 runId: 1,
                 onProgress: () => undefined,
                 onPartial: () => undefined,
+                confirmCost: async () => true,
             }),
         ).rejects.toThrow(/device/i);
+    });
+
+    /**
+     * REGRESSION GUARD for the decision behind the cost dialog: the duration
+     * cap belongs to the ENGINE, not to the source.
+     *
+     * The local path was never capped, and that was right — on-device Whisper
+     * is free at any length, so a six-hour lecture costs nothing but time. The
+     * obvious reading of "local files have no duration cap" would have been to
+     * extend `MAX_DURATION_HOURS` to them, which deletes a working feature to
+     * solve a cost problem this engine does not have. If someone later routes
+     * the confirmation through the hook for every engine instead of through
+     * `geminiEngine.run`, this is what says no.
+     */
+    it("never asks the user to approve a cost, because it has none", async () => {
+        const engine = createLocalEngine({
+            runWorkerTranscription: async () => ({
+                text: "hello",
+                chunks: [],
+                words: [{ text: "hello", start: 0, end: 1 }],
+            }),
+            loadAudio: async () => ({ duration: 12.5 } as AudioBuffer),
+        });
+
+        const confirmCost = vi.fn(async () => true);
+        await engine.run({
+            job,
+            config,
+            runId: 1,
+            onProgress: () => undefined,
+            onPartial: () => undefined,
+            confirmCost,
+        });
+
+        expect(confirmCost).not.toHaveBeenCalled();
     });
 });

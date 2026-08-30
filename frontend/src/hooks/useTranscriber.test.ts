@@ -32,6 +32,7 @@ const mocks = vi.hoisted(() => ({
     transcribeWithGemini: vi.fn(),
     subscribeToGeminiProgress: vi.fn(),
     cancelGeminiTranscription: vi.fn(),
+    estimateGeminiCost: vi.fn(),
 }));
 
 /**
@@ -64,6 +65,7 @@ vi.mock("../services/api", () => ({
         transcribeWithGemini: mocks.transcribeWithGemini,
         subscribeToGeminiProgress: mocks.subscribeToGeminiProgress,
         cancelGeminiTranscription: mocks.cancelGeminiTranscription,
+        estimateGeminiCost: mocks.estimateGeminiCost,
     },
 }));
 
@@ -161,6 +163,14 @@ beforeEach(() => {
 
     mocks.subscribeToProgress.mockReturnValue(mocks.unsubscribe);
     mocks.subscribeToGeminiProgress.mockReturnValue(() => undefined);
+    // A single chunk unless a test says otherwise: no confirmation, no cost
+    // question, exactly as a short file behaves.
+    mocks.estimateGeminiCost.mockResolvedValue({
+        duration_secs: 300,
+        chunk_count: 1,
+        estimated_usd: 0.025,
+        diarization_available: true,
+    });
     mocks.getModelStatus.mockResolvedValue({
         models_ready: true,
         missing_models: [],
@@ -1366,7 +1376,6 @@ describe("useTranscriber's Gemini path under cancellation", () => {
         expect(result.current.output?.text).toBe(LOCAL_TEXT);
         expect(result.current.status).toBe("completed");
     });
-
     /**
      * THE SUPERSEDE MONEY LEAK — the same abandonment as `cancel()`, reached by
      * the other door, and the one that was never told to stop.
@@ -1420,5 +1429,134 @@ describe("useTranscriber's Gemini path under cancellation", () => {
         // The whole point: the superseded cloud run was told to stop, under the
         // engine that was RUNNING it, not the one the selector now shows.
         expect(mocks.cancelGeminiTranscription).toHaveBeenCalledWith("job-1");
+    });
+});
+
+/**
+ * `MAX_DURATION_HOURS` has only ever guarded the YouTube path. A long LOCAL
+ * file went to Gemini with nothing between it and the bill — and the local path
+ * was never capped for a good reason, since on-device Whisper is free at any
+ * length. The guard therefore belongs to the ENGINE, not to the source, which
+ * is why it lives in `geminiEngine.run` behind `confirmCost` and why the local
+ * engine never asks.
+ */
+describe("useTranscriber's cost confirmation for a long Gemini run", () => {
+    beforeEach(() => {
+        // Same reason the suite above does this: the shared `mockReset()`
+        // leaves this returning `undefined`, and `geminiEngine.abandon` calls
+        // `.catch()` on whatever it gets back. No production call ever does.
+        mocks.cancelGeminiTranscription.mockResolvedValue(true);
+    });
+
+    function longGeminiFile() {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({
+                id: "job-1",
+                status: "ready",
+                progress: 1,
+                filename: "lecture.mp3",
+                model_id: "gemini-3.5-transcribe",
+            }),
+        );
+        mocks.getJob.mockImplementation(async (jobId: string) =>
+            makeJob({ id: jobId, status: "ready", progress: 1 }),
+        );
+        mocks.estimateGeminiCost.mockResolvedValue({
+            duration_secs: 21600,
+            chunk_count: 15,
+            estimated_usd: 1.8,
+            diarization_available: false,
+        });
+        mocks.transcribeWithGemini.mockResolvedValue({
+            text: "the six hour lecture",
+            words: [{ text: "the six hour lecture", start: 0, end: 5 }],
+            speakers: { status: "unavailable", reason: "split into 15 parts" },
+            audio_duration: 21600,
+        });
+    }
+
+    async function startLongRun() {
+        const rendered = await renderTranscriber();
+        await act(async () => {
+            rendered.result.current.setEngine("gemini");
+        });
+        await settle();
+        await act(async () => {
+            rendered.result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        return rendered;
+    }
+
+    /** The user must be shown the bill, and nothing may be bought until they answer. */
+    it("holds the run at a confirmation and spends nothing while it waits", async () => {
+        longGeminiFile();
+        const { result } = await startLongRun();
+
+        expect(result.current.pendingCost).toEqual({
+            durationSecs: 21600,
+            chunkCount: 15,
+            estimatedUsd: 1.8,
+            diarizationAvailable: false,
+        });
+        expect(mocks.transcribeWithGemini).not.toHaveBeenCalled();
+    });
+
+    it("runs the transcription once the cost is approved", async () => {
+        longGeminiFile();
+        const { result } = await startLongRun();
+
+        await act(async () => {
+            result.current.approveCost();
+        });
+        await settle();
+
+        expect(mocks.transcribeWithGemini).toHaveBeenCalledWith("job-1");
+        expect(result.current.pendingCost).toBeNull();
+    });
+
+    /**
+     * Declining is not a FAILURE. The user answered the question they were
+     * asked; showing them a red error banner for saying "no" would read as
+     * something having gone wrong.
+     */
+    it("returns to idle without an error when the cost is declined", async () => {
+        longGeminiFile();
+        const { result } = await startLongRun();
+
+        await act(async () => {
+            result.current.declineCost();
+        });
+        await settle();
+
+        expect(mocks.transcribeWithGemini).not.toHaveBeenCalled();
+        expect(result.current.status).toBe("idle");
+        expect(result.current.error).toBeNull();
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.pendingCost).toBeNull();
+    });
+
+    /**
+     * THE STRANDED FRAME. `confirmCost` hands the engine a promise that only a
+     * click resolves — so a run abandoned while the dialog is open would park
+     * `transcribePreparedJob` on a promise nobody will ever settle, holding its
+     * decoded audio for the life of the app. That is the same failure mode
+     * `cancelPendingWait` exists to prevent, and it gets the same answer:
+     * `claimRun` settles it.
+     */
+    it("settles a confirmation left open when another run takes the UI", async () => {
+        longGeminiFile();
+        const { result } = await startLongRun();
+        expect(result.current.pendingCost).not.toBeNull();
+
+        await act(async () => {
+            result.current.cancel();
+        });
+        await settle();
+
+        expect(result.current.pendingCost).toBeNull();
+        expect(mocks.transcribeWithGemini).not.toHaveBeenCalled();
+        expect(result.current.status).toBe("idle");
+        expect(result.current.error).toBeNull();
     });
 });

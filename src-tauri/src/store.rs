@@ -191,6 +191,21 @@ fn model_id_alias(model_id: &str) -> Option<String> {
     }
 }
 
+/// One row of the Gemini resume cache: a chunk already transcribed, and where
+/// it was cut from.
+///
+/// `words_json` is opaque here on purpose. The store's job is to remember the
+/// bytes and the boundaries; only `commands` knows they deserialize to
+/// `gemini::transcript::Word`, and keeping it that way stops the persistence
+/// layer from depending on the transcript shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredChunk {
+    pub index: usize,
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub words_json: String,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -685,7 +700,101 @@ impl Store {
             )?;
         }
 
+        // The resume cache has done its job the moment the transcript exists:
+        // the words are in `transcripts`, the content-keyed lookup serves them,
+        // and a second copy is pure cost. Retiring it HERE rather than at the
+        // end of the Gemini run is deliberate -- it is what makes the cache
+        // survive a persist that fails, which is the one window in which a run
+        // can have bought every chunk and still have nothing to show.
+        //
+        // Scoped to this recipe's model, so a free Whisper transcript of the
+        // same audio never discards chunks the user paid Google for.
+        conn.execute(
+            "DELETE FROM gemini_chunk_results WHERE source_id = ?1 AND model_id = ?2",
+            params![source_id, model_id],
+        )?;
+
         fetch_job(&conn, job_id)
+    }
+
+    /// Record a chunk that Gemini has answered, so a later run need not buy it
+    /// again. Replaces any row at the same index -- a re-cut chunk must be able
+    /// to overwrite the row describing the old cut.
+    pub fn save_chunk_result(
+        &self,
+        source_id: i64,
+        model_id: &str,
+        index: usize,
+        start_secs: f64,
+        end_secs: f64,
+        words_json: &str,
+    ) -> anyhow::Result<()> {
+        let now = utc_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO gemini_chunk_results
+                 (source_id, model_id, chunk_index, start_secs, end_secs, words_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(source_id, model_id, chunk_index)
+             DO UPDATE SET start_secs = excluded.start_secs,
+                           end_secs   = excluded.end_secs,
+                           words_json = excluded.words_json,
+                           created_at = excluded.created_at",
+            params![source_id, model_id, index as i64, start_secs, end_secs, words_json, now],
+        )?;
+        Ok(())
+    }
+
+    /// Every chunk already bought for this recipe, in chunk order.
+    ///
+    /// ORDER BY is not decoration: word order IS the transcript, and SQLite
+    /// promises nothing about row order without it.
+    pub fn chunk_results(&self, source_id: i64, model_id: &str) -> anyhow::Result<Vec<StoredChunk>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_index, start_secs, end_secs, words_json
+             FROM gemini_chunk_results
+             WHERE source_id = ?1 AND model_id = ?2
+             ORDER BY chunk_index",
+        )?;
+        let rows = stmt
+            .query_map(params![source_id, model_id], |row| {
+                Ok(StoredChunk {
+                    index: row.get::<_, i64>(0)? as usize,
+                    start_secs: row.get(1)?,
+                    end_secs: row.get(2)?,
+                    words_json: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Drop the resume cache for one recipe.
+    pub fn clear_chunk_results(&self, source_id: i64, model_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM gemini_chunk_results WHERE source_id = ?1 AND model_id = ?2",
+            params![source_id, model_id],
+        )?)
+    }
+
+    /// Expire chunks from runs that were never finished.
+    ///
+    /// `persist_transcript` clears the cache on the happy path, so what reaches
+    /// this sweep is the abandoned tail: a run cancelled and never resumed, or
+    /// one whose file the user never opened again. Without it those rows live
+    /// forever. They are small -- words, not audio -- which is why this TTL is
+    /// generous compared with the prepared-WAV one: the rows stand for money
+    /// already spent, and throwing them away early is the expensive mistake.
+    pub fn cleanup_expired_chunk_results(&self, ttl_hours: i64) -> usize {
+        let cutoff = (Utc::now() - Duration::hours(ttl_hours)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM gemini_chunk_results WHERE created_at < ?1",
+            params![cutoff],
+        )
+        .unwrap_or(0)
     }
 
     /// Expire the prepared WAVs nobody has touched in `ttl_hours`.
@@ -1020,6 +1129,38 @@ CREATE TABLE IF NOT EXISTS transcript_speakers (
     speaker_key TEXT NOT NULL,
     display_name TEXT NOT NULL,
     UNIQUE(source_id, speaker_key),
+    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+
+-- One Gemini chunk that has been transcribed and PAID FOR, held so that a run
+-- which dies partway does not throw that money away.
+--
+-- Not a transcript, and the distinction is the whole safety argument: a run
+-- still fails unless every chunk in the plan is present, so a hole can never
+-- reach `transcripts` and be served back forever by the content-keyed cache.
+-- These rows are a resume cache and nothing else.
+--
+-- `start_secs`/`end_secs` are carried per row rather than trusted from
+-- `chunk_index`, because an index alone cannot tell "chunk 2 of this plan" from
+-- "chunk 2 of a plan that has since moved" -- and reusing the second splices the
+-- wrong audio into the transcript while still reporting success. See
+-- `chunking::resolve_resume`.
+--
+-- Keyed on (source, model) and not on a job: the point is to survive the job.
+-- Closing the app or re-dropping the same file lands on a new job id but the
+-- same content-addressed source, which is exactly when resuming is worth most.
+-- Additive `CREATE TABLE IF NOT EXISTS`, so an existing database picks it up on
+-- its next open with everything else untouched.
+CREATE TABLE IF NOT EXISTS gemini_chunk_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL,
+    model_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    start_secs REAL NOT NULL,
+    end_secs REAL NOT NULL,
+    words_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(source_id, model_id, chunk_index),
     FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
 );
 
@@ -1910,6 +2051,159 @@ mod tests {
                 .set_speaker_name(9999, "SPEAKER_00", "Nobody")
                 .is_err(),
             "an orphaned speaker name must be refused by the foreign key"
+        );
+    }
+
+    // ---- the Gemini resume cache -------------------------------------------
+    //
+    // These rows are the only place a PAID-FOR but not-yet-finished chunk
+    // lives. They are deliberately NOT transcripts: a run still fails unless
+    // every chunk is present, so a hole can never reach `transcripts` and be
+    // served back from the content-keyed cache forever.
+
+    const GEMINI: &str = "gemini-3.5-transcribe";
+
+    fn words(text: &str) -> String {
+        format!(r#"[{{"text":"{text}","start":0.0,"end":1.0}}]"#)
+    }
+
+    #[test]
+    fn a_saved_chunk_comes_back_with_its_boundaries_and_words() {
+        let (temp, source_id) = store_with_source();
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 0, 0.0, 1500.0, &words("hello"))
+            .expect("save a chunk");
+
+        let rows = temp.store.chunk_results(source_id, GEMINI).expect("read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 0);
+        assert_eq!((rows[0].start_secs, rows[0].end_secs), (0.0, 1500.0));
+        assert_eq!(rows[0].words_json, words("hello"));
+    }
+
+    /// A re-run that re-transcribes a chunk must overwrite, not collide. The
+    /// boundaries travel with the row, so a re-cut chunk has to be able to
+    /// replace the row that recorded the OLD cut.
+    #[test]
+    fn saving_the_same_chunk_index_twice_replaces_it() {
+        let (temp, source_id) = store_with_source();
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 1, 1500.0, 3000.0, &words("first"))
+            .expect("save");
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 1, 1512.0, 3000.0, &words("second"))
+            .expect("re-save");
+
+        let rows = temp.store.chunk_results(source_id, GEMINI).expect("read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].start_secs, 1512.0);
+        assert_eq!(rows[0].words_json, words("second"));
+    }
+
+    /// Scoped to the RECIPE, not the audio. The same file under a different
+    /// model is a different transcript and a different bill; its chunks are
+    /// not interchangeable with these.
+    #[test]
+    fn chunk_results_are_scoped_to_one_model() {
+        let (temp, source_id) = store_with_source();
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 0, 0.0, 10.0, &words("cloud"))
+            .expect("save");
+
+        assert!(temp
+            .store
+            .chunk_results(source_id, "some-other-model")
+            .expect("read back")
+            .is_empty());
+    }
+
+    /// Word order IS the transcript, so chunk order is not negotiable. SQLite
+    /// makes no promise about row order without an ORDER BY.
+    #[test]
+    fn chunk_results_come_back_in_chunk_order() {
+        let (temp, source_id) = store_with_source();
+        for index in [2usize, 0, 1] {
+            temp.store
+                .save_chunk_result(source_id, GEMINI, index, index as f64, index as f64 + 1.0, &words("w"))
+                .expect("save");
+        }
+
+        let rows = temp.store.chunk_results(source_id, GEMINI).expect("read back");
+        assert_eq!(rows.iter().map(|r| r.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    /// THE LIFECYCLE JOIN. Once the transcript exists, the resume cache has
+    /// done its job: the words are in `transcripts`, the content-keyed lookup
+    /// will serve them, and keeping a second copy of the same audio's words
+    /// around is pure cost. Clearing it here -- rather than at the end of the
+    /// Gemini run -- is what makes the cache survive a persist that fails.
+    #[test]
+    fn persisting_the_transcript_clears_the_resume_cache() {
+        let (temp, source_id) = store_with_source();
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 0, 0.0, 1500.0, &words("hello"))
+            .expect("save");
+
+        write_transcript(&temp.store, source_id, GEMINI, "hello");
+
+        assert!(temp
+            .store
+            .chunk_results(source_id, GEMINI)
+            .expect("read back")
+            .is_empty());
+    }
+
+    /// ...and only for the recipe that was persisted. A Whisper transcript of
+    /// the same audio must not throw away chunks the user paid Google for.
+    #[test]
+    fn persisting_one_recipe_leaves_another_recipes_chunks_alone() {
+        let (temp, source_id) = store_with_source();
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 0, 0.0, 1500.0, &words("paid for"))
+            .expect("save");
+
+        write_transcript(
+            &temp.store,
+            source_id,
+            "onnx-community/whisper-base_timestamped",
+            "free",
+        );
+
+        assert_eq!(
+            temp.store.chunk_results(source_id, GEMINI).expect("read back").len(),
+            1
+        );
+    }
+
+    /// A run that is abandoned and never persisted would otherwise leave its
+    /// rows forever. Negative hours puts the cutoff in the future, which is how
+    /// `cleanup_expired_audio`'s own test forces expiry without backdating.
+    #[test]
+    fn the_ttl_sweep_drops_chunk_results_nobody_came_back_for() {
+        let (temp, source_id) = store_with_source();
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 0, 0.0, 1500.0, &words("abandoned"))
+            .expect("save");
+
+        assert_eq!(temp.store.cleanup_expired_chunk_results(-1), 1);
+        assert!(temp
+            .store
+            .chunk_results(source_id, GEMINI)
+            .expect("read back")
+            .is_empty());
+    }
+
+    #[test]
+    fn the_ttl_sweep_keeps_chunk_results_from_a_run_still_in_progress() {
+        let (temp, source_id) = store_with_source();
+        temp.store
+            .save_chunk_result(source_id, GEMINI, 0, 0.0, 1500.0, &words("in flight"))
+            .expect("save");
+
+        assert_eq!(temp.store.cleanup_expired_chunk_results(24), 0);
+        assert_eq!(
+            temp.store.chunk_results(source_id, GEMINI).expect("read back").len(),
+            1
         );
     }
 }

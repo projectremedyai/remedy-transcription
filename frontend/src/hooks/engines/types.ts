@@ -30,6 +30,36 @@ export type { SpeakerOutcome };
 export const LOCAL_ENGINE_NO_SPEAKERS =
     "the on-device engine does not identify speakers";
 
+/**
+ * What a run is about to cost, put to the user before it is spent.
+ *
+ * Deliberately not named for Gemini. It describes a property of a RUN — this
+ * much audio, this many requests, this much money — and any future paid engine
+ * asks the same question. The local engine never asks it at all.
+ */
+export interface CostConfirmation {
+    durationSecs: number;
+    chunkCount: number;
+    estimatedUsd: number;
+    /**
+     * Whether speaker labels are possible at this length. Carried here because
+     * the 30-minute request cap costs a long run its diarization, and nothing
+     * else in the UI mentions that until after the money is gone.
+     */
+    diarizationAvailable: boolean;
+}
+
+/**
+ * Thrown by an engine whose cost the user declined.
+ *
+ * A constant rather than prose matched at the call site, for the same reason
+ * `LOCAL_ENGINE_NO_SPEAKERS` is one: the hook has to tell "the user said no"
+ * apart from "the run failed" — one goes quietly back to idle, the other shows
+ * an error — and a reworded string would silently turn the first into the
+ * second.
+ */
+export const RUN_DECLINED = "the user declined this run's cost";
+
 export interface EngineResult {
     transcript: WorkerTranscript;
     speakers: EngineSpeakers;
@@ -58,6 +88,21 @@ export interface EngineRunArgs {
      * engine that streams over a channel the hook does not already own.
      */
     onPartial: (transcript: WorkerTranscript) => void;
+    /**
+     * Ask the user to approve what this run will cost, and wait for the answer.
+     *
+     * Resolves `true` to proceed, `false` to abandon before anything is spent.
+     * An engine that costs nothing never calls it — the local engine does not.
+     *
+     * That this await lives INSIDE `run()` is deliberate rather than
+     * incidental. `transcribePreparedJob` documents that its run token cannot
+     * move across an await whose promise settles synchronously, and a real
+     * user-interaction await would break that reasoning wherever it were
+     * placed. Here it is already covered: the hook re-checks the token after
+     * `engines[config.engine].run()` returns, which is one of the guarded
+     * resume points it enumerates.
+     */
+    confirmCost: (details: CostConfirmation) => Promise<boolean>;
 }
 
 export interface TranscriptionEngine {

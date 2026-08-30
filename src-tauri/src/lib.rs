@@ -63,6 +63,7 @@ pub fn run() {
             commands::gemini_key_status,
             commands::transcribe_with_gemini,
             commands::cancel_gemini_transcription,
+            commands::estimate_gemini_cost,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

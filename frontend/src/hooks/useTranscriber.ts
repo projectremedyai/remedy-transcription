@@ -12,7 +12,12 @@ import {
 import { EngineId, engineById } from "../config/engines";
 import { createLocalEngine } from "./engines/localEngine";
 import { createGeminiEngine } from "./engines/geminiEngine";
-import type { EngineSpeakers, TranscriptionEngine } from "./engines/types";
+import {
+    RUN_DECLINED,
+    type CostConfirmation,
+    type EngineSpeakers,
+    type TranscriptionEngine,
+} from "./engines/types";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
@@ -106,6 +111,22 @@ export interface Transcriber {
      * locked while busy.
      */
     cancel: () => void;
+    /**
+     * The cost question on screen, or `null` when there is none.
+     *
+     * Non-null means an engine is PARKED on a promise only `approveCost` or
+     * `declineCost` can settle — so whatever renders this must always render,
+     * or the run hangs with Cancel as the only way out.
+     */
+    pendingCost: CostConfirmation | null;
+    /** Approve the pending cost and let the run proceed. */
+    approveCost: () => void;
+    /**
+     * Refuse the pending cost. Nothing is spent and the app returns to idle
+     * rather than to an error — the user answered the question, they did not
+     * hit a failure.
+     */
+    declineCost: () => void;
     output?: TranscriberData;
     jobId: string | null;
     error: string | null;
@@ -185,6 +206,15 @@ export function useTranscriber(): Transcriber {
     const [error, setError] = useState<string | null>(null);
     const [progress, setProgress] = useState(0);
     const [status, setStatus] = useState<string>("idle");
+    /**
+     * The cost question currently on screen, or `null` when none is.
+     *
+     * Mirrors `pendingCostRef` so the UI can render it. The REF is what holds
+     * the promise the engine is parked on; this is only what the user sees.
+     */
+    const [pendingCost, setPendingCost] = useState<CostConfirmation | null>(
+        null,
+    );
     const [browserCaps, setBrowserCaps] = useState<BrowserCaps | null>(null);
     const [engine, setEngine] = useState<EngineId>("local");
     const [presetId, setPresetId] = useState<ModelPresetId>("auto");
@@ -792,9 +822,50 @@ export function useTranscriber(): Transcriber {
      */
     const runEngineRef = useRef<EngineId>(engine);
 
+    /** The resolver for the cost question on screen. See `settlePendingCost`. */
+    const pendingCostRef = useRef<{
+        resolve: (approved: boolean) => void;
+    } | null>(null);
+
+    /**
+     * Answer whatever cost question is open, and forget it.
+     *
+     * `confirmCost` hands the engine a promise that ONLY a click resolves, so
+     * an unanswered question is a promise nobody will ever settle — and
+     * `transcribePreparedJob` is parked on it, holding its decoded audio for
+     * the life of the app. That is the same stranded-frame failure
+     * `cancelPendingWait` exists to prevent, and it takes the same answer:
+     * every path that abandons a run settles this too.
+     *
+     * Idempotent. Clearing the ref BEFORE resolving means a resolver can never
+     * be called twice, however the second call arrives.
+     */
+    const settlePendingCost = useCallback((approved: boolean) => {
+        const pending = pendingCostRef.current;
+        pendingCostRef.current = null;
+        setPendingCost(null);
+        pending?.resolve(approved);
+    }, []);
+
+    /**
+     * Put a run's cost to the user and wait for the answer.
+     *
+     * Handed to every engine; only a paid one calls it. The promise is resolved
+     * by `approveCost`/`declineCost`, or by `claimRun` if the run is abandoned
+     * while the question is still on screen.
+     */
+    const confirmCost = useCallback(
+        (details: CostConfirmation) =>
+            new Promise<boolean>((resolve) => {
+                pendingCostRef.current = { resolve };
+                setPendingCost(details);
+            }),
+        [],
+    );
+
     /**
      * Claim the UI for a new run, killing whatever run held it — its wait, its
-     * worker, its promise, and its cloud run.
+     * worker, and its promise.
      *
      * Synchronous by contract — every caller must invoke it before its first
      * `await`. Calling it "first, before any early return" inside
@@ -836,6 +907,11 @@ export function useTranscriber(): Transcriber {
      */
     const claimRun = useCallback(() => {
         cancelPendingWait();
+        // A cost question on screen belongs to the run being abandoned, and the
+        // engine is parked on its promise. Decline it: `false` is both the safe
+        // answer (nothing gets bought for a run that no longer owns the UI) and
+        // the one that lets the dead frame unwind.
+        settlePendingCost(false);
         // Bump BEFORE rejecting: the rejection runs the dead run's `catch`, and
         // that `catch` decides whether to show an error by comparing this token.
         runIdRef.current += 1;
@@ -881,7 +957,7 @@ export function useTranscriber(): Transcriber {
         }
 
         return runIdRef.current;
-    }, [cancelPendingWait, engines, jobId, worker]);
+    }, [cancelPendingWait, engines, jobId, settlePendingCost, worker]);
 
     /**
      * Write the transcript, then — and ONLY then — decide whether this run is
@@ -1047,6 +1123,19 @@ export function useTranscriber(): Transcriber {
         setTranscript((previous) =>
             previous ? { ...previous, isBusy: false } : previous,
         );
+
+        // A declined cost is not a failure. The user answered the question they
+        // were asked, and a red banner for saying "no" reads as something
+        // having gone wrong. Both `start*` entry points funnel their catch
+        // through here, so this is the one place it needs saying.
+        if (nextError instanceof Error && nextError.message === RUN_DECLINED) {
+            setError(null);
+            setStatus("idle");
+            setIsBusy(false);
+            setProgress(0);
+            return;
+        }
+
         setError(nextError instanceof Error ? nextError.message : fallback);
         setStatus("failed");
         setIsBusy(false);
@@ -1139,6 +1228,7 @@ export function useTranscriber(): Transcriber {
                     // message handler already; this hook is here for engines
                     // that stream without a worker.
                 },
+                confirmCost,
             });
 
             // A GUARD HERE NOW, and this is the fourth round of this decision, so
@@ -1199,6 +1289,7 @@ export function useTranscriber(): Transcriber {
         [
             applyCompletedJob,
             cancelPendingWait,
+            confirmCost,
             engines,
             handleBackendJobUpdate,
             persistWorkerTranscript,
@@ -1327,6 +1418,22 @@ export function useTranscriber(): Transcriber {
         setError(null);
     }, [claimRun]);
 
+    /** The user accepted the bill: let the parked engine proceed. */
+    const approveCost = useCallback(
+        () => settlePendingCost(true),
+        [settlePendingCost],
+    );
+
+    /**
+     * The user refused the bill. The engine throws `RUN_DECLINED`, which
+     * `failRun` recognises and turns into a quiet return to idle rather than an
+     * error.
+     */
+    const declineCost = useCallback(
+        () => settlePendingCost(false),
+        [settlePendingCost],
+    );
+
     const onInputChange = useCallback(() => {
         setTranscript(undefined);
         setError(null);
@@ -1381,11 +1488,17 @@ export function useTranscriber(): Transcriber {
             speakerNames,
             renameSpeaker,
             speakerOutcome,
+            pendingCost,
+            approveCost,
+            declineCost,
         }),
         [
+            approveCost,
             browserCaps,
             cancel,
             capabilityLabel,
+            declineCost,
+            pendingCost,
             effectivePresetLabel,
             engine,
             error,

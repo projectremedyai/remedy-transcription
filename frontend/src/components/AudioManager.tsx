@@ -13,6 +13,7 @@ import { UrlInput } from "./modal/UrlInput";
 import { Transcriber } from "../hooks/useTranscriber";
 import Progress from "./Progress";
 import GeminiKeyDialog from "./GeminiKeyDialog";
+import CostConfirmationDialog from "./CostConfirmationDialog";
 import { ENGINES, EngineId, engineById } from "../config/engines";
 import { api } from "../services/api";
 
@@ -479,6 +480,18 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                         configured={geminiKeyConfigured}
                         onClose={() => setKeyDialogOpen(false)}
                         onSaved={setGeminiKeyConfigured}
+                    />
+
+                    {/*
+                        Rendered unconditionally and self-blanking on a null
+                        `pendingCost`. The engine is PARKED on the promise this
+                        answers, so a dialog that failed to mount would hang the
+                        run with no way out but Cancel.
+                    */}
+                    <CostConfirmationDialog
+                        pending={props.transcriber.pendingCost}
+                        onApprove={props.transcriber.approveCost}
+                        onDecline={props.transcriber.declineCost}
                     />
 
                     <SettingsPanel transcriber={props.transcriber} />

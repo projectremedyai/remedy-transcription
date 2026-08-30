@@ -1,6 +1,11 @@
 import { api } from "../../services/api";
 import type { GeminiProgressEvent } from "../../services/types";
-import type { EngineResult, EngineRunArgs, TranscriptionEngine } from "./types";
+import {
+    RUN_DECLINED,
+    type EngineResult,
+    type EngineRunArgs,
+    type TranscriptionEngine,
+} from "./types";
 
 /**
  * PROSE, not kebab-case machine strings.
@@ -36,6 +41,31 @@ export function createGeminiEngine(): TranscriptionEngine {
         id: "gemini",
 
         async run(args: EngineRunArgs): Promise<EngineResult> {
+            // THE MONEY GATE, and it comes first — before the progress
+            // listener, before any request, before anything that costs.
+            //
+            // Only for a chunked run. `chunk_count > 1` is the one honest
+            // trigger: it is exactly when a run stops being pocket change AND
+            // exactly when it loses its speaker labels, so one question covers
+            // both. Interrupting every short file would train the user to click
+            // through the dialog that matters.
+            //
+            // The estimate is cheap and keyless (an ffprobe of audio already on
+            // disk), so asking for it costs nothing even when the answer turns
+            // out to be "no need to ask".
+            const estimate = await api.estimateGeminiCost(args.job.id);
+            if (estimate.chunk_count > 1) {
+                const proceed = await args.confirmCost({
+                    durationSecs: estimate.duration_secs,
+                    chunkCount: estimate.chunk_count,
+                    estimatedUsd: estimate.estimated_usd,
+                    diarizationAvailable: estimate.diarization_available,
+                });
+                if (!proceed) {
+                    throw new Error(RUN_DECLINED);
+                }
+            }
+
             const unsubscribe = api.subscribeToGeminiProgress(
                 args.job.id,
                 (event) => {

@@ -8,10 +8,11 @@ const transcribeWithGemini = vi.fn();
 const cancelGeminiTranscription = vi.fn();
 // Typed explicitly (rather than inferred from the zero-arg implementation
 // below) so the two-argument call in the `vi.mock` factory typechecks; the
-// implementation itself still ignores both arguments.
-const subscribeToGeminiProgress = vi.fn<[string, unknown], () => void>(
-    () => () => undefined,
-);
+// implementation itself still ignores both arguments. Vitest 4 takes the whole
+// FUNCTION type here, not the old `<[args], return>` pair.
+const subscribeToGeminiProgress = vi.fn<
+    (jobId: string, onProgress: unknown) => () => void
+>(() => () => undefined);
 
 vi.mock("../../services/api", () => ({
     api: {

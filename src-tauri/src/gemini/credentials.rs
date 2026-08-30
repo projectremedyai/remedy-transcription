@@ -36,20 +36,44 @@ pub fn save(key: &str) -> anyhow::Result<()> {
         .context("could not write the API key to the OS keychain")
 }
 
-/// Clearing a key that was never set is a SUCCESS, not an error: the caller
-/// wanted no key stored, and there is none.
-pub fn clear() -> anyhow::Result<()> {
-    match entry()?.delete_credential() {
+/// The policy behind `clear()`: removing a key that was never set is a
+/// SUCCESS, not an error, because the caller wanted no key stored and there
+/// is none. Any other failure IS reported, since the key may still be
+/// sitting in the keychain.
+///
+/// Split out from `clear()` so the rule is testable without a keychain --
+/// `keyring::Error` is a plain enum, constructible by hand in a unit test.
+fn interpret_clear(result: keyring::Result<()>) -> anyhow::Result<()> {
+    match result {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow::Error::new(e).context("could not clear the API key")),
     }
+}
+
+pub fn clear() -> anyhow::Result<()> {
+    interpret_clear(entry()?.delete_credential())
+}
+
+/// The policy behind `is_configured()`: only a successfully retrieved
+/// password counts as "configured". A locked or unavailable keychain must
+/// read as "no key" -- not surfaced as an error, and not read as configured
+/// -- so it routes the user to the Add-key flow instead of into a run that
+/// cannot authenticate.
+///
+/// Split out from `is_configured()` for the same reason as `interpret_clear`:
+/// testable against a hand-built `keyring::Result` with no real keychain.
+fn interpret_status(result: keyring::Result<String>) -> bool {
+    result.is_ok()
 }
 
 /// Never surfaces a keychain error as "configured". A locked or unavailable
 /// keychain reads as "no key", which routes the user to the Add-key flow
 /// instead of into a run that cannot authenticate.
 pub fn is_configured() -> bool {
-    matches!(entry().and_then(|e| Ok(e.get_password().is_ok())), Ok(true))
+    match entry() {
+        Ok(e) => interpret_status(e.get_password()),
+        Err(_) => false,
+    }
 }
 
 // Not called yet: the Gemini API client (a later task) reads the key through
@@ -94,5 +118,59 @@ mod tests {
     fn the_keychain_entry_is_namespaced_to_this_app() {
         assert_eq!(SERVICE, "remedy-transcription");
         assert_eq!(ACCOUNT, "gemini-api-key");
+    }
+
+    /// Constructs a boxed platform error, the payload the real backends put
+    /// inside `PlatformFailure`/`NoStorageAccess` -- no keychain required.
+    fn platform_error() -> Box<dyn std::error::Error + Send + Sync> {
+        Box::<dyn std::error::Error + Send + Sync>::from("the keychain is locked")
+    }
+
+    #[test]
+    fn clearing_a_key_that_was_never_set_is_a_success() {
+        assert!(interpret_clear(Err(keyring::Error::NoEntry)).is_ok());
+    }
+
+    #[test]
+    fn clearing_an_existing_key_is_a_success() {
+        assert!(interpret_clear(Ok(())).is_ok());
+    }
+
+    /// Unlike a missing entry, a keychain that refuses to cooperate is a real
+    /// failure: the key may still be sitting there, so the caller must not
+    /// be told it is gone.
+    #[test]
+    fn a_locked_keychain_fails_clear_and_says_so() {
+        let err = interpret_clear(Err(keyring::Error::NoStorageAccess(platform_error())))
+            .expect_err("a locked keychain must not read as cleared");
+        assert!(
+            err.to_string().contains("could not clear"),
+            "message should say what failed: {err}"
+        );
+    }
+
+    #[test]
+    fn a_retrieved_password_reads_as_configured() {
+        assert!(interpret_status(Ok("AIzaSyABC".to_string())));
+    }
+
+    #[test]
+    fn no_stored_entry_reads_as_not_configured() {
+        assert!(!interpret_status(Err(keyring::Error::NoEntry)));
+    }
+
+    /// The rule this test exists to pin down: a keychain that cannot be
+    /// read -- locked, unavailable, whatever the platform reason -- must
+    /// read as "no key", not "configured". Reading it as configured would
+    /// route a run into the Gemini API with no key to send, straight into a
+    /// 401, instead of into the Add-key flow.
+    #[test]
+    fn a_locked_or_unavailable_keychain_reads_as_not_configured() {
+        assert!(!interpret_status(Err(keyring::Error::NoStorageAccess(
+            platform_error()
+        ))));
+        assert!(!interpret_status(Err(keyring::Error::PlatformFailure(
+            platform_error()
+        ))));
     }
 }

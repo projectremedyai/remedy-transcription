@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+    BrowserCaps,
     MODEL_PRESETS,
     ModelPresetId,
     modelIdForPreset,
@@ -58,6 +59,7 @@ describe("a preset id always resolves to a model", () => {
         );
         for (const presetId of resolvable) {
             const resolved = resolveModelConfig(
+                "local",
                 presetId,
                 caps,
                 "transcribe",
@@ -66,5 +68,55 @@ describe("a preset id always resolves to a model", () => {
             expect(resolved.modelId).not.toBe("__auto__");
             expect(resolved.modelId).toContain("/");
         }
+    });
+});
+
+describe("resolveModelConfig on the gemini engine", () => {
+    const caps: BrowserCaps = {
+        secureContext: true,
+        canUseWebGPU: true,
+        shaderF16: true,
+        deviceMemoryGiB: 32,
+        logicalCores: 16,
+    };
+
+    it("pins the model and ignores browser capabilities entirely", () => {
+        const config = resolveModelConfig(
+            "gemini",
+            "quality",
+            caps,
+            "transcribe",
+            "english",
+        );
+        expect(config.modelId).toBe("gemini-3.5-transcribe");
+        expect(config.device).toBeNull();
+    });
+
+    /**
+     * The cache-key guard. Honouring these would create a second `transcripts`
+     * row for a byte-identical run and re-bill the user.
+     */
+    it("forces task=transcribe and language=auto whatever the dropdowns say", () => {
+        const config = resolveModelConfig(
+            "gemini",
+            "balanced",
+            caps,
+            "translate",
+            "french",
+        );
+        expect(config.task).toBe("transcribe");
+        expect(config.language).toBe("auto");
+    });
+
+    it("carries the local preset through so switching back restores it", () => {
+        expect(
+            resolveModelConfig(
+                "gemini",
+                "fast_en",
+                caps,
+                "transcribe",
+                "english",
+            ).presetId,
+        ).toBe("fast_en");
     });
 });

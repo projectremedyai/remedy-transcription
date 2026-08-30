@@ -78,6 +78,8 @@ function renderAudioManager(overrides: Partial<Transcriber> = {}) {
         error: null,
         progress: 0,
         status: "idle",
+        engine: "local",
+        setEngine: vi.fn(),
         presetId: "auto",
         setPresetId: vi.fn(),
         task: "transcribe",

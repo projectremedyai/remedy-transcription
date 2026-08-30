@@ -9,6 +9,7 @@ import {
     TaskMode,
     resolveModelConfig,
 } from "../config/transcription";
+import { EngineId } from "../config/engines";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
@@ -107,6 +108,8 @@ export interface Transcriber {
     error: string | null;
     progress: number;
     status: string;
+    engine: EngineId;
+    setEngine: (engine: EngineId) => void;
     presetId: ModelPresetId;
     setPresetId: (presetId: ModelPresetId) => void;
     task: TaskMode;
@@ -182,6 +185,7 @@ export function useTranscriber(): Transcriber {
     const [progress, setProgress] = useState(0);
     const [status, setStatus] = useState<string>("idle");
     const [browserCaps, setBrowserCaps] = useState<BrowserCaps | null>(null);
+    const [engine, setEngine] = useState<EngineId>("local");
     const [presetId, setPresetId] = useState<ModelPresetId>("auto");
     const [task, setTask] = useState<TaskMode>("transcribe");
     const [language, setLanguage] = useState<string>("auto");
@@ -424,11 +428,17 @@ export function useTranscriber(): Transcriber {
         }
 
         try {
-            return resolveModelConfig(presetId, browserCaps, task, language);
+            return resolveModelConfig(
+                engine,
+                presetId,
+                browserCaps,
+                task,
+                language,
+            );
         } catch {
             return null;
         }
-    }, [browserCaps, language, presetId, task]);
+    }, [browserCaps, engine, language, presetId, task]);
 
     const selectedModelId = selectedModelConfig?.modelId ?? null;
     const selectedModelAvailable = useMemo(() => {
@@ -893,7 +903,13 @@ export function useTranscriber(): Transcriber {
             setSpeakerNames({});
 
             const caps = await ensureBrowserCaps();
-            const config = resolveModelConfig(presetId, caps, task, language);
+            const config = resolveModelConfig(
+                engine,
+                presetId,
+                caps,
+                task,
+                language,
+            );
             if (
                 modelStatus &&
                 !modelStatus.items.some(
@@ -916,7 +932,7 @@ export function useTranscriber(): Transcriber {
             setEffectivePresetLabel(config.presetLabel);
             return config;
         },
-        [ensureBrowserCaps, language, modelStatus, presetId, task],
+        [engine, ensureBrowserCaps, language, modelStatus, presetId, task],
     );
 
     const failRun = useCallback((nextError: unknown, fallback: string) => {
@@ -1191,6 +1207,8 @@ export function useTranscriber(): Transcriber {
             error,
             progress,
             status,
+            engine,
+            setEngine,
             presetId,
             setPresetId,
             task,
@@ -1217,6 +1235,7 @@ export function useTranscriber(): Transcriber {
             cancel,
             capabilityLabel,
             effectivePresetLabel,
+            engine,
             error,
             isBusy,
             isModelLoading,

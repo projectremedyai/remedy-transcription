@@ -1,3 +1,5 @@
+import { EngineId, GEMINI_MODEL_ID } from "./engines";
+
 export type TaskMode = "transcribe" | "translate";
 export type DeviceMode = "webgpu" | "wasm";
 
@@ -28,10 +30,16 @@ export interface ModelPreset {
 }
 
 export interface ResolvedModelConfig {
+    engine: EngineId;
     presetId: ModelPresetId;
     presetLabel: string;
     modelId: string;
-    device: DeviceMode;
+    /**
+     * `null` on a cloud engine: there is no local device running inference.
+     * The local engine narrows this and throws if it is ever null, rather than
+     * defaulting to "wasm" and silently running the slow path.
+     */
+    device: DeviceMode | null;
     task: TaskMode;
     language: string;
 }
@@ -165,11 +173,33 @@ export function chooseAutoPreset(
 }
 
 export function resolveModelConfig(
+    engine: EngineId,
     requestedPresetId: ModelPresetId,
     caps: BrowserCaps,
     task: TaskMode,
     language: string,
 ): ResolvedModelConfig {
+    if (engine === "gemini") {
+        // `task` and `language` are DROPPED, not honoured: the model has no
+        // translation mode and no language-forcing parameter, so persisting the
+        // user's inert dropdown values would mint distinct `transcripts` rows
+        // -- UNIQUE(source_id, model_id, task, language) -- for byte-identical
+        // runs, and the user would pay Google again for a cache miss caused by
+        // a control that did nothing.
+        //
+        // `presetId` IS carried through, unused, so switching back to the local
+        // engine restores the user's model choice instead of resetting it.
+        return {
+            engine,
+            presetId: requestedPresetId,
+            presetLabel: "Gemini 3.5 Transcribe",
+            modelId: GEMINI_MODEL_ID,
+            device: null,
+            task: "transcribe",
+            language: "auto",
+        };
+    }
+
     const normalizedLanguage = language || "auto";
     let presetId =
         requestedPresetId === "auto"
@@ -190,6 +220,7 @@ export function resolveModelConfig(
     }
 
     return {
+        engine,
         presetId,
         presetLabel: preset.label,
         modelId: preset.modelId,

@@ -10,6 +10,12 @@ rust-version = "1.77"
 [lib]
 name = "remedy_transcription_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+# `cargo test` builds a unit-test harness for the lib only when a testable
+# crate-type is present AND the target opts in. With `staticlib`/`cdylib`
+# listed first, Cargo skipped the harness entirely: `cargo test` reported
+# "0 passed" while 122 real tests sat in `store`, `gemini`, and friends,
+# and CI ran that empty command green for every commit. Opt in explicitly.
+test = true
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

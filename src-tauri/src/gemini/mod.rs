@@ -27,7 +27,34 @@ pub const CHUNK_MIME: &str = "audio/flac";
 /// How far a chunk boundary may move to land in silence.
 pub const SILENCE_SNAP_WINDOW_SECS: f64 = 30.0;
 /// Retries for a retryable failure, per chunk.
-pub const MAX_ATTEMPTS: u32 = 3;
+///
+/// SIX, not three, and the number is measured rather than chosen. Against the
+/// live API on 2026-08-29, `gemini-3.5-transcribe` shed load heavily on requests
+/// over ~13 minutes of audio, returning
+/// `500 "currently experiencing high demand ... please try again later"`.
+/// Observed: a 22-minute chunk succeeded on attempt 2, a 26-minute chunk on
+/// attempt 3, and two others were still failing past attempt 6. Three attempts
+/// would have failed runs that a fourth or fifth would have carried.
+///
+/// The cost of one more attempt is bounded and the cost of giving up is not:
+/// a failed chunk fails the WHOLE run (deliberately — see `transcribe_with_gemini`),
+/// so a single stubborn chunk throws away every chunk already transcribed and
+/// paid for.
+pub const MAX_ATTEMPTS: u32 = 6;
+
+/// Backoff is capped at 30s and starts at 5s.
+///
+/// The old 1s/2s was calibrated for a burst rate limit. It is close to
+/// meaningless here: a failing request takes 67-175s to come back at all, so the
+/// sleep is a rounding error on the retry interval. What it must not do is
+/// hammer a service that has just said it is overloaded, hence a floor of 5s and
+/// a ceiling that keeps six attempts inside a few minutes of waiting.
+pub const RETRY_BACKOFF_CAP_SECS: u64 = 30;
+
+/// The delay before attempt `attempt + 1`, in seconds. 5, 10, 20, 30, 30...
+pub fn retry_backoff_secs(attempt: u32) -> u64 {
+    (5u64.saturating_mul(1 << attempt.saturating_sub(1).min(8))).min(RETRY_BACKOFF_CAP_SECS)
+}
 
 /// Cancel handles for Gemini runs in flight, keyed by job.
 ///
@@ -155,9 +182,10 @@ async fn interact_with_retries(
                 if !retryable || attempt >= MAX_ATTEMPTS {
                     return Err(e);
                 }
-                // Exponential: 1s, 2s. Short enough not to strand the user,
-                // long enough to clear a burst rate limit.
-                tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
+                tokio::time::sleep(std::time::Duration::from_secs(retry_backoff_secs(
+                    attempt,
+                )))
+                .await;
             }
         }
     }
@@ -257,5 +285,39 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "cancelled");
+    }
+
+    /// Measured, not chosen — see `MAX_ATTEMPTS`. Three attempts would have
+    /// failed runs that the live API served on attempt 4 or 5.
+    #[test]
+    fn the_retry_budget_covers_what_the_live_api_actually_needed() {
+        assert!(
+            MAX_ATTEMPTS >= 5,
+            "a 26-minute chunk needed attempt 3 and others were still failing past 6"
+        );
+    }
+
+    /// The floor matters more than the curve: a failing request already takes
+    /// 67-175s to return, so a 1s sleep is a rounding error, and hammering a
+    /// service that just said "high demand" is the wrong response to it.
+    #[test]
+    fn backoff_starts_at_five_seconds_and_is_capped() {
+        assert_eq!(retry_backoff_secs(1), 5);
+        assert_eq!(retry_backoff_secs(2), 10);
+        assert_eq!(retry_backoff_secs(3), 20);
+        assert_eq!(retry_backoff_secs(4), RETRY_BACKOFF_CAP_SECS);
+        // Never overflows or exceeds the cap, however many attempts are configured.
+        for attempt in 1..=64 {
+            assert!(retry_backoff_secs(attempt) <= RETRY_BACKOFF_CAP_SECS);
+            assert!(retry_backoff_secs(attempt) >= 5);
+        }
+    }
+
+    /// Total sleeping across a full budget stays bounded — the user is already
+    /// waiting on requests that take minutes; the backoff must not add hours.
+    #[test]
+    fn a_full_retry_budget_sleeps_for_under_three_minutes() {
+        let total: u64 = (1..MAX_ATTEMPTS).map(retry_backoff_secs).sum();
+        assert!(total < 180, "total backoff was {total}s");
     }
 }

@@ -304,3 +304,47 @@ describe("the speaker outcome banner", () => {
         );
     });
 });
+
+/**
+ * A cached transcript is a permanent hit on the Rust side, so a transcript a
+ * buggy run persisted could not be replaced from inside the app -- the Gemini
+ * word-gluing bug shipped exactly that. The button is the whole escape hatch,
+ * and a headless check cannot see whether it is actually wired, which is why
+ * this renders the real component and clicks it.
+ */
+describe("Transcript: re-transcribing past a cached transcript", () => {
+    it("calls back when the re-transcribe button is clicked", () => {
+        const onRetranscribe = vi.fn();
+        renderTranscript({
+            transcribedData: transcriptWith([cue(0, 2, "Hello there.")]),
+            onRetranscribe,
+        });
+
+        fireEvent.click(screen.getByTestId("retranscribe"));
+
+        expect(onRetranscribe).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * Omitted rather than defaulted to a no-op, for the same reason
+     * `onRenameSpeaker` is: a caller that has not wired it must get NO button,
+     * not one that silently does nothing.
+     */
+    it("renders no button when no handler is wired", () => {
+        renderTranscript({
+            transcribedData: transcriptWith([cue(0, 2, "Hello there.")]),
+        });
+
+        expect(screen.queryByTestId("retranscribe")).toBeNull();
+    });
+
+    /** Mid-run there is nothing to re-transcribe, and the exports are hidden too. */
+    it("renders no button while a run is still busy", () => {
+        renderTranscript({
+            transcribedData: { ...transcriptWith([]), isBusy: true },
+            onRetranscribe: vi.fn(),
+        });
+
+        expect(screen.queryByTestId("retranscribe")).toBeNull();
+    });
+});

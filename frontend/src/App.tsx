@@ -21,6 +21,7 @@ function App() {
                     speakerOutcome={transcriber.speakerOutcome}
                     speakerNames={transcriber.speakerNames}
                     onRenameSpeaker={transcriber.renameSpeaker}
+                    onRetranscribe={transcriber.retranscribe}
                 />
             </div>
         </div>

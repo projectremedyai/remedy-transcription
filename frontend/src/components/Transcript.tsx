@@ -29,6 +29,17 @@ interface Props {
         speakerKey: string,
         displayName: string,
     ) => Promise<void> | void;
+    /**
+     * Run this source again with the transcript cache skipped.
+     *
+     * A cached row is a PERMANENT hit on the Rust side, so without this a
+     * transcript a buggy run persisted could never be replaced from inside the
+     * app -- which is what shipped when Gemini stored every word glued to the
+     * last one. Omitted rather than defaulted to a no-op, for the same reason
+     * `onRenameSpeaker` is: a caller that has not wired it gets NO button rather
+     * than one that silently does nothing.
+     */
+    onRetranscribe?: () => void;
 }
 
 /**
@@ -171,6 +182,7 @@ export default function Transcript({
     speakerOutcome,
     speakerNames,
     onRenameSpeaker,
+    onRetranscribe,
 }: Props) {
     const divRef = useRef<HTMLDivElement>(null);
     const names = speakerNames ?? {};
@@ -266,6 +278,16 @@ export default function Transcript({
                     >
                         Export JSON
                     </button>
+                    {onRetranscribe && (
+                        <button
+                            data-testid='retranscribe'
+                            onClick={onRetranscribe}
+                            title='Transcribe this file again instead of reusing the stored transcript. Paid engines will charge for the new run.'
+                            className='text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 focus:ring-4 focus:ring-slate-200 font-medium rounded-lg text-sm px-4 py-2 text-center inline-flex items-center'
+                        >
+                            Re-transcribe
+                        </button>
+                    )}
                 </div>
             )}
         </div>

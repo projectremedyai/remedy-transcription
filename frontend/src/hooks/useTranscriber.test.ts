@@ -228,6 +228,86 @@ describe("useTranscriber's wait for prepared audio", () => {
      * This test therefore emits NO event at all — it can only pass because of
      * the poll.
      */
+    /**
+     * A cached transcript is a PERMANENT hit on the Rust side: `find_transcript`
+     * serves the stored row forever and no engine runs. Until `force` existed
+     * there was no way to ask for a fresh run from inside the app, so a
+     * transcript written by a buggy engine could never be replaced -- which is
+     * exactly what happened when Gemini persisted whole transcripts with every
+     * word glued to the last one.
+     *
+     * `retranscribe` replays the last source with `force`, and `force` is the
+     * whole mechanism: Rust skips the cache lookup, and `persist_transcript`
+     * upserts over the stale row when the fresh run lands.
+     */
+    it("replays the last file with force when asked to re-transcribe", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "ready", progress: 1 }),
+        );
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        // The ordinary run must NOT force, or every reopen pays Gemini again.
+        expect(mocks.createFileJob).toHaveBeenCalledTimes(1);
+        expect(mocks.createFileJob.mock.calls[0][0].force).toBeFalsy();
+
+        await act(async () => {
+            result.current.retranscribe();
+        });
+        await settle();
+
+        expect(mocks.createFileJob).toHaveBeenCalledTimes(2);
+        const second = mocks.createFileJob.mock.calls[1][0];
+        expect(second.force).toBe(true);
+        // Same source, not a re-pick: the user pressed a button on a transcript
+        // that is already on screen.
+        expect(second.path).toBe("/tmp/lecture.mp3");
+    });
+
+    /** The YouTube entry point has the same cache and needs the same way out. */
+    it("replays the last YouTube url with force when asked to re-transcribe", async () => {
+        mocks.createYouTubeJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "ready", progress: 1 }),
+        );
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.startFromYouTube("https://youtu.be/abcdefghijk");
+        });
+        await settle();
+
+        await act(async () => {
+            result.current.retranscribe();
+        });
+        await settle();
+
+        expect(mocks.createYouTubeJob).toHaveBeenCalledTimes(2);
+        const second = mocks.createYouTubeJob.mock.calls[1][0];
+        expect(second.force).toBe(true);
+        expect(second.url).toBe("https://youtu.be/abcdefghijk");
+    });
+
+    /**
+     * Nothing has run yet, so there is no source to replay. It must be a no-op
+     * rather than a run against `undefined` -- the button is rendered from
+     * transcript state, and a stale render could still fire it.
+     */
+    it("does nothing when asked to re-transcribe before any run", async () => {
+        const { result } = await renderTranscriber();
+
+        await act(async () => {
+            result.current.retranscribe();
+        });
+        await settle();
+
+        expect(mocks.createFileJob).not.toHaveBeenCalled();
+        expect(mocks.createYouTubeJob).not.toHaveBeenCalled();
+    });
+
     it("resolves from the poll when the ready event never arrives", async () => {
         mocks.createFileJob.mockResolvedValue(
             makeJob({ id: "job-1", status: "extracting", progress: 0.1 }),

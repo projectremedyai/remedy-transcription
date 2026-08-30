@@ -1340,9 +1340,19 @@ pub async fn export_transcript(request: ExportRequest) -> Result<(), String> {
     std::fs::write(&request.destination, request.content.as_bytes()).map_err(|e| e.to_string())
 }
 
+/// Validate against Google BEFORE writing to the keychain.
+///
+/// Storing first and discovering the key is bad at transcribe time means the
+/// user finds out twenty minutes and one upload later. One `GET /v1beta/models`
+/// is cheaper than that by every measure.
 #[tauri::command]
-pub fn set_gemini_key(key: String) -> Result<(), String> {
-    crate::gemini::credentials::save(&key).map_err(|e| e.to_string())
+pub async fn set_gemini_key(key: String) -> Result<(), String> {
+    let validated = crate::gemini::credentials::validate(&key).map_err(|e| e.to_string())?;
+    crate::gemini::client::GeminiClient::new(validated.clone())
+        .validate_key()
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::gemini::credentials::save(&validated).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

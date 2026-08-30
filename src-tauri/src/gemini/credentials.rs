@@ -76,9 +76,11 @@ pub fn is_configured() -> bool {
     }
 }
 
-// Not called yet: the Gemini API client (a later task) reads the key through
-// this to authenticate requests. Allowed dead here rather than adding a
-// premature caller, so `cargo check` stays warning-clean at this checkpoint.
+// Still not called: Task 9's remote key validation goes through `validate`
+// and `save`, not `load` -- `load` is for reading the key back at transcribe
+// time, which is `transcribe_with_gemini` in Task 11. Allowed dead here for
+// one more task rather than adding a premature caller; Task 11 must remove
+// this attribute.
 #[allow(dead_code)]
 pub(crate) fn load() -> anyhow::Result<String> {
     entry()?

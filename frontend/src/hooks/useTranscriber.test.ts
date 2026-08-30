@@ -1366,4 +1366,59 @@ describe("useTranscriber's Gemini path under cancellation", () => {
         expect(result.current.output?.text).toBe(LOCAL_TEXT);
         expect(result.current.status).toBe("completed");
     });
+
+    /**
+     * THE SUPERSEDE MONEY LEAK — the same abandonment as `cancel()`, reached by
+     * the other door, and the one that was never told to stop.
+     *
+     * `cancel()` calls `claimRun()` and THEN `engines[...].abandon(jobId)`.
+     * `claimRun()` on its own — which is all either `start*` entry point calls —
+     * did the first half only. So a second run started over a live Gemini run
+     * bumped the token, and the test above this one proves the late result is
+     * correctly dropped: nothing paints, nothing persists, the cache stays
+     * honest. The UI is entirely correct.
+     *
+     * The MONEY is not. Google is still transcribing run 1, still billing every
+     * minute of it, and the user's audio is still sitting in Google's storage
+     * until the 48-hour expiry — for a transcript the app has already promised
+     * itself it will throw away. A 26-minute file is ~$1.80 of that.
+     *
+     * The user does not need to touch Cancel to reach this. Dropping a second
+     * file on the window is enough, and that is the ordinary way to change your
+     * mind about which file you meant.
+     */
+    it("tells Rust to abort a Gemini run that a second run supersedes", async () => {
+        twoReadyFiles();
+        slowGemini(5000);
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.setEngine("gemini");
+        });
+        await settle();
+        await act(async () => {
+            result.current.start("/tmp/talk.mp4");
+        });
+        await settle();
+
+        // Run 1 is genuinely in flight in the cloud, not merely queued.
+        expect(mocks.transcribeWithGemini).toHaveBeenCalledWith("job-1");
+        expect(result.current.isBusy).toBe(true);
+        expect(result.current.jobId).toBe("job-1");
+
+        // Run 2 takes the UI. No cancel anywhere in this test.
+        await act(async () => {
+            result.current.setEngine("local");
+        });
+        await settle();
+        await act(async () => {
+            result.current.start("/tmp/interview.mp3");
+        });
+        await settle();
+        expect(result.current.jobId).toBe("job-2");
+
+        // The whole point: the superseded cloud run was told to stop, under the
+        // engine that was RUNNING it, not the one the selector now shows.
+        expect(mocks.cancelGeminiTranscription).toHaveBeenCalledWith("job-1");
+    });
 });

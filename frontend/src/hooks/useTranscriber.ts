@@ -560,68 +560,6 @@ export function useTranscriber(): Transcriber {
         pendingWaitRef.current = null;
     }, []);
 
-    /**
-     * Claim the UI for a new run, killing whatever run held it — its wait, its
-     * worker, and its promise.
-     *
-     * Synchronous by contract — every caller must invoke it before its first
-     * `await`. Calling it "first, before any early return" inside
-     * `transcribePreparedJob` is NOT early enough: that runs only after
-     * `beginRun()` and `api.create*Job()` have both resolved, and `create_file_job`
-     * sha256s the whole file while `create_youtube_job` shells out to yt-dlp.
-     * Through that window the previous run's poll and listener would still be live.
-     *
-     * `worker.restart()` is the half that actually STOPS the abandoned run.
-     * Ignoring its messages is not stopping it: transformers.js has no abort, so
-     * without a terminate it keeps decoding — every core pinned for however many
-     * minutes of audio are left, its `Float32Array` held — and a second
-     * `postMessage` would merely start a concurrent handler sharing the same
-     * pipeline instance (whose `dispose()` on a preset change would then throw
-     * under the run still using it). Only the terminate ends it. It is done only
-     * when a transcription is actually in flight, so the ordinary
-     * one-file-then-the-next case keeps its warm, already-loaded model.
-     *
-     * Rejecting the abandoned promise is what frees its `AudioBuffer` and mono
-     * `Float32Array`: `transcribePreparedJob` is parked on that promise, and a
-     * promise that never settles strands the whole frame. The rejection is safe
-     * BECAUSE the token has already been bumped — the dead run's `catch` in
-     * `startFromFile`/`startFromYouTube` sees it no longer owns the UI and returns
-     * without calling `failRun`, so no error is shown for a run the user
-     * abandoned.
-     *
-     * THE INVARIANT THAT MAKES THE ORDERING WORK, since it is load-bearing and was
-     * unwritten: this function is entirely SYNCHRONOUS. `cancelPendingWait()`
-     * rejects before the bump lexically, and `worker.restart()`'s rejection also
-     * runs before the `return` — but a rejection does not run its `catch` inline,
-     * it QUEUES a microtask, and no microtask can run until this function (and the
-     * event handler that called it) returns. So every abandoned continuation
-     * observes the bumped token, whatever order the rejections appear in here. The
-     * same invariant, read the other way, is why the token cannot move across an
-     * `await` whose promise is resolved synchronously from a message handler —
-     * which is what makes the pre-persist guard in `transcribePreparedJob` dead
-     * and the post-persist one live. Introduce an `await` into this function and
-     * both facts stop holding.
-     */
-    const claimRun = useCallback(() => {
-        cancelPendingWait();
-        // Bump BEFORE rejecting: the rejection runs the dead run's `catch`, and
-        // that `catch` decides whether to show an error by comparing this token.
-        runIdRef.current += 1;
-
-        const abandoned = pendingWorkerRef.current;
-        if (abandoned) {
-            pendingWorkerRef.current = null;
-            worker.restart();
-            setIsModelLoading(false);
-            setProgressItems([]);
-            abandoned.reject(
-                new Error("Transcription was cancelled or superseded"),
-            );
-        }
-
-        return runIdRef.current;
-    }, [cancelPendingWait, worker]);
-
     const waitForReady = useCallback(
         (job: Job) => {
             cancelPendingWait();
@@ -846,11 +784,104 @@ export function useTranscriber(): Transcriber {
      * the same value `beginRun` will resolve into `config.engine` — both read
      * `engine` from the same render's closure — so this cannot disagree with
      * the engine `transcribePreparedJob` actually dispatched to. Deliberately
-     * NOT set inside `claimRun` itself: `cancel()` calls `claimRun` before it
-     * reads this, so setting it there would put the selector's engine back in
-     * the very place the bug was.
+     * NOT set inside `claimRun` itself, which is now the sole READER of it:
+     * `claimRun` abandons the outgoing run's engine, and both `start*` entry
+     * points restamp this ref on the line after they call it. Stamping it inside
+     * `claimRun` would hand that abandon the incoming selector's engine — which
+     * is exactly the place the bug was.
      */
     const runEngineRef = useRef<EngineId>(engine);
+
+    /**
+     * Claim the UI for a new run, killing whatever run held it — its wait, its
+     * worker, its promise, and its cloud run.
+     *
+     * Synchronous by contract — every caller must invoke it before its first
+     * `await`. Calling it "first, before any early return" inside
+     * `transcribePreparedJob` is NOT early enough: that runs only after
+     * `beginRun()` and `api.create*Job()` have both resolved, and `create_file_job`
+     * sha256s the whole file while `create_youtube_job` shells out to yt-dlp.
+     * Through that window the previous run's poll and listener would still be live.
+     *
+     * `worker.restart()` is the half that actually STOPS the abandoned run.
+     * Ignoring its messages is not stopping it: transformers.js has no abort, so
+     * without a terminate it keeps decoding — every core pinned for however many
+     * minutes of audio are left, its `Float32Array` held — and a second
+     * `postMessage` would merely start a concurrent handler sharing the same
+     * pipeline instance (whose `dispose()` on a preset change would then throw
+     * under the run still using it). Only the terminate ends it. It is done only
+     * when a transcription is actually in flight, so the ordinary
+     * one-file-then-the-next case keeps its warm, already-loaded model.
+     *
+     * Rejecting the abandoned promise is what frees its `AudioBuffer` and mono
+     * `Float32Array`: `transcribePreparedJob` is parked on that promise, and a
+     * promise that never settles strands the whole frame. The rejection is safe
+     * BECAUSE the token has already been bumped — the dead run's `catch` in
+     * `startFromFile`/`startFromYouTube` sees it no longer owns the UI and returns
+     * without calling `failRun`, so no error is shown for a run the user
+     * abandoned.
+     *
+     * THE INVARIANT THAT MAKES THE ORDERING WORK, since it is load-bearing and was
+     * unwritten: this function is entirely SYNCHRONOUS. `cancelPendingWait()`
+     * rejects before the bump lexically, and `worker.restart()`'s rejection also
+     * runs before the `return` — but a rejection does not run its `catch` inline,
+     * it QUEUES a microtask, and no microtask can run until this function (and the
+     * event handler that called it) returns. So every abandoned continuation
+     * observes the bumped token, whatever order the rejections appear in here. The
+     * same invariant, read the other way, is why the token cannot move across an
+     * `await` whose promise is resolved synchronously from a message handler —
+     * which is what makes the pre-persist guard in `transcribePreparedJob` dead
+     * and the post-persist one live. Introduce an `await` into this function and
+     * both facts stop holding.
+     */
+    const claimRun = useCallback(() => {
+        cancelPendingWait();
+        // Bump BEFORE rejecting: the rejection runs the dead run's `catch`, and
+        // that `catch` decides whether to show an error by comparing this token.
+        runIdRef.current += 1;
+
+        const abandoned = pendingWorkerRef.current;
+        if (abandoned) {
+            pendingWorkerRef.current = null;
+            worker.restart();
+            setIsModelLoading(false);
+            setProgressItems([]);
+            abandoned.reject(
+                new Error("Transcription was cancelled or superseded"),
+            );
+        }
+
+        // The cloud half of the same stop. `worker.restart()` above is the only
+        // thing that ends a transformers.js inference, and it does nothing
+        // whatever to a Gemini run, which lives in Rust and in Google's
+        // datacentre.
+        //
+        // This belongs HERE and not in `cancel()`, because `cancel()` is not the
+        // only door. Dropping a second file on the window supersedes a live run
+        // with no cancel anywhere in the path, and that path used to bump the
+        // token and walk away: the UI correctly discarded the late result (the
+        // supersede tests prove it) while Google kept transcribing, kept
+        // BILLING, and kept the user's audio until the 48-hour expiry. Every
+        // abandonment funnels through this function, so this is the one place
+        // the two halves cannot drift apart again.
+        //
+        // `runEngineRef`, NOT `engine` — the run being abandoned is the one that
+        // was RUNNING, which is not necessarily the one the selector points at;
+        // see the ref's own comment. Both `start*` entry points restamp that ref
+        // immediately AFTER calling this, so the value read here is still the
+        // outgoing run's.
+        //
+        // Fire-and-forget, so the SYNCHRONOUS invariant above still holds. Cheap
+        // in the cases that are not the bug: the local engine's `abandon` is a
+        // no-op by design, and `cancel_gemini_transcription` answers `false` for
+        // a job that is not running — which is all a completed previous run
+        // leaves behind here.
+        if (jobId) {
+            engines[runEngineRef.current].abandon(jobId);
+        }
+
+        return runIdRef.current;
+    }, [cancelPendingWait, engines, jobId, worker]);
 
     /**
      * Write the transcript, then — and ONLY then — decide whether this run is
@@ -1266,17 +1297,15 @@ export function useTranscriber(): Transcriber {
      * is not. That is tolerable ONLY because an abandoned ffmpeg finishes on its
      * own, in seconds to a minute.
      *
-     * The Gemini engine is NOT like that ffmpeg case, which is why it is the one
-     * thing this DOES tell to stop: `engines[runEngineRef.current].abandon(jobId)`
-     * reaches Rust
-     * and asks it to abort the request in flight, because an abandoned cloud run
-     * keeps costing money for every minute Google spends still transcribing it,
-     * and leaves the user's audio sitting in Google's storage until it does.
-     * `abandon` is fire-and-forget and best-effort (see `geminiEngine.ts`): a
-     * cancel that cannot reach the backend must still clear the UI. The LOCAL
-     * engine's `abandon` is a no-op, correctly — `claimRun`'s `worker.restart()`
-     * above already IS the stop for a transformers.js inference, so there is
-     * nothing further for it to tell.
+     * The Gemini engine is NOT like that ffmpeg case, and it IS told to stop —
+     * but by `claimRun`, not here. An abandoned cloud run keeps costing money for
+     * every minute Google spends still transcribing it and leaves the user's
+     * audio in Google's storage until it does, and cancel is only one of the ways
+     * a run gets abandoned; a second file dropped on the window is another. So
+     * the `abandon` call sits at the choke point both doors pass through. See it
+     * there for why. It is fire-and-forget and best-effort (see
+     * `geminiEngine.ts`): a cancel that cannot reach the backend must still clear
+     * the UI.
      *
      * Nor does it stop a `persistTranscript` already in flight — and cancelling
      * inside that window is exactly how the last bug was reached, because the app
@@ -1287,12 +1316,6 @@ export function useTranscriber(): Transcriber {
      */
     const cancel = useCallback(() => {
         claimRun();
-        if (jobId) {
-            // `runEngineRef`, NOT `engine` — the run being abandoned is the one
-            // that is running, which is not necessarily the one the selector is
-            // pointing at. See the ref's own comment.
-            engines[runEngineRef.current].abandon(jobId);
-        }
         setTranscript((previous) =>
             previous ? { ...previous, isBusy: false } : previous,
         );
@@ -1302,7 +1325,7 @@ export function useTranscriber(): Transcriber {
         setProgress(0);
         setStatus("idle");
         setError(null);
-    }, [claimRun, engines, jobId]);
+    }, [claimRun]);
 
     const onInputChange = useCallback(() => {
         setTranscript(undefined);

@@ -55,6 +55,23 @@ pub fn classify_status(status: u16, retry_after: Option<u64>) -> Option<GeminiEr
     }
 }
 
+/// Google's own explanation, dug out of an error body.
+///
+/// Their errors are `{"error":{"message":"...","code":"..."}}`. Handing the raw
+/// JSON to a user is barely better than hiding it, and the body is not always
+/// JSON at all (a proxy or an LB can return HTML), so this returns `None` rather
+/// than guessing and the caller falls back to our own wording.
+pub fn google_error_message(body: &str) -> Option<String> {
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .get("message")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!message.is_empty()).then_some(message)
+}
+
 #[derive(Debug, Clone)]
 pub struct UploadedFile {
     pub uri: String,
@@ -104,21 +121,27 @@ impl GeminiClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
 
-        match classify_status(response.status().as_u16(), retry_after) {
-            None => Ok(response),
-            Some(GeminiError::Rejected { status, .. }) => {
-                let body = response.text().await.unwrap_or_default();
-                Err(GeminiError::Rejected { status, body }.into())
-            }
-            Some(GeminiError::RateLimited { retry_after_secs }) => {
-                // Surface Google's own wording alongside ours: "quota exceeded"
-                // and "too many requests" need different actions from the user.
-                let body = response.text().await.unwrap_or_default();
-                Err(anyhow::Error::new(GeminiError::RateLimited { retry_after_secs })
-                    .context(body))
-            }
-            Some(e) => Err(e.into()),
-        }
+        let Some(kind) = classify_status(response.status().as_u16(), retry_after) else {
+            return Ok(response);
+        };
+
+        // EVERY failure path reads the body, because Google's own sentence is
+        // routinely the actionable half and ours is not. Observed live on
+        // 2026-08-29 against the real API: a 500 carries
+        //   "gemini-3.5-transcribe is currently experiencing high demand, spikes
+        //    in demand are usually temporary. Please try again later."
+        // which tells the user to wait and retry. Our own text for that arm is
+        // "Gemini returned a server error (500)", which tells them nothing and
+        // reads like a bug in this app. This used to discard the body for the
+        // ServerError and InvalidKey arms; it no longer does.
+        let body = response.text().await.unwrap_or_default();
+        Err(match kind {
+            GeminiError::Rejected { status, .. } => GeminiError::Rejected { status, body }.into(),
+            other => match google_error_message(&body) {
+                Some(message) => anyhow::Error::new(other).context(message),
+                None => anyhow::Error::new(other),
+            },
+        })
     }
 
     /// The Files API's two-step resumable upload.
@@ -382,5 +405,49 @@ mod tests {
         let client = GeminiClient::with_base_url("KEY".into(), server.base_url());
         client.validate_key().await.unwrap();
         mock.assert();
+    }
+
+    /// The real body Google returned on 2026-08-29 when `gemini-3.5-transcribe`
+    /// shed load. This is the message a user must actually see: it tells them to
+    /// wait, which "Gemini returned a server error (500)" does not.
+    #[test]
+    fn googles_own_sentence_is_dug_out_of_a_real_500_body() {
+        let body = r#"{"error":{"message":"gemini-3.5-transcribe is currently experiencing high demand, spikes in demand are usually temporary. Please try again later.","code":"api_error"}}"#;
+        let message = google_error_message(body).expect("a real 500 body has a message");
+        assert!(message.starts_with("gemini-3.5-transcribe is currently experiencing high demand"));
+        assert!(message.ends_with("Please try again later."));
+    }
+
+    /// A proxy or load balancer can return HTML, and an empty message is no
+    /// message. Both fall back to our own wording rather than showing the user
+    /// raw markup or a blank line.
+    #[test]
+    fn a_body_that_is_not_a_google_error_yields_nothing() {
+        assert!(google_error_message("<html>502 Bad Gateway</html>").is_none());
+        assert!(google_error_message("").is_none());
+        assert!(google_error_message(r#"{"error":{"code":"x"}}"#).is_none());
+        assert!(google_error_message(r#"{"error":{"message":"   "}}"#).is_none());
+    }
+
+    /// The regression this whole change exists for: the ServerError arm used to
+    /// hit `Some(e) => Err(e.into())` and drop the body on the floor.
+    #[tokio::test]
+    async fn a_server_error_surfaces_googles_message_not_just_the_status() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1beta/interactions");
+            then.status(500).body(
+                r#"{"error":{"message":"gemini-3.5-transcribe is currently experiencing high demand, spikes in demand are usually temporary. Please try again later.","code":"api_error"}}"#,
+            );
+        });
+
+        let client = GeminiClient::with_base_url("KEY".into(), server.base_url());
+        let err = client.interact(serde_json::json!({})).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("experiencing high demand"), "got: {rendered}");
+        // Our own classification survives alongside it, so the retry logic still works.
+        assert!(err
+            .downcast_ref::<GeminiError>()
+            .is_some_and(|e| e.is_retryable()));
     }
 }

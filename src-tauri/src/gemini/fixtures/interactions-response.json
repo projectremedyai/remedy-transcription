@@ -1,0 +1,113 @@
+{
+  "id": "v1_ChdtYldUYXEyQkE4S3lxdHNQMDdHR2lBWRIXbWJXVGFxMkJBOEt5cXRzUDA3R0dpQVk",
+  "status": "completed",
+  "usage": {
+    "total_tokens": 2632,
+    "total_input_tokens": 2632,
+    "input_tokens_by_modality": [
+      {
+        "modality": "text",
+        "tokens": 1
+      },
+      {
+        "modality": "audio",
+        "tokens": 2631
+      }
+    ],
+    "total_cached_tokens": 0,
+    "total_output_tokens": 0,
+    "total_tool_use_tokens": 0,
+    "total_thought_tokens": 0,
+    "raw_prompt_token": 3103
+  },
+  "created": "2026-08-30T04:46:17Z",
+  "updated": "2026-08-30T04:46:17Z",
+  "service_tier": "standard",
+  "steps": [
+    {
+      "content": [
+        {
+          "text": "Mary?Hi.Hello. I'm Susan Thompson, resource manager here.Hi, I'm Mary Hansen, and I'm applying for one of your kitchen jobs.Great.Here's a copy of my resume.Great. Have a seat, Mary.Thank you.Mary, do\u2026",
+          "annotations": [
+            {
+              "start_index": 0,
+              "end_index": 5,
+              "text": "Mary?",
+              "start_offset": "3.300s",
+              "end_offset": "3.800s",
+              "speaker": "spk:0",
+              "type": "word_info"
+            },
+            {
+              "start_index": 5,
+              "end_index": 8,
+              "text": "Hi.",
+              "start_offset": "5.500s",
+              "end_offset": "6s",
+              "speaker": "spk:1",
+              "type": "word_info"
+            },
+            {
+              "start_index": 8,
+              "end_index": 14,
+              "text": "Hello.",
+              "start_offset": "6.100s",
+              "end_offset": "6.800s",
+              "speaker": "spk:0",
+              "type": "word_info"
+            },
+            {
+              "start_index": 15,
+              "end_index": 18,
+              "text": "I'm",
+              "start_offset": "6.800s",
+              "end_offset": "7.100s",
+              "speaker": "spk:0",
+              "type": "word_info"
+            },
+            {
+              "start_index": 19,
+              "end_index": 24,
+              "text": "Susan",
+              "start_offset": "7.100s",
+              "end_offset": "7.400s",
+              "speaker": "spk:0",
+              "type": "word_info"
+            },
+            {
+              "start_index": 25,
+              "end_index": 34,
+              "text": "Thompson,",
+              "start_offset": "7.400s",
+              "end_offset": "7.800s",
+              "speaker": "spk:0",
+              "type": "word_info"
+            },
+            {
+              "start_index": 35,
+              "end_index": 43,
+              "text": "resource",
+              "start_offset": "7.800s",
+              "end_offset": "8.400s",
+              "speaker": "spk:0",
+              "type": "word_info"
+            },
+            {
+              "start_index": 44,
+              "end_index": 51,
+              "text": "manager",
+              "start_offset": "8.400s",
+              "end_offset": "8.700s",
+              "speaker": "spk:0",
+              "type": "word_info"
+            }
+          ],
+          "type": "text"
+        }
+      ],
+      "type": "model_output"
+    }
+  ],
+  "object": "interaction",
+  "model": "gemini-3.5-transcribe"
+}

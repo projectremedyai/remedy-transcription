@@ -436,4 +436,90 @@ mod tests {
         ];
         assert_eq!(full_text(&words), "Hello there");
     }
+
+    /// The REAL Gemini response, captured 29 Aug 2026 from a live
+    /// `gemini-3.5-transcribe` call on a two-speaker interview.
+    ///
+    /// This is the test the whole structural-search design was waiting on. Two
+    /// things it pins that the published docs got wrong:
+    ///
+    ///   1. The annotations live at `steps[].content[].annotations[]` — three
+    ///      levels deep. A hard-coded path would have had to guess that, and a
+    ///      wrong guess fails SILENTLY by finding zero words.
+    ///   2. The speaker ids are `spk:0`, `spk:1` — COLON-separated and
+    ///      ZERO-based. The docs say `spk_1`: underscore, one-based. Treating
+    ///      the id as opaque and densifying by first appearance is what makes
+    ///      that difference a non-event; a parser that read the integer out of
+    ///      `spk_N` would be broken against the real API right now.
+    #[test]
+    fn the_real_captured_response_parses_into_words_and_turns() {
+        let raw = include_str!("fixtures/interactions-response.json");
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+
+        let words = words_from_response(&value).expect("captured response must parse");
+        assert!(!words.is_empty(), "found no words in a real response");
+        assert!(words.iter().all(|w| w.end >= w.start), "a word ended before it started");
+        assert!(words.iter().all(|w| !w.text.is_empty()), "a word came back with no text");
+
+        // Time-ordered, which is what the sort in `words_from_response` guarantees
+        // regardless of how the envelope nests.
+        assert!(words.windows(2).all(|p| p[0].start <= p[1].start));
+
+        let (turns, count) = turns_from_words(&words);
+        assert_eq!(count, 2, "the sample is a two-speaker interview");
+        assert!(!turns.is_empty());
+        // Densified to 0..n-1 despite the ids being `spk:0`/`spk:1`.
+        assert!(turns.iter().all(|t| t.speaker < count));
+
+        assert!(full_text(&words).contains("Mary"));
+    }
+
+    /// A REAL response from a multi-chunk run, captured 29 Aug 2026 — the same
+    /// live call shape `build_request(.., diarize = false)` emits for any audio
+    /// over 28 minutes.
+    ///
+    /// It pins the half of the contract the diarized fixture cannot: when
+    /// `diarization_mode` is omitted, the annotations carry **no `speaker` key at
+    /// all**. So `turns_from_words` yields nothing, which is exactly what makes
+    /// `transcribe_with_gemini` report `Speakers::Unavailable` for a chunked run
+    /// rather than inventing a single speaker spanning the file.
+    #[test]
+    fn a_real_undiarized_response_yields_words_but_no_turns() {
+        let raw = include_str!("fixtures/interactions-response-nodiarize.json");
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+
+        let words = words_from_response(&value).expect("must parse");
+        assert!(!words.is_empty());
+        assert!(words.iter().all(|w| w.speaker.is_none()), "no diarization was requested");
+
+        let (turns, count) = turns_from_words(&words);
+        assert!(turns.is_empty(), "no speakers means no turns");
+        assert_eq!(count, 0);
+    }
+
+    /// Stitching two REAL chunks. Chunk offsets come back relative to the chunk,
+    /// so chunk 1's words must be pushed out by chunk 0's length before the two
+    /// are concatenated — otherwise the transcript restarts at zero halfway
+    /// through. Both inputs here are live captures, not hand-written JSON.
+    #[test]
+    fn real_chunks_stitch_into_one_monotonic_timeline() {
+        let parse = |raw: &str| {
+            words_from_response(&serde_json::from_str::<serde_json::Value>(raw).unwrap()).unwrap()
+        };
+        let mut first = parse(include_str!("fixtures/interactions-response.json"));
+        let mut second = parse(include_str!("fixtures/interactions-response-nodiarize.json"));
+
+        // Both really do start near zero — that is why the shift is needed.
+        assert!(first[0].start < 60.0 && second[0].start < 60.0);
+
+        const CHUNK_0_LEN: f64 = 792.67;
+        shift(&mut second, CHUNK_0_LEN);
+        assert!(second.iter().all(|w| w.start >= CHUNK_0_LEN));
+
+        first.extend(second);
+        assert!(
+            first.windows(2).all(|p| p[0].start <= p[1].start),
+            "the stitched timeline went backwards at the seam"
+        );
+    }
 }

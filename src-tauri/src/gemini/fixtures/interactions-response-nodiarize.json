@@ -1,0 +1,64 @@
+{
+  "steps": [
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "\u2026",
+          "annotations": [
+            {
+              "start_index": 0,
+              "end_index": 3,
+              "text": "Hey",
+              "start_offset": "5.300s",
+              "end_offset": "5.500s",
+              "type": "word_info"
+            },
+            {
+              "start_index": 4,
+              "end_index": 13,
+              "text": "everyone,",
+              "start_offset": "5.500s",
+              "end_offset": "6s",
+              "type": "word_info"
+            },
+            {
+              "start_index": 14,
+              "end_index": 17,
+              "text": "and",
+              "start_offset": "6s",
+              "end_offset": "6.100s",
+              "type": "word_info"
+            },
+            {
+              "start_index": 18,
+              "end_index": 25,
+              "text": "welcome",
+              "start_offset": "6.100s",
+              "end_offset": "6.500s",
+              "type": "word_info"
+            },
+            {
+              "start_index": 26,
+              "end_index": 30,
+              "text": "back",
+              "start_offset": "6.500s",
+              "end_offset": "6.800s",
+              "type": "word_info"
+            },
+            {
+              "start_index": 31,
+              "end_index": 33,
+              "text": "to",
+              "start_offset": "6.800s",
+              "end_offset": "6.800s",
+              "type": "word_info"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "status": "completed",
+  "model": "gemini-3.5-transcribe"
+}

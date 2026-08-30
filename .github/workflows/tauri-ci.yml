@@ -14,10 +14,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      # 22, not 20: Vite 8 requires `^20.19.0 || >=22.12.0`. Bare `20` would
+      # resolve to a new enough 20.x today, but nothing pins it there.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: |
             package-lock.json
@@ -53,30 +55,28 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
   # The README has always claimed "Windows 10+". Until this job existed, that
-  # claim was never checked by CI or run on a real Windows machine -- adding a
-  # native ONNX Runtime dependency (Task 7-8) without a Windows runner would
-  # have made the claim actively unverifiable rather than merely unverified.
+  # claim was never checked by CI nor run on a real Windows machine.
   #
-  # STATUS AS OF THIS COMMIT: written and believed correct, NOT proven. It has
-  # not yet completed a run on a real Windows runner (no Windows machine was
-  # available to the author). `continue-on-error: true` keeps a first red run
-  # from blocking the pipeline while that is still true, but the job stays
-  # VISIBLE in the Actions tab either way -- remove continue-on-error once it
-  # has gone green at least once, so a later regression is not silently masked.
+  # It carried `continue-on-error: true` for as long as it had never completed a
+  # run on a real Windows runner, so that a first red could not block the
+  # pipeline on a job nobody had been able to try. It went green on run
+  # 33296608968, and the flag came off with this commit: from here it would be
+  # hiding a regression rather than protecting an unproven job.
   windows-build-checks:
     name: Build checks (Windows)
     runs-on: windows-latest
     timeout-minutes: 60
-    continue-on-error: true
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      # 22, not 20: Vite 8 requires `^20.19.0 || >=22.12.0`. Bare `20` would
+      # resolve to a new enough 20.x today, but nothing pins it there.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: |
             package-lock.json
@@ -125,6 +125,94 @@ jobs:
           $binDir = Split-Path $ffmpegExe.FullName
           Copy-Item "$binDir\ffmpeg.exe" "src-tauri\binaries\ffmpeg-x86_64-pc-windows-msvc.exe"
           Copy-Item "$binDir\ffprobe.exe" "src-tauri\binaries\ffprobe-x86_64-pc-windows-msvc.exe"
+
+      - name: Check Rust
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # Cargo.toml selects a keyring backend per platform, and the Linux arm --
+  # `sync-secret-service` -- was the one no machine anywhere ever compiled: CI
+  # ran macOS and Windows, and `build-release.sh` ships macOS arm64 only. So the
+  # Linux `#[cfg]` arm could stop compiling and nothing would say so, while
+  # Cargo.toml went on claiming the platform. This job exists to make that claim
+  # falsifiable.
+  #
+  # Deliberately NOT a third copy of the frontend checks: lint and the 204
+  # frontend tests are platform-independent and already run on macOS. The
+  # frontend is BUILT here only because `tauri-build` embeds `frontendDist`, so
+  # `cargo check` needs it to exist. What this job is actually for is the Rust
+  # compile and the Rust tests.
+  linux-build-checks:
+    name: Build checks (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # 22, not 20: Vite 8 requires `^20.19.0 || >=22.12.0`. Bare `20` would
+      # resolve to a new enough 20.x today, but nothing pins it there.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # webkit2gtk/gtk/appindicator are Tauri v2's own Linux prerequisites.
+      # libdbus-1-dev is the one this job is really here for: without it
+      # keyring's `sync-secret-service` backend does not build, which is the
+      # exact gap the job closes.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libdbus-1-dev \
+            build-essential \
+            pkg-config \
+            patchelf \
+            file
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Build frontend
+        run: npm run frontend:build
+
+      - name: Fetch Tauri sidecars (yt-dlp)
+        run: ./scripts/fetch-sidecars.sh
+
+      # As on Windows, fetch-sidecars.sh does not fetch ffmpeg/ffprobe for this
+      # triple -- and they are not optional here: tauri-build checks that EVERY
+      # declared `externalBin` exists for the target triple, so a missing one
+      # fails `cargo check` itself, before a single test runs. apt's ffmpeg is
+      # used rather than a static download because it is the reproducible
+      # option on the runner; nothing in this job executes it.
+      - name: Fetch ffmpeg/ffprobe for Linux
+        run: |
+          sudo apt-get install -y ffmpeg
+          cp "$(command -v ffmpeg)" src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+          cp "$(command -v ffprobe)" src-tauri/binaries/ffprobe-x86_64-unknown-linux-gnu
+          chmod 755 src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+          chmod 755 src-tauri/binaries/ffprobe-x86_64-unknown-linux-gnu
 
       - name: Check Rust
         run: cargo check --manifest-path src-tauri/Cargo.toml

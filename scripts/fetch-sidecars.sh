@@ -62,6 +62,11 @@ case "$TRIPLE" in
         ffmpeg_url=""   # see note below
         ffprobe_url=""
         ;;
+    x86_64-unknown-linux-gnu)
+        ytdlp_url="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
+        ffmpeg_url=""   # see note below
+        ffprobe_url=""
+        ;;
     *)
         echo "Unsupported triple: $TRIPLE" >&2
         exit 1
@@ -130,5 +135,19 @@ builds from https://www.gyan.dev/ffmpeg/builds/ (the "release essentials" zip),
 extract ffmpeg.exe and ffprobe.exe, and rename them to:
     src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
     src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe
+NOTE
+fi
+
+# Same deliberate gap as Windows, for the same reason: there is no single
+# ffmpeg build that is right for every distro, and the packaged one usually is.
+# Not optional, though -- tauri-build fails `cargo check` on a missing
+# externalBin for the target triple, before anything is compiled.
+if [[ "$TRIPLE" == *-linux-* ]]; then
+    cat <<'NOTE'
+
+Note: Linux ffmpeg/ffprobe binaries are not auto-fetched. Install them from
+your distribution (e.g. `apt-get install ffmpeg`) and copy them in:
+    cp "$(command -v ffmpeg)"  src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+    cp "$(command -v ffprobe)" src-tauri/binaries/ffprobe-x86_64-unknown-linux-gnu
 NOTE
 fi

@@ -205,6 +205,31 @@ class TauriApiClient {
 
         return destination;
     }
+
+    /**
+     * Store the key in the OS keychain, after Rust has spent one cheap
+     * `GET /v1beta/models` proving it works.
+     *
+     * REJECTS with the backend's own message when the key is malformed or
+     * Google refuses it — failing at paste time beats failing twenty minutes
+     * into the user's first transcription.
+     */
+    async setGeminiKey(key: string): Promise<void> {
+        await invoke("set_gemini_key", { key });
+    }
+
+    /** Removing a key that was never stored SUCCEEDS: the goal state is reached. */
+    async clearGeminiKey(): Promise<void> {
+        await invoke("clear_gemini_key");
+    }
+
+    /**
+     * WHETHER a key is stored — never the key itself. Nothing in the backend
+     * returns it to the webview.
+     */
+    async geminiKeyStatus(): Promise<boolean> {
+        return invoke<boolean>("gemini_key_status");
+    }
 }
 
 export const api = new TauriApiClient();

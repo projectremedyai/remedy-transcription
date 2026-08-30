@@ -4,10 +4,20 @@ import { TranscriberData } from "../hooks/useTranscriber";
 import { formatAudioTimestamp } from "../utils/AudioUtils";
 import { api, SpeakerNames } from "../services/api";
 import { ConsolidatedSegment } from "../lib/captionFormatter";
+import {
+    EngineSpeakers,
+    LOCAL_ENGINE_NO_SPEAKERS,
+} from "../hooks/engines/types";
 
 interface Props {
     transcribedData: TranscriberData | undefined;
     jobId?: string | null;
+    /**
+     * What the engine that produced this transcript said about speakers.
+     * `null` means no engine has answered yet — its own state, distinct from
+     * both arms of the union.
+     */
+    speakerOutcome?: EngineSpeakers | null;
     /** What the user has called each speaker, keyed by the opaque label a cue carries. */
     speakerNames?: SpeakerNames;
     /**
@@ -117,9 +127,48 @@ function SpeakerLabel({
     );
 }
 
+/**
+ * The one place an `EngineSpeakers` becomes words on screen.
+ *
+ * There is no feature flag here. With a single diarization producer, "does
+ * this transcript have speakers?" is answered by the data, and a flag would
+ * only be a second, staler answer to the same question.
+ */
+function SpeakerOutcomeBanner({
+    outcome,
+}: {
+    outcome?: EngineSpeakers | null;
+}) {
+    if (!outcome) return null;
+
+    if (outcome.status === "identified") {
+        return (
+            <div className='mt-2 rounded-md border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700'>
+                {outcome.speaker_count} speaker
+                {outcome.speaker_count === 1 ? "" : "s"} identified. Click a
+                name to rename them.
+            </div>
+        );
+    }
+
+    // The LOCAL engine reports "unavailable" on every single run — it has no
+    // diarizer at all. Saying so on every on-device transcript would be noise
+    // about a feature the user never asked for, so only a Gemini run's reason
+    // (a real, specific "we could not do this, here is why") is shown.
+    if (outcome.reason === LOCAL_ENGINE_NO_SPEAKERS) return null;
+
+    return (
+        <div className='mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800'>
+            Speaker labels are not available for this transcript:{" "}
+            {outcome.reason}
+        </div>
+    );
+}
+
 export default function Transcript({
     transcribedData,
     jobId,
+    speakerOutcome,
     speakerNames,
     onRenameSpeaker,
 }: Props) {
@@ -162,6 +211,7 @@ export default function Transcript({
 
     return (
         <div className='w-full flex flex-col my-2'>
+            <SpeakerOutcomeBanner outcome={speakerOutcome} />
             <div
                 ref={divRef}
                 className='w-full flex flex-col p-4 max-h-[20rem] overflow-y-auto'

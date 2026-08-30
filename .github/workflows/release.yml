@@ -1,0 +1,162 @@
+name: Release
+
+# Tag-driven, because the trap this closes is a HUMAN one: the signed and
+# notarized .dmg comes from `scripts/build-release.sh`, and a plain
+# `npm run build` produces a bundle that looks finished and is not — it is
+# signed but unnotarized, and Gatekeeper refuses it with "Apple could not
+# verify this app is free of malware". 1.3.0 was very nearly shipped that way.
+#
+# So the release artifact is built here rather than on somebody's laptop, and
+# the notarization is VERIFIED below rather than assumed.
+on:
+  push:
+    tags:
+      - "v*"
+  # Buildable without tagging, to prove the signing path still works before
+  # committing a tag to history.
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Build, notarize and publish
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      # `gh release create` writes to the repo.
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Fail NOW, with a readable message, rather than 40 minutes later inside
+      # notarytool -- or, far worse, succeeding and publishing an unnotarized
+      # build. Every one of these is required for a shippable artifact.
+      - name: Require signing and notarization secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=""
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -z "${!v}" ] && missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            echo "See 'Cutting a release' in the README for how to produce each one." >&2
+            exit 1
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      # The same checks CI runs. A tag must not ship code that would have gone
+      # red on `main`.
+      - name: Lint frontend
+        run: npm --prefix frontend run lint
+
+      - name: Frontend tests
+        run: npm --prefix frontend test
+
+      - name: Fetch Tauri sidecars
+        run: ./scripts/fetch-sidecars.sh aarch64-apple-darwin
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # Imports the Developer ID cert into a throwaway keychain. Without this
+      # the build falls back to an ad-hoc signature and notarization rejects it.
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security import certificate.p12 -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          rm -f certificate.p12
+          security find-identity -v -p codesigning
+
+      # The very script a human would run, so there is exactly one release path
+      # and CI exercises it.
+      - name: Build, notarize and staple
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./scripts/build-release.sh
+
+      # The assertion the whole workflow exists for. `spctl` says
+      # "source=Notarized Developer ID" only when a ticket is actually stapled;
+      # an unnotarized build says "Unnotarized Developer ID" and is rejected.
+      # Never publish without this passing.
+      - name: Verify the .dmg is notarized
+        run: |
+          DMG="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg \
+                   -maxdepth 1 -name '*.dmg' | head -1)"
+          [ -n "$DMG" ] || { echo "::error::no .dmg was produced"; exit 1; }
+          xcrun stapler validate "$DMG"
+          if ! spctl --assess --type open \
+                 --context context:primary-signature -vv "$DMG" 2>&1 \
+                 | tee /dev/stderr | grep -q "source=Notarized Developer ID"; then
+            echo "::error::$DMG is not notarized -- refusing to publish"
+            exit 1
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          cp "$DMG" "Remedy-Transcription-${VERSION}-arm64.dmg"
+          echo "ASSET=Remedy-Transcription-${VERSION}-arm64.dmg" >> "$GITHUB_ENV"
+
+      - name: Upload the installer as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-dmg
+          path: ${{ env.ASSET }}
+
+      # Only on a tag. A `workflow_dispatch` run proves the signing path and
+      # stops here rather than inventing a release.
+      - name: Attach the installer to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            gh release create "$TAG" "$ASSET" \
+              --title "Remedy Transcription ${TAG#v}" \
+              --generate-notes
+          fi

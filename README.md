@@ -47,6 +47,39 @@ npm run build
 
 Output: `src-tauri/target/release/bundle/` — `.dmg` on macOS, `.msi` / `.exe` on Windows. The installer is fully standalone; end users don't need Node, Rust, or Python on their machine.
 
+**This is not the command that produces a shippable macOS build.** `npm run build` signs the app but does not notarize it, and an unnotarized `.dmg` is refused by Gatekeeper with *"Apple could not verify this app is free of malware."* The bundle looks finished and is not. To cut a release, see below.
+
+## Cutting a release
+
+Use `npm run release` (`scripts/build-release.sh`), never `npm run build`. It builds for `aarch64-apple-darwin`, signs with your Developer ID, submits to Apple, waits for the result, staples the ticket, and then verifies Gatekeeper accepts both the `.app` and the `.dmg`.
+
+It needs three values, in a gitignored `.env.local` at the repo root:
+
+```bash
+APPLE_ID=you@example.com          # your Apple ID email
+APPLE_PASSWORD=xxxx-xxxx-xxxx-xxxx # app-specific password, NOT your account password
+APPLE_TEAM_ID=7XU3QW326W           # from `security find-identity -v -p codesigning`
+```
+
+Generate the app-specific password at [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords. `.env.local` is gitignored, so it does not survive a fresh clone — expect to recreate it on a new machine.
+
+The release is notarized only if the script prints:
+
+```
+source=Notarized Developer ID
+```
+
+`Unnotarized Developer ID`, or `rejected`, means do not ship it.
+
+Then tag and publish:
+
+```bash
+git tag -a v1.3.0 -m "Remedy Transcription 1.3.0"
+git push origin v1.3.0
+```
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which runs the same script on CI and refuses to publish anything `spctl` does not report as notarized. That workflow needs six repository secrets — the three above plus `APPLE_SIGNING_IDENTITY` (the full `Developer ID Application: ...` string), `APPLE_CERTIFICATE` (the Developer ID `.p12` base64-encoded: `base64 -i cert.p12 | pbcopy`), and `APPLE_CERTIFICATE_PASSWORD`. Until those are set the workflow fails immediately with the list of what is missing, rather than shipping an unsigned build.
+
 ## CI and build checks
 
 GitHub Actions runs the checked build path on macOS:

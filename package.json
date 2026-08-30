@@ -9,7 +9,8 @@
     "build": "tauri build",
     "frontend:install": "npm --prefix frontend install",
     "frontend:dev": "npm --prefix frontend run dev",
-    "frontend:build": "npm --prefix frontend run build"
+    "frontend:build": "npm --prefix frontend run build",
+    "release": "./scripts/build-release.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1"

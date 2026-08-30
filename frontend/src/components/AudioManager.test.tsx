@@ -99,6 +99,7 @@ function renderAudioManager(overrides: Partial<Transcriber> = {}) {
         languageOptions: LANGUAGE_OPTIONS,
         speakerNames: {},
         renameSpeaker: vi.fn(),
+        speakerOutcome: null,
         ...overrides,
     };
 

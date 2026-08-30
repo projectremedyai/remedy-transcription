@@ -11,7 +11,8 @@ import {
 } from "../config/transcription";
 import { EngineId } from "../config/engines";
 import { createLocalEngine } from "./engines/localEngine";
-import type { TranscriptionEngine } from "./engines/types";
+import { createGeminiEngine } from "./engines/geminiEngine";
+import type { EngineSpeakers, TranscriptionEngine } from "./engines/types";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
@@ -137,6 +138,13 @@ export interface Transcriber {
      * write and the subsequent re-fetch both land.
      */
     renameSpeaker: (speakerKey: string, displayName: string) => Promise<void>;
+    /**
+     * Whether the engine that produced the current transcript identified
+     * speakers, and if not, why not. `null` before any run has finished — as
+     * distinct from `{ status: "unavailable", ... }`, which means a run DID
+     * finish and specifically found none.
+     */
+    speakerOutcome: EngineSpeakers | null;
 }
 
 type PendingWorker = {
@@ -192,6 +200,9 @@ export function useTranscriber(): Transcriber {
         null,
     );
     const [speakerNames, setSpeakerNames] = useState<SpeakerNames>({});
+    const [speakerOutcome, setSpeakerOutcome] = useState<EngineSpeakers | null>(
+        null,
+    );
 
     const pendingWorkerRef = useRef<PendingWorker | null>(null);
 
@@ -797,17 +808,16 @@ export function useTranscriber(): Transcriber {
         [worker],
     );
 
-    // Partial, honestly: only "local" is wired up so far (Task 12 adds
-    // "gemini"). `EngineId` already has both members — Task 4 added the axis
-    // to config ahead of the engine that uses it — so indexing this by
-    // `config.engine` cannot be typed as total without lying about "gemini"
-    // existing. `transcribePreparedJob` below checks for the `undefined` case
-    // explicitly rather than letting a missing entry throw an opaque
-    // "not a function" from inside `.run(`.
-    const engines: Partial<Record<EngineId, TranscriptionEngine>> = useMemo(
-        () => ({
-            local: createLocalEngine({ runWorkerTranscription }),
-        }),
+    // TOTAL over `EngineId`, enforced by `satisfies`: a third engine id added
+    // to `EngineId` without an entry here is a compile error, not a runtime
+    // throw the first time `transcribePreparedJob` indexes into it with
+    // `config.engine`.
+    const engines = useMemo(
+        () =>
+            ({
+                local: createLocalEngine({ runWorkerTranscription }),
+                gemini: createGeminiEngine(),
+            } satisfies Record<EngineId, TranscriptionEngine>),
         [runWorkerTranscription],
     );
 
@@ -929,6 +939,9 @@ export function useTranscriber(): Transcriber {
             // stale set from the PREVIOUS job must not sit on screen looking
             // like an answer for this one.
             setSpeakerNames({});
+            // Same reasoning: the previous run's speaker outcome (identified
+            // or its reason) is not an answer for this one either.
+            setSpeakerOutcome(null);
 
             const caps = await ensureBrowserCaps();
             const config = resolveModelConfig(
@@ -1027,14 +1040,21 @@ export function useTranscriber(): Transcriber {
                 return;
             }
 
-            setStatus("loading-audio");
-
+            // No `setStatus("loading-audio")` here: that phase is not true of
+            // every engine. It used to be hardcoded on this line, ahead of
+            // EVERY engine's dispatch, back when "local" was the only one —
+            // but Gemini never loads audio into the browser (Rust does its
+            // own audio prep before it ever calls out), and the local
+            // engine's OWN `run()` already announces "loading-audio" via
+            // `onProgress` as its first act, before its first `await`. So the
+            // hardcoded line here was redundant for local and would have been
+            // an outright lie for Gemini — a phase flashing on screen that
+            // this run will never actually be in. Each engine now owns
+            // announcing its own first phase (or, for Gemini, staying quiet
+            // until its own backend has something to report — see item 4 in
+            // the task brief on why that first event can take a couple of
+            // seconds to arrive).
             const activeEngine = engines[config.engine];
-            if (!activeEngine) {
-                throw new Error(
-                    `no transcription engine wired up for "${config.engine}" yet`,
-                );
-            }
 
             const engineResult = await activeEngine.run({
                 job: readyJob,
@@ -1089,6 +1109,13 @@ export function useTranscriber(): Transcriber {
             // added at the worker post.
             if (runIdRef.current !== runId) {
                 return;
+            }
+
+            // So the UI can render WHY there are no speakers (Task 14), not
+            // only that there are none. Guarded the same way as every other
+            // write here: a dead run may finish, but it may not paint.
+            if (runIdRef.current === runId) {
+                setSpeakerOutcome(engineResult.speakers);
             }
 
             await persistWorkerTranscript(
@@ -1201,6 +1228,17 @@ export function useTranscriber(): Transcriber {
      * is not. That is tolerable ONLY because an abandoned ffmpeg finishes on its
      * own, in seconds to a minute.
      *
+     * The Gemini engine is NOT like that ffmpeg case, which is why it is the one
+     * thing this DOES tell to stop: `engines[engine].abandon(jobId)` reaches Rust
+     * and asks it to abort the request in flight, because an abandoned cloud run
+     * keeps costing money for every minute Google spends still transcribing it,
+     * and leaves the user's audio sitting in Google's storage until it does.
+     * `abandon` is fire-and-forget and best-effort (see `geminiEngine.ts`): a
+     * cancel that cannot reach the backend must still clear the UI. The LOCAL
+     * engine's `abandon` is a no-op, correctly — `claimRun`'s `worker.restart()`
+     * above already IS the stop for a transformers.js inference, so there is
+     * nothing further for it to tell.
+     *
      * Nor does it stop a `persistTranscript` already in flight — and cancelling
      * inside that window is exactly how the last bug was reached, because the app
      * is `isBusy` while persisting, so the Cancel button is on screen. The persist
@@ -1210,6 +1248,9 @@ export function useTranscriber(): Transcriber {
      */
     const cancel = useCallback(() => {
         claimRun();
+        if (jobId) {
+            engines[engine].abandon(jobId);
+        }
         setTranscript((previous) =>
             previous ? { ...previous, isBusy: false } : previous,
         );
@@ -1219,7 +1260,7 @@ export function useTranscriber(): Transcriber {
         setProgress(0);
         setStatus("idle");
         setError(null);
-    }, [claimRun]);
+    }, [claimRun, engine, engines, jobId]);
 
     const onInputChange = useCallback(() => {
         setTranscript(undefined);
@@ -1274,6 +1315,7 @@ export function useTranscriber(): Transcriber {
             languageOptions: LANGUAGE_OPTIONS,
             speakerNames,
             renameSpeaker,
+            speakerOutcome,
         }),
         [
             browserCaps,
@@ -1296,6 +1338,7 @@ export function useTranscriber(): Transcriber {
             selectedModelAvailable,
             selectedModelId,
             speakerNames,
+            speakerOutcome,
             startFromFile,
             startFromYouTube,
             status,

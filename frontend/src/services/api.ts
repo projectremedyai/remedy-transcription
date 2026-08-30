@@ -11,6 +11,8 @@ import {
 } from "../lib/srtGenerator";
 import {
     FileJobRequest,
+    GeminiProgressEvent,
+    GeminiTranscriptionResult,
     HealthResponse,
     Job,
     ModelStatusResponse,
@@ -22,6 +24,9 @@ import {
 
 export type {
     FileJobRequest,
+    GeminiProgressEvent,
+    GeminiTranscriptionResult,
+    GeminiWord,
     HealthResponse,
     Job,
     ModelStatusItem,
@@ -229,6 +234,53 @@ class TauriApiClient {
      */
     async geminiKeyStatus(): Promise<boolean> {
         return invoke<boolean>("gemini_key_status");
+    }
+
+    /**
+     * Transcribe a job's prepared audio with Gemini.
+     *
+     * REJECTS on a wrong request (unknown job, no prepared audio, no key
+     * stored) AND on any chunk failing after its retries — there is no partial
+     * transcript, because a silent 25-minute hole would be persisted and
+     * content-cached.
+     */
+    async transcribeWithGemini(
+        jobId: string,
+    ): Promise<GeminiTranscriptionResult> {
+        return invoke<GeminiTranscriptionResult>("transcribe_with_gemini", {
+            jobId,
+        });
+    }
+
+    /**
+     * Stop a Gemini run. Resolves `false` when the job was not running, which
+     * is the common case and not an error. Worth calling even so: an abandoned
+     * run costs money and leaves audio in Google's storage.
+     */
+    async cancelGeminiTranscription(jobId: string): Promise<boolean> {
+        return invoke<boolean>("cancel_gemini_transcription", { jobId });
+    }
+
+    subscribeToGeminiProgress(
+        jobId: string,
+        onProgress: (event: GeminiProgressEvent) => void,
+    ): () => void {
+        let unlisten: UnlistenFn | null = null;
+        let cancelled = false;
+
+        listen<GeminiProgressEvent>(`gemini-progress::${jobId}`, (event) => {
+            onProgress(event.payload);
+        })
+            .then((fn) => (cancelled ? fn() : (unlisten = fn)))
+            .catch(() => {
+                // A missing progress stream must not fail the transcription.
+            });
+
+        return () => {
+            cancelled = true;
+            unlisten?.();
+            unlisten = null;
+        };
     }
 }
 

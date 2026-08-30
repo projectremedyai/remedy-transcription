@@ -142,3 +142,40 @@ export type SpeakerOutcome =
            */
           reason: string;
       };
+
+/** One word as Gemini timed it, already offset into whole-file time by Rust. */
+export interface GeminiWord {
+    text: string;
+    start: number;
+    end: number;
+}
+
+export interface GeminiProgressEvent {
+    phase: "slicing" | "uploading" | "transcribing" | "stitching";
+    chunk_index: number;
+    chunk_count: number;
+    fraction: number;
+}
+
+/**
+ * What `transcribe_with_gemini` produced.
+ *
+ * `speakers` is a tagged union for the reason the old `DiarizationOutcome`
+ * documented: a transcript with no speaker labels *because the engine gave us
+ * nothing* must never be indistinguishable from one *because a single person
+ * was talking*. Here that is not hypothetical — audio over 28 minutes is split
+ * into chunks, and `spk_1` in chunk 2 is not the same person as `spk_1` in
+ * chunk 1, so no speakers are produced at all.
+ *
+ * ```ts
+ * result.speakers.turns                              // ✗ does not compile
+ * if (result.speakers.status === "identified") ...    // ✓ the only way in
+ * ```
+ */
+export interface GeminiTranscriptionResult {
+    text: string;
+    words: GeminiWord[];
+    /** The union added in Task 5. Reused, not redeclared. */
+    speakers: SpeakerOutcome;
+    audio_duration: number;
+}

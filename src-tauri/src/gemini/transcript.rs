@@ -33,14 +33,28 @@ pub struct SpeakerTurn {
 }
 
 /// `"0.100s"` -> `0.1`.
+///
+/// Rejects non-finite results: `f64::from_str` happily accepts `"NaN"` and
+/// `"inf"`/`"-inf"` as valid floats, and a NaN or infinite offset would flow
+/// straight into `Word.start`/`end` and corrupt every downstream comparison
+/// (`shift`, the time sort in `words_from_response`, turn stitching) without
+/// ever tripping an error. Also rejects negatives: a word cannot start before
+/// t=0.
 pub fn parse_offset(raw: &str) -> anyhow::Result<f64> {
     let trimmed = raw.trim().strip_suffix('s').unwrap_or(raw.trim());
     if trimmed.is_empty() {
         bail!("empty duration offset");
     }
-    trimmed
+    let value = trimmed
         .parse::<f64>()
-        .map_err(|_| anyhow!("could not read {raw:?} as a duration offset"))
+        .map_err(|_| anyhow!("could not read {raw:?} as a duration offset"))?;
+    if !value.is_finite() {
+        bail!("duration offset {raw:?} is not a finite number");
+    }
+    if value < 0.0 {
+        bail!("duration offset {raw:?} is negative");
+    }
+    Ok(value)
 }
 
 /// Every object tagged `"type": "word_info"`, wherever it sits.
@@ -82,7 +96,7 @@ pub fn words_from_response(value: &serde_json::Value) -> anyhow::Result<Vec<Word
         );
     }
 
-    infos
+    let mut words = infos
         .into_iter()
         .map(|info| {
             Ok(Word {
@@ -92,7 +106,22 @@ pub fn words_from_response(value: &serde_json::Value) -> anyhow::Result<Vec<Word
                 speaker: info["speaker"].as_str().map(|s| s.to_string()),
             })
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<Word>>>()?;
+
+    // `collect_word_infos`'s traversal order is NOT speech order: this crate
+    // builds `serde_json::Value::Object` on a `BTreeMap` (no `preserve_order`
+    // feature), so a walk visits sibling keys alphabetically. If the real
+    // envelope ever spreads `word_info` nodes across multiple keys (the docs
+    // describe them living in "steps AND content sections"), alphabetical
+    // order would scramble the transcript. Sorting by `start` derives order
+    // from the API's own timestamps -- the one thing the docs do pin -- so
+    // this is correct under any envelope shape, not just the ones tested
+    // here. `total_cmp` is safe only because `parse_offset` above already
+    // rejected non-finite values; a stable sort keeps equal-start words in
+    // traversal order.
+    words.sort_by(|a, b| a.start.total_cmp(&b.start));
+
+    Ok(words)
 }
 
 pub fn shift(words: &mut [Word], offset_secs: f64) {
@@ -106,12 +135,24 @@ pub fn shift(words: &mut [Word], offset_secs: f64) {
 ///
 /// Returns `(turns, speaker_count)`. `speaker_count` is the number of DISTINCT
 /// speakers, not the number of turns.
+///
+/// An unattributed word (`speaker: None`) ENDS the current turn rather than
+/// being silently spanned by it: Gemini declined to say who was speaking
+/// then, so letting the previous speaker's turn stretch across that gap
+/// would claim something the response never said. The next attributed word
+/// starts a new turn even if it is the same speaker as before the gap. The
+/// resulting fragmentation is harmless downstream: `speaker_count` counts
+/// distinct speakers, not turns, and the frontend's cue splitter only breaks
+/// on a speaker-label change, so two adjacent turns by the same speaker
+/// produce no visible cue break.
 pub fn turns_from_words(words: &[Word]) -> (Vec<SpeakerTurn>, u32) {
     let mut order: Vec<&str> = Vec::new();
     let mut turns: Vec<SpeakerTurn> = Vec::new();
+    let mut turn_open = false;
 
     for word in words {
         let Some(raw) = word.speaker.as_deref() else {
+            turn_open = false;
             continue;
         };
         let dense = match order.iter().position(|seen| *seen == raw) {
@@ -123,13 +164,14 @@ pub fn turns_from_words(words: &[Word]) -> (Vec<SpeakerTurn>, u32) {
         };
 
         match turns.last_mut() {
-            Some(last) if last.speaker == dense => last.end = word.end,
+            Some(last) if turn_open && last.speaker == dense => last.end = word.end,
             _ => turns.push(SpeakerTurn {
                 start: word.start,
                 end: word.end,
                 speaker: dense,
             }),
         }
+        turn_open = true;
     }
 
     (turns, order.len() as u32)
@@ -166,6 +208,19 @@ mod tests {
         assert!(parse_offset("s").is_err());
     }
 
+    /// `f64::from_str` happily parses `"NaN"`/`"inf"`/`"-inf"` as valid floats.
+    /// A NaN or infinite offset would flow straight into `Word.start`/`end`
+    /// and corrupt every downstream comparison (`shift`, turn stitching,
+    /// sorting) without ever tripping an error. Negative offsets are rejected
+    /// too: a word cannot start before t=0.
+    #[test]
+    fn non_finite_and_negative_offsets_are_errors() {
+        assert!(parse_offset("NaNs").is_err());
+        assert!(parse_offset("infs").is_err());
+        assert!(parse_offset("-infs").is_err());
+        assert!(parse_offset("-3.5s").is_err());
+    }
+
     /// The envelope around `word_info` is not pinned by the published docs, so
     /// the parser searches structurally. This test IS the contract: nesting
     /// depth and key names along the way must not matter.
@@ -200,6 +255,30 @@ mod tests {
     #[test]
     fn a_response_with_no_words_is_an_error() {
         assert!(words_from_response(&json!({"output_text": "hi"})).is_err());
+    }
+
+    /// `serde_json::Value::Object` here is a `BTreeMap` (no `preserve_order`
+    /// feature), so plain tree traversal visits keys alphabetically, not in
+    /// speech order. If the real envelope ever spreads `word_info` nodes
+    /// across sibling keys, alphabetical traversal would silently scramble
+    /// the transcript. Sorting by `start` after parsing derives order from
+    /// the API's own timestamps -- the ground truth -- instead of from
+    /// whatever the envelope's key names happen to be, which is what keeps
+    /// this correct under an envelope shape the docs don't pin.
+    #[test]
+    fn words_come_back_time_ordered_even_when_the_envelope_keys_are_not() {
+        // Speech order is zulu_word (t=0.0) then alpha_word (t=1.0); key
+        // order is the reverse alphabetically, so a naive traversal would
+        // yield "second" before "first".
+        let response = json!({
+            "zulu_word": { "type": "word_info", "text": "first", "start_offset": "0.0s", "end_offset": "0.5s" },
+            "alpha_word": { "type": "word_info", "text": "second", "start_offset": "1.0s", "end_offset": "1.5s" }
+        });
+        let words = words_from_response(&response).unwrap();
+        assert_eq!(
+            words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
     }
 
     #[test]
@@ -249,6 +328,43 @@ mod tests {
         let (turns, count) = turns_from_words(&words);
         assert!(turns.is_empty());
         assert_eq!(count, 0);
+    }
+
+    /// An unattributed word must END the current turn rather than being
+    /// silently spanned by it: Gemini declined to say who was speaking then,
+    /// so claiming the previous speaker occupied that timespan would be a
+    /// fabrication. Same speaker on both sides of the gap must still produce
+    /// two turns, not one merged one.
+    #[test]
+    fn an_unattributed_word_ends_the_turn_even_if_the_same_speaker_returns() {
+        let words = vec![
+            Word { text: "a".into(), start: 0.0, end: 1.0, speaker: Some("spk_1".into()) },
+            Word { text: "b".into(), start: 1.0, end: 2.0, speaker: None },
+            Word { text: "c".into(), start: 2.0, end: 3.0, speaker: Some("spk_1".into()) },
+        ];
+        let (turns, count) = turns_from_words(&words);
+        assert_eq!(count, 1);
+        assert_eq!(turns.len(), 2);
+        assert_eq!((turns[0].start, turns[0].end), (0.0, 1.0));
+        assert_eq!((turns[1].start, turns[1].end), (2.0, 3.0));
+    }
+
+    /// Same shape as above but with a different speaker after the gap, to
+    /// prove the behaviour no longer depends on what comes next: both cases
+    /// now produce a two-turn split with a silent gap over the unattributed
+    /// word, rather than one merging and the other not.
+    #[test]
+    fn an_unattributed_word_before_a_different_speaker_still_leaves_a_gap() {
+        let words = vec![
+            Word { text: "a".into(), start: 0.0, end: 1.0, speaker: Some("spk_1".into()) },
+            Word { text: "b".into(), start: 1.0, end: 2.0, speaker: None },
+            Word { text: "c".into(), start: 2.0, end: 3.0, speaker: Some("spk_2".into()) },
+        ];
+        let (turns, count) = turns_from_words(&words);
+        assert_eq!(count, 2);
+        assert_eq!(turns.len(), 2);
+        assert_eq!((turns[0].start, turns[0].end), (0.0, 1.0));
+        assert_eq!((turns[1].start, turns[1].end), (2.0, 3.0));
     }
 
     /// full_text is joined from the WORDS, not taken from `output_text`, so

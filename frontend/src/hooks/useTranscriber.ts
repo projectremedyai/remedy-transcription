@@ -10,6 +10,8 @@ import {
     resolveModelConfig,
 } from "../config/transcription";
 import { EngineId } from "../config/engines";
+import { createLocalEngine } from "./engines/localEngine";
+import type { TranscriptionEngine } from "./engines/types";
 import { useWorker } from "./useWorker";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
@@ -146,15 +148,6 @@ type PendingWorker = {
     modelLabel?: string;
     audioDuration: number;
 };
-
-async function decodeAudio(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
-    const audioContext = new AudioContext({ sampleRate: 16000 });
-    try {
-        return await audioContext.decodeAudioData(arrayBuffer.slice(0));
-    } finally {
-        await audioContext.close();
-    }
-}
 
 function mixToMono(audioBuffer: AudioBuffer): Float32Array {
     if (audioBuffer.numberOfChannels === 1) {
@@ -783,6 +776,20 @@ export function useTranscriber(): Transcriber {
         [worker],
     );
 
+    // Partial, honestly: only "local" is wired up so far (Task 12 adds
+    // "gemini"). `EngineId` already has both members — Task 4 added the axis
+    // to config ahead of the engine that uses it — so indexing this by
+    // `config.engine` cannot be typed as total without lying about "gemini"
+    // existing. `transcribePreparedJob` below checks for the `undefined` case
+    // explicitly rather than letting a missing entry throw an opaque
+    // "not a function" from inside `.run(`.
+    const engines: Partial<Record<EngineId, TranscriptionEngine>> = useMemo(
+        () => ({
+            local: createLocalEngine({ runWorkerTranscription }),
+        }),
+        [runWorkerTranscription],
+    );
+
     /**
      * Write the transcript, then — and ONLY then — decide whether this run is
      * still allowed to paint it.
@@ -1001,68 +1008,74 @@ export function useTranscriber(): Transcriber {
 
             setStatus("loading-audio");
 
-            const audioUrl = await api.getAudioUrl(readyJob.id);
-            const audioResponse = await fetch(audioUrl);
-            if (!audioResponse.ok) {
-                throw new Error("Failed to load prepared audio");
+            const activeEngine = engines[config.engine];
+            if (!activeEngine) {
+                throw new Error(
+                    `no transcription engine wired up for "${config.engine}" yet`,
+                );
             }
 
-            // The WAV is 16 kHz mono and `decodeAudio` opens its `AudioContext` at
-            // exactly 16 kHz, so nothing is resampled and `audioBuffer.duration` is
-            // the true duration of the source — the same number the in-browser
-            // decode of the original file used to yield.
-            //
-            // That number is load-bearing: `persistWorkerTranscript` passes it to
-            // `segmentsForPersistence`, which uses it to CLOSE the final segment. A
-            // missing or wrong duration silently swallows the end of the transcript
-            // rather than throwing, so it must keep coming from a real decode of
-            // the real audio.
-            const audioBuffer = await decodeAudio(
-                await audioResponse.arrayBuffer(),
-            );
+            const engineResult = await activeEngine.run({
+                job: readyJob,
+                config,
+                runId,
+                onProgress: (progress) => {
+                    if (runIdRef.current !== runId) return;
+                    setStatus(progress.status);
+                    if (progress.fraction !== null) {
+                        setProgress(progress.fraction);
+                    }
+                },
+                onPartial: () => {
+                    // The local engine paints partials through the worker
+                    // message handler already; this hook is here for engines
+                    // that stream without a worker.
+                },
+            });
 
+            // A GUARD HERE NOW, and this is the fourth round of this decision, so
+            // it is worth writing down why it flipped. One used to sit on this
+            // line, commented "the last gate before the transcript becomes
+            // PERMANENT", and it was removed: it was PROVABLY DEAD, because the
+            // only engine that existed resolved `runWorkerTranscription`
+            // synchronously from the worker's message handler, so the
+            // continuation of the `await` above was a microtask, microtasks
+            // drain before any task, and no click could bump the token in that
+            // window. The condition could never be false. Worse, it LOOKED like
+            // protection — and that is what hid the live hole ten lines below it,
+            // inside `persistWorkerTranscript`, for three rounds. The real gate
+            // stayed there, after the persist's own await, which is still the
+            // one place a cancel is guaranteed to land.
+            //
+            // What changed: this now awaits `engines[config.engine].run()`, not a
+            // guaranteed-synchronous worker resolve. The LOCAL engine still
+            // resolves that way under the hood, so for it this guard remains as
+            // inert as before. But the GEMINI engine resolves from a Tauri IPC
+            // round trip — a real asynchronous boundary a cancel can land inside
+            // — so for it the token genuinely can move during the `await` above,
+            // and this condition can genuinely be true. The guard that was
+            // deliberately absent here is deliberately present again.
             if (runIdRef.current !== runId) {
                 return;
             }
 
-            const workerTranscript = await runWorkerTranscription(
-                audioBuffer,
-                config,
-                runId,
-                readyJob.filename || undefined,
-            );
-
-            // NO GUARD HERE, deliberately, and this is the fourth round of that
-            // decision so it is worth writing down. One used to sit on this line,
-            // commented "the last gate before the transcript becomes PERMANENT".
-            // It was PROVABLY DEAD: `pending.resolve()` is called synchronously
-            // inside the worker's message handler, so the continuation of the
-            // `await` above is a microtask, microtasks drain before any task, and
-            // no click can bump the token in that window. The condition could
-            // never be false. Worse, it LOOKED like protection — and that is what
-            // hid the live hole ten lines below it, inside `persistWorkerTranscript`,
-            // for three rounds. The real gate is there, after the persist's own
-            // await, which is the one place a cancel can actually land.
-            //
-            // If a future change makes the resolve asynchronous (a `setTimeout`,
-            // a `queueMicrotask` chain that yields, an `await` before the resolve
-            // in the handler), this line becomes reachable and a guard belongs
-            // here again.
             await persistWorkerTranscript(
                 readyJob,
                 config,
-                workerTranscript,
-                audioBuffer.duration,
+                engineResult.transcript,
+                engineResult.audioDuration,
                 runId,
-                undefined,
+                engineResult.speakers.status === "identified"
+                    ? engineResult.speakers.turns
+                    : undefined,
             );
         },
         [
             applyCompletedJob,
             cancelPendingWait,
+            engines,
             handleBackendJobUpdate,
             persistWorkerTranscript,
-            runWorkerTranscription,
             waitForReady,
         ],
     );
@@ -1136,10 +1149,10 @@ export function useTranscriber(): Transcriber {
      * WHAT THE TOKEN BUYS, precisely — a dead run may still FINISH, but it may not
      * PAINT. Every point at which one can resume re-checks the token before it
      * writes to the UI: after `beginRun`, after `create*Job`, after `waitForReady`,
-     * after `decodeAudio`, and — the one that was missing for three rounds — after
-     * `api.persistTranscript`. Worker messages are keyed the same way, by the run
-     * that posted them. Driven directly by the tests in "under an overlap the
-     * worker cannot stop".
+     * after `engines[config.engine].run()`, and — the one that was missing for
+     * three rounds — after `api.persistTranscript`. Worker messages are keyed the
+     * same way, by the run that posted them. Driven directly by the tests in
+     * "under an overlap the worker cannot stop".
      *
      * Two things are deliberately NOT guarded, and both are correct: the persist
      * still writes (below), and `setBrowserCaps` inside `ensureBrowserCaps` writes

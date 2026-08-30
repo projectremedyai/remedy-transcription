@@ -93,7 +93,25 @@ pub fn words_from_response(value: &serde_json::Value) -> anyhow::Result<Vec<Word
         .into_iter()
         .map(|info| {
             Ok(Word {
-                text: info["text"].as_str().unwrap_or_default().to_string(),
+                // REQUIRED, not defaulted -- this was the parser's one silent
+                // failure mode. Every other field fails loudly under an
+                // unexpected envelope: a different `type` tag empties `infos`
+                // and errors above, and differently-named offsets reach
+                // `parse_offset("")` and error there. A defaulted `text` did
+                // not. If the annotation ever names its content anything but
+                // `text` while keeping snake_case offsets, every word would
+                // parse with valid times and an empty string, `full_text`
+                // would filter them all away, `all_words` would be non-empty
+                // so nothing would error -- and a blank transcript would be
+                // persisted AND content-cached, handed back on every reopen
+                // with no re-run able to miss the cache. An empty string is
+                // still accepted when it genuinely IS one; only an absent or
+                // non-string key is an error.
+                text: info
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .ok_or_else(|| anyhow!("word_info carried no `text` field"))?
+                    .to_string(),
                 start: parse_offset(info["start_offset"].as_str().unwrap_or(""))?,
                 end: parse_offset(info["end_offset"].as_str().unwrap_or(""))?,
                 speaker: info["speaker"].as_str().map(|s| s.to_string()),
@@ -248,6 +266,53 @@ mod tests {
     #[test]
     fn a_response_with_no_words_is_an_error() {
         assert!(words_from_response(&json!({"output_text": "hi"})).is_err());
+    }
+
+    /// THE ONE SILENT FAILURE MODE, closed. The live envelope has never been
+    /// verified against the real API. Every other misnamed key fails loudly:
+    /// a different `type` tag empties `infos`, differently-named offsets hit
+    /// `parse_offset("")`. A word annotation that carries its content under
+    /// some other key -- while keeping the snake_case offsets -- used to
+    /// parse into a full set of correctly-timed BLANK words, which
+    /// `full_text` then filtered away entirely. Nothing errored, so the empty
+    /// transcript was persisted and content-cached under
+    /// `(source_id, "gemini-3.5-transcribe", ...)` and served back on every
+    /// reopen.
+    #[test]
+    fn a_word_annotation_with_no_text_key_is_an_error_not_a_blank_word() {
+        let response = json!({
+            "steps": [{ "content": [
+                { "type": "word_info", "word": "Hello", "start_offset": "0.1s", "end_offset": "0.4s" }
+            ]}]
+        });
+        let err = words_from_response(&response).unwrap_err().to_string();
+        assert!(err.contains("text"), "error should name the field: {err}");
+    }
+
+    /// A non-string `text` is the same failure wearing different clothes.
+    #[test]
+    fn a_non_string_text_is_an_error_too() {
+        let response = json!({
+            "content": [
+                { "type": "word_info", "text": 42, "start_offset": "0.1s", "end_offset": "0.4s" }
+            ]
+        });
+        assert!(words_from_response(&response).is_err());
+    }
+
+    /// The flip side: the key being PRESENT and empty is a thing Gemini may
+    /// legitimately do (a filled pause, a dropped token), and must still
+    /// parse. Only an absent key is an error.
+    #[test]
+    fn a_genuinely_empty_text_still_parses() {
+        let response = json!({
+            "content": [
+                { "type": "word_info", "text": "", "start_offset": "0.1s", "end_offset": "0.4s" }
+            ]
+        });
+        let words = words_from_response(&response).unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].text, "");
     }
 
     /// `serde_json::Value::Object` here is a `BTreeMap` (no `preserve_order`

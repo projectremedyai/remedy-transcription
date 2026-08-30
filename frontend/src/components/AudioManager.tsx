@@ -40,6 +40,67 @@ const MEDIA_EXTENSIONS = [
     "mpg",
 ];
 
+/**
+ * The statuses THIS APP sets for itself, and their prose.
+ *
+ * Two jobs, deliberately one table. It maps a machine string to a sentence,
+ * and — by what it does NOT contain — it is also the test for whether a status
+ * came from an ENGINE instead. `EngineProgress.status` is declared "user-facing
+ * and already specific ... shown verbatim", and `useTranscriber` stores it
+ * straight onto `status`, so anything absent here is already a sentence and
+ * both `getStatusMessage` and `progressValue` treat it as one.
+ *
+ * That join is what was missing. This used to be a `switch` with
+ * `default: return ""`, written when these were the only statuses that
+ * existed, and never revisited when the engine seam arrived — so a multi-chunk
+ * Gemini run rendered a spinner next to blank text for its entire duration,
+ * and a single-chunk one matched `transcribing` and claimed the work was
+ * happening "in your browser". The local engine only ever worked because it
+ * happened to pick `loading-audio`, a string that was already here.
+ *
+ * The two members that are not backend job statuses: `loading-audio` comes
+ * from `localEngine.run()` (it predates the seam and is kept because its copy
+ * is specific to the local path), and `transcribing` is set by the hook's own
+ * `runWorkerTranscription`. Both are local-only by construction; the Gemini
+ * engine's labels are prose and cannot collide with either.
+ */
+const JOB_STATUS_MESSAGES: Record<string, string> = {
+    // Not busy — nothing to say, and the block this feeds is not rendered.
+    idle: "",
+    "checking-cache": "Checking transcript cache...",
+    downloading: "Downloading from YouTube...",
+    extracting: "Extracting audio...",
+    // The backend's own job-status string, on screen for the window between
+    // prepared audio going "ready" and the engine's first progress event. The
+    // local engine closes that window itself (its `run()` posts "loading-audio"
+    // before its first `await`), but Gemini's first event waits on a Rust-side
+    // silence-detection pass, so without this the spinner would sit next to
+    // blank text for a couple of seconds.
+    ready: "Preparing transcription...",
+    "loading-audio": "Loading prepared audio...",
+    transcribing: "Transcribing in your browser...",
+    persisting: "Saving transcript...",
+    completed: "Completed",
+    failed: "Failed",
+};
+
+/**
+ * The prose for one of this app's own statuses, or `undefined` if it is not
+ * one — which is the same question as "did an engine supply this?".
+ *
+ * `hasOwnProperty` rather than a bare lookup, so the answer is the table's and
+ * not `Object.prototype`'s: a plain `status in JOB_STATUS_MESSAGES` says yes
+ * to `toString`, and a plain `JOB_STATUS_MESSAGES[status]` hands back a
+ * function for it. Both callers below have to agree on this predicate exactly,
+ * or the status text and the progress bar can disagree about which run they
+ * are describing.
+ */
+function jobStatusMessage(status: string): string | undefined {
+    return Object.prototype.hasOwnProperty.call(JOB_STATUS_MESSAGES, status)
+        ? JOB_STATUS_MESSAGES[status]
+        : undefined;
+}
+
 function basename(path: string): string {
     const parts = path.split(/[\\/]/);
     return parts[parts.length - 1] || path;
@@ -209,41 +270,26 @@ export function AudioManager(props: { transcriber: Transcriber }) {
     };
 
     const getStatusMessage = () => {
-        switch (props.transcriber.status) {
-            case "checking-cache":
-                return "Checking transcript cache...";
-            case "downloading":
-                return "Downloading from YouTube...";
-            case "extracting":
-                return "Extracting audio...";
-            // The backend's own job-status string, on screen for the window
-            // between prepared audio going "ready" and the engine's first
-            // progress event. The local engine closes that window itself
-            // (its `run()` posts "loading-audio" before its first `await`),
-            // but Gemini's first event waits on a Rust-side silence-detection
-            // pass, so without this case the spinner would sit next to blank
-            // text for a couple of seconds.
-            case "ready":
-                return "Preparing transcription...";
-            case "loading-audio":
-                return "Loading prepared audio...";
-            case "transcribing":
-                return "Transcribing in your browser...";
-            case "persisting":
-                return "Saving transcript...";
-            case "completed":
-                return "Completed";
-            case "failed":
-                return "Failed";
-            default:
-                return "";
-        }
+        // Not one of ours, so it came from an engine's `EngineProgress`, which
+        // `hooks/engines/types.ts` declares is "user-facing and already
+        // specific -- shown verbatim". Shown verbatim.
+        return (
+            jobStatusMessage(props.transcriber.status) ??
+            props.transcriber.status
+        );
     };
 
     const progressValue = useMemo(() => {
         if (
             props.transcriber.status === "downloading" ||
-            props.transcriber.status === "extracting"
+            props.transcriber.status === "extracting" ||
+            // Same join as `getStatusMessage`, on the other half of the
+            // progress pair: an engine-supplied status means the fraction next
+            // to it is the ENGINE's, and it is the only determinate number a
+            // cloud run produces. Gemini has no token stream, so the spec's
+            // "the transcript appears all at once, behind a determinate
+            // progress bar" is this bar or nothing.
+            jobStatusMessage(props.transcriber.status) === undefined
         ) {
             return props.transcriber.progress * 100;
         }
@@ -264,6 +310,19 @@ export function AudioManager(props: { transcriber: Transcriber }) {
         props.transcriber.progressItems,
         props.transcriber.status,
     ]);
+
+    /**
+     * Why the YouTube modal's submit is dead, when it is.
+     *
+     * The Transcribe button's own gate has its explanation sitting right next
+     * to it in the engine row. The modal's does not -- the engine row is
+     * BEHIND the overlay -- so a user with Gemini selected and no key could
+     * paste a valid URL and find "Prepare Audio" inert with nothing on screen
+     * saying why. `null` means the control is live.
+     */
+    const youtubeDisabledReason = !engineReady
+        ? "Gemini needs an API key before it can prepare audio. Close this and add one in the engine settings behind this dialog."
+        : null;
 
     return (
         <div className='w-full'>
@@ -326,6 +385,7 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                             engineReady &&
                             !isBusy
                         }
+                        disabledReason={youtubeDisabledReason}
                         disabled={isBusy}
                     />
                     <VerticalBar />
@@ -618,7 +678,17 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
                 </label>
             </div>
 
-            {!engine.supportsLanguageChoice && (
+            {/*
+             * Both controls, not just Language. The Task select above is
+             * disabled by `!supportsTranslate` and the Language select by
+             * `!supportsLanguageChoice`; gating the explanation on only one of
+             * them leaves an engine that supports language choice but not
+             * translation with a dead Task control and nothing saying why.
+             * (The copy is Gemini-specific prose in a capability-driven block —
+             * a third engine will need it rewritten. The polarity is the bug;
+             * the wording is a known debt.)
+             */}
+            {(!engine.supportsLanguageChoice || !engine.supportsTranslate) && (
                 <p className='text-xs text-slate-500'>
                     Gemini detects the language automatically across 85+ locales
                     and has no translation mode, so Task and Language do not
@@ -637,6 +707,7 @@ function ProgressBar(props: { progress: number }) {
     return (
         <div className='w-full bg-gray-200 rounded-full h-1 dark:bg-gray-700'>
             <div
+                data-testid='overall-progress'
                 className='bg-blue-600 h-1 rounded-full transition-all duration-100'
                 style={{
                     width: `${Math.max(0, Math.min(100, props.progress))}%`,
@@ -651,6 +722,8 @@ function YouTubeTile(props: {
     text: string;
     onUrlSubmit: (url: string) => void;
     enabled: boolean;
+    /** Why `enabled` is false, when it is. Rendered beside the dead submit. */
+    disabledReason?: string | null;
     disabled?: boolean;
 }) {
     const [showModal, setShowModal] = useState(false);
@@ -666,6 +739,7 @@ function YouTubeTile(props: {
             <YouTubeModal
                 show={showModal}
                 enabled={props.enabled}
+                disabledReason={props.disabledReason}
                 onSubmit={(url) => {
                     props.onUrlSubmit(url);
                     setShowModal(false);
@@ -679,6 +753,7 @@ function YouTubeTile(props: {
 function YouTubeModal(props: {
     show: boolean;
     enabled: boolean;
+    disabledReason?: string | null;
     onSubmit: (url: string) => void;
     onClose: () => void;
 }) {
@@ -712,6 +787,17 @@ function YouTubeModal(props: {
                             Please enter a valid YouTube URL
                         </div>
                     )}
+                    {/*
+                     * Last in `content`, so it lands immediately above the
+                     * button row `Modal` renders — the closest this can sit to
+                     * the disabled submit without `Modal` learning about it.
+                     * Amber, mirroring the engine row it is pointing at.
+                     */}
+                    {props.disabledReason && (
+                        <div className='mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800'>
+                            {props.disabledReason}
+                        </div>
+                    )}
                 </>
             }
             onClose={props.onClose}
@@ -730,9 +816,10 @@ function YouTubeModal(props: {
  *
  * This used to build an `<input type="file">` and hand the resulting browser
  * `File` straight to the transcriber. A `File` exposes only its bytes, never its
- * path — so the audio could only ever be decoded in the webview, and Rust (where
- * diarization runs) had no file to point ffmpeg or sherpa-onnx at. The dialog
- * returns a real path instead.
+ * path — so the audio could only ever be decoded in the webview, and Rust had no
+ * file to point ffmpeg at. That matters more now, not less: ffmpeg's prepared WAV
+ * is the front of the pipeline for BOTH engines, and it is also what Gemini's
+ * chunker slices. The dialog returns a real path instead.
  */
 function FileTile(props: {
     icon: JSX.Element;

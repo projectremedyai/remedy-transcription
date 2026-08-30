@@ -27,10 +27,9 @@ pub fn audio_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("audio")
 }
 
-pub fn downloads_dir(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("downloads")
-}
-
-pub fn models_dir(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("models")
-}
+// No `downloads_dir` / `models_dir` here. `ensure_runtime_dirs` above still
+// CREATES both directories, but the accessors were dead duplicates: everything
+// that resolves a path at runtime does so from an `AppHandle`, not from an
+// already-resolved data dir -- `commands::downloads_dir`/`commands::audio_dir`
+// for the ffmpeg and yt-dlp paths, `commands::resolve_models_dir` for the
+// model root.

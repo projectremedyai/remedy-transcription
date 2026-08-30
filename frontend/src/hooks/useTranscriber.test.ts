@@ -1127,3 +1127,243 @@ describe("R8: engine-aware readiness gates", () => {
         expect(result.current.error).toBeNull();
     });
 });
+
+/**
+ * The test the spec asks for by name: "`useTranscriber`'s Gemini path with
+ * `api.transcribeWithGemini` mocked, asserting specifically that the
+ * run-token semantics survive: a cancelled Gemini run cannot paint."
+ *
+ * What existed was a happy path here and an isolated `abandon` unit test in
+ * `geminiEngine.test.ts`. Neither reaches the thing that matters — nothing at
+ * the HOOK level asserted that `cancel()` during a Gemini run actually calls
+ * `api.cancelGeminiTranscription`, which is the only thing standing between an
+ * abandoned cloud run and (a) Google continuing to bill for a transcript
+ * nobody will read and (b) the user's audio sitting in Google's storage until
+ * the 48-hour expiry.
+ *
+ * Everything here uses fake timers and REAL task boundaries, for the same
+ * reason the overlap suite above does: a promise that settles in a microtask
+ * cannot express a cancel landing mid-run, because no user event can be
+ * delivered inside a microtask. `transcribeWithGemini` is therefore made to
+ * take actual time.
+ */
+describe("useTranscriber's Gemini path under cancellation", () => {
+    const CLOUD_TEXT = "the cloud transcript nobody is waiting for any more";
+    const LOCAL_TEXT = "the run the user actually asked for";
+
+    beforeEach(() => {
+        // The real command resolves a bool; `geminiEngine.abandon` calls
+        // `.catch()` on what it gets back. The shared `mockReset()` above
+        // leaves it returning `undefined`, which no production call ever does.
+        mocks.cancelGeminiTranscription.mockResolvedValue(true);
+    });
+
+    /** A Gemini round trip that spans real timer ticks, not a microtask. */
+    function slowGemini(ms: number, text = CLOUD_TEXT) {
+        mocks.transcribeWithGemini.mockImplementation(async () => {
+            await new Promise((resolve) => setTimeout(resolve, ms));
+            return {
+                text,
+                words: [{ text, start: 0, end: 5 }],
+                speakers: {
+                    status: "unavailable",
+                    reason: "split into 3 parts",
+                },
+                audio_duration: 5,
+            };
+        });
+    }
+
+    /** Echoes what it was given, so a test can tell WHOSE transcript landed. */
+    function echoingPersist() {
+        mocks.persistTranscript.mockImplementation(
+            async (jobId: string, payload: { full_text: string }) =>
+                makeJob({
+                    id: jobId,
+                    status: "completed",
+                    progress: 1,
+                    full_text: payload.full_text,
+                    filename: "talk.mp4",
+                }),
+        );
+    }
+
+    /** `talk.mp4` is the cloud run; anything else is the local one. */
+    function twoReadyFiles() {
+        mocks.createFileJob.mockImplementation(async ({ path }) =>
+            makeJob({
+                id: path.includes("talk") ? "job-1" : "job-2",
+                status: "ready",
+                progress: 1,
+                filename: path.includes("talk") ? "talk.mp4" : "interview.mp3",
+                model_id: path.includes("talk")
+                    ? "gemini-3.5-transcribe"
+                    : "onnx-community/whisper-base_timestamped",
+            }),
+        );
+        mocks.getJob.mockImplementation(async (jobId: string) =>
+            makeJob({ id: jobId, status: "ready", progress: 1 }),
+        );
+    }
+
+    it("tells Rust to abort the run when a Gemini run is cancelled", async () => {
+        twoReadyFiles();
+        slowGemini(5000);
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.setEngine("gemini");
+        });
+        await settle();
+        await act(async () => {
+            result.current.start("/tmp/talk.mp4");
+        });
+        await settle();
+
+        expect(mocks.transcribeWithGemini).toHaveBeenCalledWith("job-1");
+        expect(result.current.isBusy).toBe(true);
+
+        await act(async () => {
+            result.current.cancel();
+        });
+
+        // The whole point. Unlike the local engine's no-op `abandon`, this one
+        // has to reach the backend.
+        expect(mocks.cancelGeminiTranscription).toHaveBeenCalledWith("job-1");
+        // And it must not restart the worker: nothing was ever posted to it,
+        // and a needless terminate throws away a warm, already-loaded model.
+        expect(mocks.restartWorker).not.toHaveBeenCalled();
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.status).toBe("idle");
+    });
+
+    /**
+     * `cancel_gemini_transcription` is best-effort by design — the request may
+     * already be past the point Rust can stop it, and `abandon` swallows its
+     * own rejection. So the token has to hold the line independently: the run
+     * may still FINISH, it may not PAINT.
+     */
+    it("does not paint a cancelled Gemini run that resolves afterwards", async () => {
+        twoReadyFiles();
+        echoingPersist();
+        slowGemini(5000);
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.setEngine("gemini");
+        });
+        await settle();
+        await act(async () => {
+            result.current.start("/tmp/talk.mp4");
+        });
+        await settle();
+
+        await act(async () => {
+            result.current.cancel();
+        });
+        expect(result.current.status).toBe("idle");
+
+        // Google answers anyway, five seconds after nobody was listening.
+        await tick(5000);
+
+        expect(result.current.status).toBe("idle");
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.output).toBeUndefined();
+        expect(result.current.error).toBeNull();
+        // Above all: not written, and so not content-cached under
+        // (source, "gemini-3.5-transcribe", ...) for every future reopen.
+        expect(mocks.persistTranscript).not.toHaveBeenCalled();
+    });
+
+    /**
+     * The engine `cancel()` abandons must be the RUNNING run's, not the
+     * selector's.
+     *
+     * `AudioManager` renders the engine radios `disabled={transcriber.isBusy}`,
+     * so today a user cannot move the selector mid-run by clicking — but the
+     * hook is not entitled to assume that. `useTranscriber`'s own comment on
+     * `cancel` enumerates what depends on that busy gate and contemplates
+     * removing it for a queue or a second panel, and this was one of the
+     * things quietly hanging off it: with the selector on "local", `cancel()`
+     * called the LOCAL engine's no-op `abandon`, the live Gemini run was never
+     * told to stop, and it kept billing.
+     */
+    it("abandons the engine the run is using, not the one the selector shows", async () => {
+        twoReadyFiles();
+        slowGemini(5000);
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.setEngine("gemini");
+        });
+        await settle();
+        await act(async () => {
+            result.current.start("/tmp/talk.mp4");
+        });
+        await settle();
+        expect(mocks.transcribeWithGemini).toHaveBeenCalledWith("job-1");
+
+        // The selector moves while the cloud run is still in flight.
+        await act(async () => {
+            result.current.setEngine("local");
+        });
+        await settle();
+        expect(result.current.engine).toBe("local");
+
+        await act(async () => {
+            result.current.cancel();
+        });
+
+        expect(mocks.cancelGeminiTranscription).toHaveBeenCalledWith("job-1");
+    });
+
+    /**
+     * The supersede variant, with no cancel in it at all: a second run simply
+     * takes the UI while the first is parked inside its cloud round trip. The
+     * abandoned Gemini result arrives afterwards and must be dropped whole —
+     * not painted over the transcript the user is reading, and above all not
+     * persisted under the second run's job, where the content-keyed cache
+     * would serve it back forever.
+     */
+    it("does not let a late Gemini resolve paint over the run that superseded it", async () => {
+        twoReadyFiles();
+        echoingPersist();
+        slowGemini(5000);
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.setEngine("gemini");
+        });
+        await settle();
+        await act(async () => {
+            result.current.start("/tmp/talk.mp4");
+        });
+        await settle();
+        expect(result.current.jobId).toBe("job-1");
+
+        // Run 2: the local engine, on a different file, straight over the top.
+        await act(async () => {
+            result.current.setEngine("local");
+        });
+        await settle();
+        await act(async () => {
+            result.current.start("/tmp/interview.mp3");
+        });
+        await settle();
+        expect(result.current.jobId).toBe("job-2");
+
+        await emitFromWorker(workerComplete(postedRunId(0), LOCAL_TEXT));
+        expect(result.current.status).toBe("completed");
+        expect(result.current.output?.text).toBe(LOCAL_TEXT);
+
+        // Run 1's cloud call finally answers.
+        await tick(5000);
+
+        expect(mocks.persistTranscript).toHaveBeenCalledTimes(1);
+        const [persistedJobId, payload] = mocks.persistTranscript.mock.calls[0];
+        expect(persistedJobId).toBe("job-2");
+        expect(payload.full_text).toBe(LOCAL_TEXT);
+        expect(result.current.output?.text).toBe(LOCAL_TEXT);
+        expect(result.current.status).toBe("completed");
+    });
+});

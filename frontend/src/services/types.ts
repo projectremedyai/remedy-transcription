@@ -151,7 +151,14 @@ export interface GeminiWord {
 }
 
 export interface GeminiProgressEvent {
-    phase: "slicing" | "uploading" | "transcribing" | "stitching";
+    /**
+     * Exactly the three `phase` strings `emit_gemini_progress` passes, and no
+     * more. `uploading` used to be listed here and had no producer on either
+     * side of the boundary, which meant `geminiEngine`'s `PHASE_LABEL` carried
+     * an arm that could never be reached and the type described an event the
+     * backend never sends.
+     */
+    phase: "slicing" | "transcribing" | "stitching";
     chunk_index: number;
     chunk_count: number;
     fraction: number;

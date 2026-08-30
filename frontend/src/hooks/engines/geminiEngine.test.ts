@@ -37,7 +37,10 @@ const job = { id: "job-1", filename: "talk.mp4" } as Job;
 
 const run = (
     engine: ReturnType<typeof createGeminiEngine>,
-    onProgress = () => undefined,
+    onProgress: (progress: {
+        fraction: number | null;
+        status: string;
+    }) => void = () => undefined,
 ) =>
     engine.run({
         job,
@@ -123,6 +126,85 @@ describe("the gemini engine", () => {
 
         await expect(run(createGeminiEngine())).rejects.toThrow(/rejected/);
         expect(unlisten).toHaveBeenCalled();
+    });
+
+    /**
+     * `EngineProgress.status` is shown VERBATIM by `AudioManager` — anything
+     * it does not recognise as one of its own kebab-case job statuses goes
+     * straight to the screen. So these strings are the UI, and two properties
+     * have to hold: they must read as sentences, and they must never say the
+     * work is happening in the browser. The labels used to be kebab-case
+     * machine strings, and `transcribing` collided exactly with the local
+     * worker's own status, rendering "Transcribing in your browser..." over a
+     * run whose audio was being uploaded to Google.
+     */
+    describe("the progress labels it hands the UI", () => {
+        /** Capture what the engine emits for one backend progress event. */
+        async function statusFor(event: {
+            phase: string;
+            chunk_index: number;
+            chunk_count: number;
+            fraction: number;
+        }) {
+            const seen: { fraction: number | null; status: string }[] = [];
+            subscribeToGeminiProgress.mockImplementation(
+                (_jobId: string, onProgress: unknown) => {
+                    (onProgress as (e: unknown) => void)(event);
+                    return () => undefined;
+                },
+            );
+            transcribeWithGemini.mockResolvedValue({
+                text: "hi",
+                words: [{ text: "hi", start: 0, end: 1 }],
+                speakers: { status: "unavailable", reason: "n/a" },
+                audio_duration: 1,
+            });
+            await run(createGeminiEngine(), (progress) => {
+                seen.push(progress);
+            });
+            return seen[0];
+        }
+
+        it("emits presentable prose, never a kebab-case machine string", async () => {
+            const progress = await statusFor({
+                phase: "transcribing",
+                chunk_index: 0,
+                chunk_count: 1,
+                fraction: 0,
+            });
+            expect(progress.status).toBe(
+                "Uploading to Google and transcribing...",
+            );
+            expect(progress.status).not.toMatch(/browser/i);
+        });
+
+        it("numbers the parts on a chunked run", async () => {
+            const progress = await statusFor({
+                phase: "transcribing",
+                chunk_index: 1,
+                chunk_count: 3,
+                fraction: 1 / 3,
+            });
+            expect(progress.status).toBe(
+                "Uploading to Google and transcribing (part 2 of 3)...",
+            );
+            expect(progress.fraction).toBeCloseTo(1 / 3);
+        });
+
+        /**
+         * `stitching` is emitted with `chunk_index == chunk_count` — it is a
+         * whole-run step, not a per-chunk one — so a naive `chunk_index + 1`
+         * announced "part 4 of 3" at the end of every multi-chunk run.
+         */
+        it("does not invent a part number for the whole-run stitch", async () => {
+            const progress = await statusFor({
+                phase: "stitching",
+                chunk_index: 3,
+                chunk_count: 3,
+                fraction: 1,
+            });
+            expect(progress.status).toBe("Assembling the transcript...");
+        });
     });
 
     /**

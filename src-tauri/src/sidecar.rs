@@ -1,13 +1,22 @@
 use std::path::Path;
 
 use tauri::AppHandle;
-use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::mpsc::Receiver;
 
+/// The event stream of a spawned sidecar, and nothing else.
+///
+/// The `CommandChild` is deliberately NOT held. Nothing ever read it -- no
+/// caller kills, signals or writes to a sidecar; every one of them drains `rx`
+/// until `Terminated`. Keeping it only kept the child's stdin pipe open, which
+/// no sidecar here is fed on stdin. Dropping it is the same thing the plugin's
+/// own `Command::status()` does (`let (mut rx, _child) = self.spawn()?`):
+/// `CommandChild` has no `Drop`, so the process is not killed, and the reaper
+/// thread `spawn()` starts holds its own `Arc<SharedChild>`, so `Terminated`
+/// still arrives on `rx`.
 pub struct SidecarHandle {
     pub rx: Receiver<CommandEvent>,
-    pub child: CommandChild,
 }
 
 /// UNVERIFIED ON A PACKAGED BUILD — macOS TCC and the ffmpeg child process.
@@ -42,6 +51,6 @@ pub fn spawn_sidecar(
     if let Some(dir) = cwd {
         command = command.current_dir(dir);
     }
-    let (rx, child) = command.spawn()?;
-    Ok(SidecarHandle { rx, child })
+    let (rx, _child) = command.spawn()?;
+    Ok(SidecarHandle { rx })
 }

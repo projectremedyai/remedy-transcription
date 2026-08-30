@@ -829,6 +829,30 @@ export function useTranscriber(): Transcriber {
     );
 
     /**
+     * The engine the RUNNING run belongs to — not the one the selector is
+     * pointing at now.
+     *
+     * `cancel()` used to read `engines[engine]`, i.e. the selector's current
+     * state, which is only the running run's engine because `AudioManager`
+     * renders the radios `disabled={transcriber.isBusy}`. That gate is a UX
+     * decision, and the long comment on `cancel` below already enumerates what
+     * would have to be answered before it comes off — so hanging "does an
+     * abandoned Gemini run get told to stop" on it was one queue feature away
+     * from silently regressing into a run that keeps billing and keeps the
+     * user's audio in Google's storage.
+     *
+     * Stamped by the two `start*` entry points immediately after `claimRun()`,
+     * which is the same synchronous window in which the run takes the UI. It is
+     * the same value `beginRun` will resolve into `config.engine` — both read
+     * `engine` from the same render's closure — so this cannot disagree with
+     * the engine `transcribePreparedJob` actually dispatched to. Deliberately
+     * NOT set inside `claimRun` itself: `cancel()` calls `claimRun` before it
+     * reads this, so setting it there would put the selector's engine back in
+     * the very place the bug was.
+     */
+    const runEngineRef = useRef<EngineId>(engine);
+
+    /**
      * Write the transcript, then — and ONLY then — decide whether this run is
      * still allowed to paint it.
      *
@@ -1157,6 +1181,7 @@ export function useTranscriber(): Transcriber {
             // previous run's listener and poll die now — not after `beginRun` and
             // a full-file sha256 have had their say. See `cancelPendingWait`.
             const runId = claimRun();
+            runEngineRef.current = engine;
             try {
                 const config = await beginRun(runId);
                 const job = await api.createFileJob({
@@ -1177,12 +1202,13 @@ export function useTranscriber(): Transcriber {
                 failRun(nextError, "Failed to transcribe file");
             }
         },
-        [beginRun, claimRun, failRun, transcribePreparedJob],
+        [beginRun, claimRun, engine, failRun, transcribePreparedJob],
     );
 
     const startFromYouTube = useCallback(
         async (url: string) => {
             const runId = claimRun();
+            runEngineRef.current = engine;
             try {
                 const config = await beginRun(runId);
                 const job = await api.createYouTubeJob({
@@ -1203,7 +1229,7 @@ export function useTranscriber(): Transcriber {
                 failRun(nextError, "YouTube preparation failed");
             }
         },
-        [beginRun, claimRun, failRun, transcribePreparedJob],
+        [beginRun, claimRun, engine, failRun, transcribePreparedJob],
     );
 
     /**
@@ -1241,7 +1267,8 @@ export function useTranscriber(): Transcriber {
      * own, in seconds to a minute.
      *
      * The Gemini engine is NOT like that ffmpeg case, which is why it is the one
-     * thing this DOES tell to stop: `engines[engine].abandon(jobId)` reaches Rust
+     * thing this DOES tell to stop: `engines[runEngineRef.current].abandon(jobId)`
+     * reaches Rust
      * and asks it to abort the request in flight, because an abandoned cloud run
      * keeps costing money for every minute Google spends still transcribing it,
      * and leaves the user's audio sitting in Google's storage until it does.
@@ -1261,7 +1288,10 @@ export function useTranscriber(): Transcriber {
     const cancel = useCallback(() => {
         claimRun();
         if (jobId) {
-            engines[engine].abandon(jobId);
+            // `runEngineRef`, NOT `engine` — the run being abandoned is the one
+            // that is running, which is not necessarily the one the selector is
+            // pointing at. See the ref's own comment.
+            engines[runEngineRef.current].abandon(jobId);
         }
         setTranscript((previous) =>
             previous ? { ...previous, isBusy: false } : previous,
@@ -1272,7 +1302,7 @@ export function useTranscriber(): Transcriber {
         setProgress(0);
         setStatus("idle");
         setError(null);
-    }, [claimRun, engine, engines, jobId]);
+    }, [claimRun, engines, jobId]);
 
     const onInputChange = useCallback(() => {
         setTranscript(undefined);

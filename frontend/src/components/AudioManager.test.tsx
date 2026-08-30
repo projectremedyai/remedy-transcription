@@ -280,3 +280,159 @@ describe("the engine selector", () => {
         expect(screen.getByText(/uploaded to Google/i)).toBeTruthy();
     });
 });
+
+/**
+ * The engine seam's other half. `hooks/engines/types.ts` declares
+ * `EngineProgress.status` "user-facing and already specific -- shown
+ * verbatim", `useTranscriber` stores it straight onto `status`, and this
+ * component is where it either reaches the screen or does not. It did not:
+ * `getStatusMessage` was a closed `switch` over the backend job statuses with
+ * `default: return ""`, and `progressValue` returned the fraction only for
+ * `downloading`/`extracting`. A Gemini run therefore had NEITHER text nor bar
+ * — the exact opposite of the spec's "behind a determinate progress bar".
+ *
+ * These drive the `transcriber` stub with the strings `geminiEngine.ts`
+ * actually emits, which is the only place the two halves meet.
+ */
+describe("a cloud engine's own progress reaches the screen", () => {
+    it("shows an engine-supplied status verbatim instead of blank text", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+            isBusy: true,
+            status: "Uploading to Google and transcribing (part 2 of 3)...",
+            progress: 1 / 3,
+        });
+
+        expect(
+            screen.getByText(
+                "Uploading to Google and transcribing (part 2 of 3)...",
+            ),
+        ).toBeTruthy();
+    });
+
+    /**
+     * The single-chunk case, which was worse than blank: Gemini used to emit a
+     * bare "transcribing", which MATCHED the local worker's own status and
+     * rendered "Transcribing in your browser..." for a run whose audio was
+     * being uploaded to Google. Wrong on precisely the axis the spec insists
+     * be stated plainly.
+     */
+    it("never claims a cloud run is happening in the browser", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+            isBusy: true,
+            status: "Uploading to Google and transcribing...",
+        });
+
+        expect(screen.queryByText(/in your browser/i)).toBeNull();
+        expect(
+            screen.getByText("Uploading to Google and transcribing..."),
+        ).toBeTruthy();
+    });
+
+    it("drives the progress bar from the engine's fraction", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+            isBusy: true,
+            status: "Uploading to Google and transcribing (part 3 of 5)...",
+            progress: 0.4,
+        });
+
+        expect(
+            (screen.getByTestId("overall-progress") as HTMLElement).style.width,
+        ).toBe("40%");
+    });
+
+    /** The bar has to MOVE, not merely be non-zero once. */
+    it("moves the bar as the engine's fraction advances", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+            isBusy: true,
+            status: "Preparing the audio (part 1 of 5)...",
+            progress: 0,
+        });
+        expect(
+            (screen.getByTestId("overall-progress") as HTMLElement).style.width,
+        ).toBe("0%");
+
+        cleanup();
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+            isBusy: true,
+            status: "Assembling the transcript...",
+            progress: 1,
+        });
+        expect(
+            (screen.getByTestId("overall-progress") as HTMLElement).style.width,
+        ).toBe("100%");
+    });
+
+    /**
+     * The other side of the same join: a kebab-case status this app sets for
+     * itself must still be turned into prose, never echoed raw.
+     */
+    it("still renders this app's own job statuses as prose", async () => {
+        await renderAudioManager({ isBusy: true, status: "extracting" });
+        expect(screen.getByText("Extracting audio...")).toBeTruthy();
+        expect(screen.queryByText("extracting")).toBeNull();
+    });
+
+    it("still says 'in your browser' for the local worker's own status", async () => {
+        await renderAudioManager({
+            engine: "local",
+            isBusy: true,
+            status: "transcribing",
+        });
+        expect(
+            screen.getByText("Transcribing in your browser..."),
+        ).toBeTruthy();
+    });
+});
+
+/**
+ * The YouTube modal's submit is gated on `engineReady` — but the ONLY thing
+ * explaining that gate ("Gemini needs an API key / Add key") lives in the
+ * engine row, which is behind the modal's own overlay. So the user pasted a
+ * valid URL, found "Prepare Audio" inert, and had nothing on screen to read.
+ * Deleting the gate entirely left all 188 tests green, which is what this
+ * test exists to stop happening again; `Transcript.test.tsx` records the last
+ * time a permanently-dead control shipped behind a fully-green headless suite.
+ */
+describe("the YouTube modal says why its submit is dead", () => {
+    function openTheModalWithAValidUrl() {
+        fireEvent.click(screen.getByText("YouTube"));
+        fireEvent.change(screen.getByPlaceholderText("www.example.com"), {
+            target: { value: "https://www.youtube.com/watch?v=abc123" },
+        });
+    }
+
+    it("disables Prepare Audio and states the reason when Gemini has no key", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: false,
+        });
+        openTheModalWithAValidUrl();
+
+        expect(isDisabled(screen.getByText("Prepare Audio"))).toBe(true);
+        // Matched on the part that is unique to the modal: the engine row's
+        // own "Gemini needs an API key" is in the document too, behind the
+        // overlay, which is the whole problem this copy exists to solve.
+        expect(screen.getByText(/behind this dialog/i)).toBeTruthy();
+    });
+
+    it("shows no reason at all once the key is stored", async () => {
+        await renderAudioManager({
+            engine: "gemini",
+            geminiKeyConfigured: true,
+        });
+        openTheModalWithAValidUrl();
+
+        expect(isDisabled(screen.getByText("Prepare Audio"))).toBe(false);
+        expect(screen.queryByText(/behind this dialog/i)).toBeNull();
+    });
+});

@@ -158,21 +158,18 @@ pub struct PersistTranscriptRequest {
     pub segments: Vec<TranscriptionSegment>,
 }
 
+/// Write already-rendered text to a path the user picked.
+///
+/// The frontend still SENDS `job_id` and `format` (see
+/// `api.exportTranscript`), and both are still meaningful to it: the format
+/// picks the generator and the save-dialog filter, both of which run in the
+/// webview. Neither reaches this side of the boundary as anything but noise --
+/// the file name is already chosen and the content is already rendered -- so
+/// they are not declared here. No `deny_unknown_fields`, so serde drops them.
 #[derive(Debug, Deserialize)]
 pub struct ExportRequest {
-    pub job_id: String,
-    pub format: ExportFormat,
     pub destination: String,
     pub content: String,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum ExportFormat {
-    Srt,
-    Vtt,
-    Txt,
-    Json,
 }
 
 #[derive(Debug, Serialize)]

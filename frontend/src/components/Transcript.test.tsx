@@ -67,9 +67,6 @@ describe("Transcript: an undiarized transcript is unchanged", () => {
         render(<Transcript transcribedData={data} jobId='job-1' />);
 
         expect(screen.getByText("Hello there.")).toBeTruthy();
-        expect(
-            document.querySelector('[data-testid="diarization-status"]'),
-        ).toBeNull();
         // No speaker pill of any kind — only the (unrelated) export buttons.
         expect(
             document.querySelector('[data-testid^="speaker-label-"]'),

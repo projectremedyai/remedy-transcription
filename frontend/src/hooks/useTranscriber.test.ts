@@ -927,6 +927,79 @@ describe("useTranscriber under an overlap the worker cannot stop", () => {
         expect(mocks.getAudioUrl).not.toHaveBeenCalled();
         expect(mocks.postMessage).not.toHaveBeenCalled();
     });
+
+    /**
+     * THE WINDOW LEFT OPEN BY MOVING THE FETCH/DECODE INTO THE ENGINE.
+     *
+     * `transcribePreparedJob` used to re-check the run token between decoding
+     * the audio and calling `runWorkerTranscription`. Extracting that step into
+     * `localEngine.run()` (`getAudioUrl` → `fetch` the WAV → decode it) dropped
+     * that check: nothing re-checked the token between the audio's real,
+     * multi-await load finishing and the worker being posted to.
+     *
+     * The failure this opened: cancel a run while its audio is still loading.
+     * `pendingWorkerRef` is still `null` at that moment — nothing has been
+     * posted to the worker yet — so `claimRun`'s abandon branch has nothing to
+     * reject and does not restart the worker (asserted below). Unguarded, the
+     * load then finishes, the dead run resumes: it flips the UI back to
+     * "transcribing" with `isBusy: true` and posts to a worker nobody
+     * restarted — resurrecting a run the user already watched get cancelled,
+     * and (though not exercised by this test, which stops at the post) leaving
+     * the app wedged busy once that worker's never-terminated `complete`
+     * arrives and the persist it would have needed is skipped for a dead run.
+     *
+     * The fix restores the pre-worker guard as the first statement inside
+     * `runWorkerTranscription`'s promise executor, in the hook — not in the
+     * engine, which must not gain run-token knowledge.
+     *
+     * `getAudioUrl` is made to take real time here — a `mockResolvedValue`
+     * settles in a microtask, before any timer can tick, so the window would
+     * never open (the same argument made above for the `createJob` and
+     * `getJob` windows).
+     */
+    it("does not resume a transcription after a cancel lands while the audio is loading", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "ready", progress: 1 }),
+        );
+        // The Tauri round trip for the prepared WAV's URL. In production this
+        // is followed by a `fetch` of the whole file and a `decodeAudioData`;
+        // this one delay is enough to open the window.
+        mocks.getAudioUrl.mockImplementation(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            return "asset://localhost/audio.wav";
+        });
+
+        const { result } = await renderTranscriber();
+
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+        expect(result.current.status).toBe("loading-audio");
+        expect(result.current.isBusy).toBe(true);
+        expect(mocks.postMessage).not.toHaveBeenCalled();
+
+        // The user cancels while the audio is still loading. Nothing has been
+        // posted to the worker, so there is nothing for `claimRun` to abandon —
+        // it must NOT restart the worker, which is exactly the state that
+        // leaves a dead run free to resume if nothing else stops it.
+        await act(async () => {
+            result.current.cancel();
+        });
+        expect(mocks.restartWorker).not.toHaveBeenCalled();
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.status).toBe("idle");
+
+        // The load now finishes. The dead run must not resume into a
+        // transcription: no worker post, and the busy gate/status the cancel
+        // set must still hold rather than flipping back to "transcribing".
+        await tick(1000);
+
+        expect(mocks.postMessage).not.toHaveBeenCalled();
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.status).toBe("idle");
+        expect(result.current.error).toBeNull();
+    });
 });
 
 /**

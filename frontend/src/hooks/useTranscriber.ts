@@ -746,6 +746,27 @@ export function useTranscriber(): Transcriber {
             filename?: string,
         ) =>
             new Promise<WorkerTranscript>((resolve, reject) => {
+                // The base's pre-worker guard, restored here rather than in the
+                // engine. Loading and decoding the audio (a Tauri `invoke`, a
+                // `fetch` of the whole WAV, `decodeAudioData`) is real elapsed
+                // time — seconds on a lecture — and a cancel or a supersede can
+                // land anywhere in it. At the moment it lands, `pendingWorkerRef`
+                // is still `null` (nothing has been posted to the worker yet), so
+                // `claimRun`'s abandon branch has nothing to reject and does
+                // nothing. Without this check, this function would run anyway:
+                // it unconditionally overwrites `pendingWorkerRef`, flips the UI
+                // back to "transcribing" with `isBusy: true`, and posts to a
+                // worker nobody restarted — resurrecting a run the user already
+                // watched get cancelled, and leaving the app wedged busy once
+                // the dead run's `complete` message paints a transcript that
+                // then skips `persistWorkerTranscript` (guarded, further down).
+                if (runIdRef.current !== runId) {
+                    reject(
+                        new Error("Transcription was cancelled or superseded"),
+                    );
+                    return;
+                }
+
                 pendingWorkerRef.current = {
                     runId,
                     resolve,
@@ -1048,13 +1069,24 @@ export function useTranscriber(): Transcriber {
             // one place a cancel is guaranteed to land.
             //
             // What changed: this now awaits `engines[config.engine].run()`, not a
-            // guaranteed-synchronous worker resolve. The LOCAL engine still
-            // resolves that way under the hood, so for it this guard remains as
-            // inert as before. But the GEMINI engine resolves from a Tauri IPC
-            // round trip — a real asynchronous boundary a cancel can land inside
-            // — so for it the token genuinely can move during the `await` above,
-            // and this condition can genuinely be true. The guard that was
-            // deliberately absent here is deliberately present again.
+            // guaranteed-synchronous worker resolve — and that is true for the
+            // LOCAL engine ALREADY, today, not only for a future Gemini engine.
+            // `localEngine.run()` awaits a Tauri `invoke` (`getAudioUrl`), a
+            // `fetch` of the whole WAV and a `decodeAudioData` BEFORE it ever
+            // reaches `runWorkerTranscription` — real task boundaries a cancel
+            // can land inside. The old "provably dead" argument only ever
+            // covered the LAST link of that chain (the worker's synchronous
+            // message-handler resolve); it never covered the links in front of
+            // it, and extracting them into the engine's `run()` is what makes
+            // the token able to move during the `await` above. This condition
+            // can genuinely be true, right now, for the local engine — which is
+            // also why `runWorkerTranscription` now re-checks the same token as
+            // its own first statement, before it touches `pendingWorkerRef` or
+            // posts anything: a cancel landing INSIDE `loadPreparedAudio` reaches
+            // that check with nothing yet posted, so nothing there would
+            // otherwise stop it. The guard that was deliberately absent here is
+            // deliberately present again — for the same reason a second one was
+            // added at the worker post.
             if (runIdRef.current !== runId) {
                 return;
             }

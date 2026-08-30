@@ -46,10 +46,16 @@ export interface EngineRunArgs {
     runId: number;
     onProgress: (progress: EngineProgress) => void;
     /**
-     * Live preview. The LOCAL engine calls this on every worker `update`. The
-     * GEMINI engine NEVER calls it — the Interactions request is one opaque
-     * round trip with no token stream — which is what
-     * `EngineDescriptor.supportsLivePreview` tells the UI in advance.
+     * Live preview, for an engine that streams outside the hook's own worker
+     * message handler. NEITHER engine calls this today: the LOCAL engine
+     * leaves partials entirely to the hook's existing `useWorker` handler,
+     * which already paints them straight from the worker's `update` messages
+     * (see `useTranscriber.ts`), so `localEngine.ts` never references
+     * `onPartial` at all. The GEMINI engine will not call it either — the
+     * Interactions request is one opaque round trip with no token stream,
+     * which is what `EngineDescriptor.supportsLivePreview` tells the UI in
+     * advance. So this callback has no caller yet; it exists for a future
+     * engine that streams over a channel the hook does not already own.
      */
     onPartial: (transcript: WorkerTranscript) => void;
 }

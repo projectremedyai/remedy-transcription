@@ -12,6 +12,9 @@ use tokio::sync::oneshot::error::TryRecvError;
 
 use crate::events::HealthStatus;
 use crate::gemini::chunking::ChunkSpec;
+// Module scope now that `run_chunk_plan` lives out here, not only inside
+// `transcribe_with_gemini`.
+use crate::gemini::{chunking, transcript};
 use crate::sidecar::spawn_sidecar;
 use crate::store::{Job, JobStatus, JobUpdate, SourceType, TaskType, TranscriptionSegment};
 use crate::AppState;
@@ -1447,6 +1450,185 @@ pub fn gemini_key_status() -> bool {
     crate::gemini::credentials::is_configured()
 }
 
+/// Where a chunk's words come from, and whether the run is still wanted.
+///
+/// A trait rather than a pair of closures because both answers need the SAME
+/// cancel receiver -- `transcribe_chunk` selects on it mid-request while the
+/// loop checks it between chunks -- and two closures cannot share one `&mut`.
+/// Implementing it is what lets `run_chunk_plan` be driven with no ffmpeg, no
+/// network and no Tauri.
+///
+/// Boxed and `Send` rather than `async fn`: this runs inside a `#[tauri::command]`
+/// future, which must be `Send`, and `async fn` in a trait promises no such bound.
+trait ChunkSource {
+    /// True once the run has been cancelled.
+    fn cancelled(&mut self) -> bool;
+
+    /// Buy one chunk. Times come back CHUNK-RELATIVE; the caller rebases them.
+    fn fetch<'a>(
+        &'a mut self,
+        spec: &'a chunking::ChunkSpec,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<transcript::Word>, String>> + Send + 'a>,
+    >;
+}
+
+/// Walk the chunk plan: reuse what has already been paid for, buy the rest, and
+/// bank each one as it lands.
+///
+/// Free of Tauri by construction, and that is the point. `transcribe_with_gemini`
+/// takes an `AppHandle` and a `State`, so every line that lived in its loop was
+/// unreachable from a test -- `resolve_resume` and the store methods were both
+/// covered while the join between them had never been exercised at all. Slicing
+/// and progress events stay on the far side of `ChunkSource`; everything that
+/// decides what to spend money on is here. See `gemini_resume_tests`.
+async fn run_chunk_plan(
+    specs: &[chunking::ChunkSpec],
+    store: &crate::store::Store,
+    job_id: &str,
+    source: &mut impl ChunkSource,
+    on_reused: impl Fn(&chunking::ChunkSpec),
+) -> Result<Vec<transcript::Word>, String> {
+    // What this audio has already been billed for.
+    //
+    // MULTI-chunk runs only, and that restriction does two jobs at once. A
+    // single-chunk run has no partial progress worth saving -- the one chunk IS
+    // the run, so there is never a surviving prefix to resume from. It is also
+    // the only shape that asks for diarization, and speaker ids do not survive
+    // the round trip (see `transcript::Word`). Confining the cache to more than
+    // one chunk keeps those two facts from ever meeting: no cached row can be
+    // reused by a run that wanted speaker labels, because such a run is never
+    // cached in the first place.
+    let source_id = if specs.len() > 1 {
+        store.source_id_for_job(job_id).ok().flatten()
+    } else {
+        None
+    };
+    let cached: Vec<crate::store::StoredChunk> = source_id
+        .and_then(|id| store.chunk_results(id, crate::gemini::MODEL_ID).ok())
+        .unwrap_or_default();
+    let resume = chunking::resolve_resume(
+        specs,
+        &cached
+            .iter()
+            .map(|row| chunking::CachedBounds {
+                index: row.index,
+                start_secs: row.start_secs,
+                end_secs: row.end_secs,
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let mut all_words: Vec<transcript::Word> = Vec::new();
+
+    for (position, spec) in specs.iter().enumerate() {
+        // Checked before the chunk is bought as well as inside
+        // `transcribe_chunk`, so a cancel between chunks does not first spend an
+        // ffmpeg pass.
+        if source.cancelled() {
+            return Err("cancelled".into());
+        }
+
+        // Already bought. Skip the request AND the ffmpeg slice: the slice is
+        // the cheaper half, but a resumed run should cost nothing at all for
+        // what it already holds. `on_reused` still fires so the UI advances
+        // through the chunks it is skipping rather than appearing to hang.
+        if let Some(hit) = resume[position].and_then(|index| cached.get(index)) {
+            if let Ok(words) = serde_json::from_str::<Vec<transcript::Word>>(&hit.words_json) {
+                on_reused(spec);
+                all_words.extend(words);
+                continue;
+            }
+            // A row that will not parse is a row not to trust. Falling through
+            // re-buys it: that costs money but cannot be WRONG, whereas
+            // believing a half-read chunk could silently corrupt the seam.
+        }
+
+        let mut words = source.fetch(spec).await?;
+        transcript::shift(&mut words, spec.start_secs);
+
+        // THE LINE THIS FEATURE IS. Bank the chunk before the next one is
+        // attempted, so everything earlier in the run survives whatever happens
+        // after it -- a failure, a crash, a cancel, or the app being closed.
+        //
+        // Stored with times ALREADY SHIFTED, which makes a reuse a plain
+        // `extend` with no second shift to get wrong. Sound because a row is
+        // reused only when its boundaries match the fresh plan to within a
+        // millisecond.
+        //
+        // Best-effort: a store that will not write is not a reason to fail a run
+        // whose words are in hand. The cost of losing this row is paying for the
+        // chunk again later, not a wrong answer.
+        if let Some(id) = source_id {
+            if let Ok(json) = serde_json::to_string(&words) {
+                let _ = store.save_chunk_result(
+                    id,
+                    crate::gemini::MODEL_ID,
+                    spec.index,
+                    spec.start_secs,
+                    spec.end_secs,
+                    &json,
+                );
+            }
+        }
+
+        all_words.extend(words);
+    }
+
+    Ok(all_words)
+}
+
+/// The real `ChunkSource`: ffmpeg cuts it, Gemini transcribes it.
+struct GeminiChunks<'a> {
+    app: &'a AppHandle,
+    wav_path: &'a Path,
+    client: &'a crate::gemini::client::GeminiClient,
+    job_id: &'a str,
+    chunk_count: usize,
+    diarize: bool,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl ChunkSource for GeminiChunks<'_> {
+    fn cancelled(&mut self) -> bool {
+        // Anything but `Empty` ends the run, including a dropped sender -- see
+        // `transcribe_chunk`, which must never poll a receiver `try_recv` has
+        // already emptied.
+        !matches!(self.cancel.try_recv(), Err(TryRecvError::Empty))
+    }
+
+    fn fetch<'a>(
+        &'a mut self,
+        spec: &'a chunking::ChunkSpec,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<transcript::Word>, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            emit_gemini_progress(self.app, self.job_id, "slicing", spec.index, self.chunk_count);
+            let chunk_path = slice_chunk(self.app, self.wav_path, spec, self.job_id).await?;
+
+            emit_gemini_progress(
+                self.app,
+                self.job_id,
+                "transcribing",
+                spec.index,
+                self.chunk_count,
+            );
+            let words = crate::gemini::transcribe_chunk(
+                self.client,
+                &chunk_path,
+                &format!("{}-{}", self.job_id, spec.index),
+                self.diarize,
+                &mut self.cancel,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = tokio::fs::remove_file(&chunk_path).await;
+            words
+        })
+    }
+}
+
 /// What a Gemini run on this job would cost, before anything is spent.
 ///
 /// Same probe and same `chunking::plan` the run itself uses, so the chunk count
@@ -1495,7 +1677,7 @@ pub async fn transcribe_with_gemini(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<crate::gemini::GeminiTranscriptionResult, String> {
-    use crate::gemini::{chunking, transcript, Speakers};
+    use crate::gemini::Speakers;
 
     let api_key = crate::gemini::credentials::load().map_err(|e| e.to_string())?;
     let wav_path = prepared_audio_for_job(&job_id, &state, &app)?;
@@ -1524,7 +1706,7 @@ pub async fn transcribe_with_gemini(
         }
     }
 
-    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     {
         // ONE run per job id, decided under a single lock.
         //
@@ -1547,131 +1729,28 @@ pub async fn transcribe_with_gemini(
     // person as spk_1 in chunk 1, and there is no honest way to bridge that.
     let diarize = specs.len() == 1;
     let chunk_count = specs.len();
-    let mut all_words: Vec<transcript::Word> = Vec::new();
-    let mut run_error: Option<String> = None;
-
-    // What this audio has already been billed for.
-    //
-    // MULTI-chunk runs only, and that restriction does two jobs at once. A
-    // single-chunk run has no partial progress worth saving -- the one chunk IS
-    // the run, so there is never a surviving prefix to resume from. It is also
-    // the only shape that asks for diarization, and speaker ids do not survive
-    // the round trip (see `transcript::Word`). Confining the cache to
-    // `chunk_count > 1` keeps those two facts from ever meeting: no cached row
-    // can be reused by a run that wanted speaker labels, because such a run is
-    // never cached in the first place.
-    let source_id = if chunk_count > 1 {
-        state.store.source_id_for_job(&job_id).ok().flatten()
-    } else {
-        None
+    // The chunk loop lives in `run_chunk_plan`, which is Tauri-free and
+    // therefore testable. Everything that needs an `AppHandle` sits behind
+    // `ChunkSource`. See `gemini_resume_tests`.
+    let mut chunks = GeminiChunks {
+        app: &app,
+        wav_path: &wav_path,
+        client: &client,
+        job_id: &job_id,
+        chunk_count,
+        diarize,
+        cancel: cancel_rx,
     };
-    let cached: Vec<crate::store::StoredChunk> = source_id
-        .and_then(|id| state.store.chunk_results(id, crate::gemini::MODEL_ID).ok())
-        .unwrap_or_default();
-    let resume = chunking::resolve_resume(
-        &specs,
-        &cached
-            .iter()
-            .map(|row| chunking::CachedBounds {
-                index: row.index,
-                start_secs: row.start_secs,
-                end_secs: row.end_secs,
-            })
-            .collect::<Vec<_>>(),
-    );
+    let outcome = run_chunk_plan(&specs, &state.store, &job_id, &mut chunks, |spec| {
+        emit_gemini_progress(&app, &job_id, "transcribing", spec.index, chunk_count)
+    })
+    .await;
 
-    for (position, spec) in specs.iter().enumerate() {
-        // Checked before slicing as well as inside `transcribe_chunk`, so a
-        // cancel between chunks does not first spend an ffmpeg pass. Anything
-        // but `Empty` ends the run -- see `transcribe_chunk`, which must never
-        // poll a receiver `try_recv` has already emptied.
-        if !matches!(cancel_rx.try_recv(), Err(TryRecvError::Empty)) {
-            run_error = Some("cancelled".into());
-            break;
-        }
-
-        // Already bought. Skip the request AND the ffmpeg slice: the slice is
-        // the cheaper half, but a resumed run should cost nothing at all for
-        // what it already holds. Progress is still emitted so the UI advances
-        // through the chunks it is skipping rather than appearing to hang.
-        if let Some(hit) = resume[position].and_then(|index| cached.get(index)) {
-            if let Ok(words) = serde_json::from_str::<Vec<transcript::Word>>(&hit.words_json) {
-                emit_gemini_progress(&app, &job_id, "transcribing", spec.index, chunk_count);
-                all_words.extend(words);
-                continue;
-            }
-            // A row that will not parse is a row not to trust. Falling through
-            // re-transcribes it: that costs money but cannot be WRONG, whereas
-            // believing a half-read chunk could silently corrupt the seam.
-        }
-
-        emit_gemini_progress(&app, &job_id, "slicing", spec.index, chunk_count);
-        let chunk_path = match slice_chunk(&app, &wav_path, spec, &job_id).await {
-            Ok(path) => path,
-            Err(e) => {
-                run_error = Some(e);
-                break;
-            }
-        };
-
-        emit_gemini_progress(&app, &job_id, "transcribing", spec.index, chunk_count);
-        let outcome = crate::gemini::transcribe_chunk(
-            &client,
-            &chunk_path,
-            &format!("{job_id}-{}", spec.index),
-            diarize,
-            &mut cancel_rx,
-        )
-        .await
-        .map_err(|e| e.to_string());
-        let _ = tokio::fs::remove_file(&chunk_path).await;
-
-        match outcome {
-            Ok(mut words) => {
-                transcript::shift(&mut words, spec.start_secs);
-
-                // THE LINE THIS FEATURE IS. Bank the chunk before the next one
-                // is attempted, so everything earlier in the run survives
-                // whatever happens later -- a failure, a crash, a cancel, or
-                // the app being closed.
-                //
-                // Stored with times ALREADY SHIFTED, which makes a reuse a
-                // plain `extend` with no second shift to get wrong. Sound
-                // because a row is reused only when its boundaries match the
-                // fresh plan to within a millisecond.
-                //
-                // Best-effort: a store that will not write is not a reason to
-                // fail a run whose words are in hand. The cost of losing this
-                // row is paying for the chunk again later, not a wrong answer.
-                if let Some(id) = source_id {
-                    if let Ok(json) = serde_json::to_string(&words) {
-                        let _ = state.store.save_chunk_result(
-                            id,
-                            crate::gemini::MODEL_ID,
-                            spec.index,
-                            spec.start_secs,
-                            spec.end_secs,
-                            &json,
-                        );
-                    }
-                }
-
-                all_words.extend(words);
-            }
-            Err(e) => {
-                run_error = Some(e);
-                break;
-            }
-        }
-    }
-
-    // Deregistered on EVERY exit from the loop -- success, failure and cancel.
-    // A leaked entry means a later cancel targets a run that is already gone.
+    // Deregistered on EVERY exit -- success, failure and cancel. A leaked entry
+    // means a later cancel targets a run that is already gone.
     state.gemini_runs.lock().unwrap().remove(&job_id);
 
-    if let Some(error) = run_error {
-        return Err(error);
-    }
+    let all_words = outcome?;
 
     emit_gemini_progress(&app, &job_id, "stitching", chunk_count, chunk_count);
 
@@ -2166,5 +2245,313 @@ mod gemini_ffmpeg_tests {
     fn silencedetect_writes_no_output_file() {
         let args = ffmpeg_silencedetect_args("/in.wav");
         assert!(args.windows(2).any(|w| w == ["-f", "null"]));
+    }
+}
+
+/// The resume WIRING, which `transcribe_with_gemini` cannot be tested through:
+/// it needs an `AppHandle` and a `State`, and only two things in its chunk loop
+/// actually need Tauri. Everything below is driven with a REAL `Store` and a
+/// fake chunk fetcher — real persistence, real resume decisions, no ffmpeg, no
+/// network, no Tauri.
+///
+/// What this covers is the join, not the parts. `resolve_resume` is unit-tested
+/// in `chunking`, the store methods in `store`, and both were green while the
+/// loop that uses them had never been exercised at all.
+#[cfg(test)]
+mod gemini_resume_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempStore {
+        store: crate::store::Store,
+        path: PathBuf,
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// A store holding one source and one Gemini job against it — the shape
+    /// `source_id_for_job` has to resolve for any of this to engage.
+    fn store_with_job() -> (TempStore, String, i64) {
+        let path = std::env::temp_dir().join(format!(
+            "remedy-resume-{}-{}.sqlite",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = crate::store::Store::open(&path).expect("open a fresh store");
+        let source = store
+            .get_or_create_source(SourceType::File, "sha256", None, Some("talk.mp4"), None)
+            .expect("create source");
+        let job = store
+            .create_pending_job(
+                source.id,
+                SourceType::File,
+                "sha256",
+                JobStatus::Ready,
+                Some("talk.mp4"),
+                None,
+                crate::gemini::MODEL_ID,
+                TaskType::Transcribe,
+                "english",
+            )
+            .expect("create job");
+        let source_id = source.id;
+        (TempStore { store, path }, job.id, source_id)
+    }
+
+    fn word(text: &str, start: f64) -> transcript::Word {
+        transcript::Word {
+            text: text.to_string(),
+            start,
+            end: start + 1.0,
+            speaker: None,
+        }
+    }
+
+    /// A `ChunkSource` that buys nothing, records what it was asked for, and can
+    /// be told to fail on one chunk or to report the run cancelled.
+    struct FakeChunks {
+        fetched: Arc<Mutex<Vec<usize>>>,
+        fail_at: Option<usize>,
+        cancelled: bool,
+        /// Chunk-RELATIVE, as a real chunk's words are before rebasing.
+        local_start: f64,
+    }
+
+    impl FakeChunks {
+        fn new() -> Self {
+            Self {
+                fetched: Arc::new(Mutex::new(Vec::new())),
+                fail_at: None,
+                cancelled: false,
+                local_start: 0.0,
+            }
+        }
+        fn bought(&self) -> Vec<usize> {
+            self.fetched.lock().unwrap().clone()
+        }
+    }
+
+    impl ChunkSource for FakeChunks {
+        fn cancelled(&mut self) -> bool {
+            self.cancelled
+        }
+
+        fn fetch<'a>(
+            &'a mut self,
+            spec: &'a chunking::ChunkSpec,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<transcript::Word>, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.fetched.lock().unwrap().push(spec.index);
+                if self.fail_at == Some(spec.index) {
+                    Err("Gemini is overloaded. Please try again later.".to_string())
+                } else {
+                    Ok(vec![word("bought", self.local_start)])
+                }
+            })
+        }
+    }
+
+    /// 3000s splits into two 1500s chunks — the smallest plan that can resume.
+    fn two_chunks() -> Vec<chunking::ChunkSpec> {
+        let specs = chunking::plan(3000.0);
+        assert_eq!(specs.len(), 2, "this suite needs a two-chunk plan");
+        specs
+    }
+
+    fn bank(store: &crate::store::Store, source_id: i64, spec: &chunking::ChunkSpec, json: &str) {
+        store
+            .save_chunk_result(
+                source_id,
+                crate::gemini::MODEL_ID,
+                spec.index,
+                spec.start_secs,
+                spec.end_secs,
+                json,
+            )
+            .expect("bank a chunk");
+    }
+
+    /// THE POINT OF THE WHOLE FEATURE: a chunk already paid for is not paid for
+    /// again. `resolve_resume` deciding so is not the same as the loop acting on
+    /// it, and only the loop spends money.
+    #[tokio::test]
+    async fn a_cached_chunk_is_never_bought_again() {
+        let (temp, job_id, source_id) = store_with_job();
+        let specs = two_chunks();
+        bank(
+            &temp.store,
+            source_id,
+            &specs[0],
+            &serde_json::to_string(&vec![word("cached", 12.0)]).unwrap(),
+        );
+
+        let mut source = FakeChunks::new();
+        let out = run_chunk_plan(&specs, &temp.store, &job_id, &mut source, |_| {})
+            .await
+            .expect("the run completes");
+
+        assert_eq!(source.bought(), vec![1], "chunk 0 was bought twice");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "cached");
+    }
+
+    /// Banking has to happen as each chunk lands, not after the loop. If it
+    /// waited for the end, a run that failed on the last chunk would save
+    /// nothing — which is precisely the run this feature exists for.
+    #[tokio::test]
+    async fn a_chunk_is_banked_before_the_next_one_is_attempted() {
+        let (temp, job_id, source_id) = store_with_job();
+        let specs = two_chunks();
+
+        let mut source = FakeChunks::new();
+        source.fail_at = Some(1);
+        let outcome = run_chunk_plan(&specs, &temp.store, &job_id, &mut source, |_| {}).await;
+
+        assert!(outcome.is_err(), "a failed chunk must fail the run");
+        let kept = temp
+            .store
+            .chunk_results(source_id, crate::gemini::MODEL_ID)
+            .expect("read back");
+        assert_eq!(kept.len(), 1, "the paid-for chunk was thrown away");
+        assert_eq!(kept[0].index, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_returns_its_own_error() {
+        let (temp, job_id, _) = store_with_job();
+        let specs = two_chunks();
+
+        let mut source = FakeChunks::new();
+        source.fail_at = Some(0);
+        let outcome = run_chunk_plan(&specs, &temp.store, &job_id, &mut source, |_| {}).await;
+
+        assert_eq!(
+            outcome.unwrap_err(),
+            "Gemini is overloaded. Please try again later."
+        );
+    }
+
+    /// A row that will not parse must be re-bought, not trusted and not fatal.
+    /// Paying twice is a cost; splicing half-read words into a transcript that
+    /// then reports success is a corruption.
+    #[tokio::test]
+    async fn an_unreadable_cached_row_is_refetched() {
+        let (temp, job_id, source_id) = store_with_job();
+        let specs = two_chunks();
+        bank(&temp.store, source_id, &specs[0], "{ this is not a word list");
+
+        let mut source = FakeChunks::new();
+        let out = run_chunk_plan(&specs, &temp.store, &job_id, &mut source, |_| {})
+            .await
+            .expect("the run completes");
+
+        assert_eq!(source.bought(), vec![0, 1]);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Cancel is checked BEFORE the chunk is bought, so a cancel that lands
+    /// between chunks costs nothing at all.
+    #[tokio::test]
+    async fn a_cancel_between_chunks_buys_nothing() {
+        let (temp, job_id, _) = store_with_job();
+        let specs = two_chunks();
+
+        let mut source = FakeChunks::new();
+        source.cancelled = true;
+        let outcome = run_chunk_plan(&specs, &temp.store, &job_id, &mut source, |_| {}).await;
+
+        assert_eq!(outcome.unwrap_err(), "cancelled");
+        assert!(source.bought().is_empty(), "a cancelled run still spent money");
+    }
+
+    /// Word order IS the transcript. A fetched chunk's times are chunk-relative
+    /// and must be rebased; a cached one is stored already rebased and must NOT
+    /// be shifted twice.
+    #[tokio::test]
+    async fn fetched_words_are_rebased_and_cached_words_are_not_shifted_twice() {
+        let (temp, job_id, source_id) = store_with_job();
+        let specs = two_chunks();
+        bank(
+            &temp.store,
+            source_id,
+            &specs[0],
+            &serde_json::to_string(&vec![word("cached", 7.0)]).unwrap(),
+        );
+
+        let mut source = FakeChunks::new();
+        source.local_start = 3.0;
+        let out = run_chunk_plan(&specs, &temp.store, &job_id, &mut source, |_| {})
+            .await
+            .expect("the run completes");
+
+        assert_eq!(out[0].start, 7.0, "a cached chunk was shifted a second time");
+        assert_eq!(
+            out[1].start,
+            specs[1].start_secs + 3.0,
+            "a fetched chunk was not rebased into whole-file time"
+        );
+    }
+
+    /// The soundness gate, not a space optimisation. `diarize` is true only for
+    /// a single chunk, and `Word.speaker` is `#[serde(skip)]` — so a cached
+    /// single-chunk row would come back with its speakers silently erased.
+    /// Never writing one is what makes that unreachable.
+    #[tokio::test]
+    async fn a_single_chunk_run_banks_nothing() {
+        let (temp, job_id, source_id) = store_with_job();
+        let specs = chunking::plan(600.0);
+        assert_eq!(specs.len(), 1);
+
+        let mut source = FakeChunks::new();
+        run_chunk_plan(&specs, &temp.store, &job_id, &mut source, |_| {})
+            .await
+            .expect("the run completes");
+
+        assert!(
+            temp.store
+                .chunk_results(source_id, crate::gemini::MODEL_ID)
+                .expect("read back")
+                .is_empty(),
+            "a single-chunk run cached a row whose speakers cannot survive"
+        );
+    }
+
+    /// The UI must still advance through chunks it is skipping, or a resumed run
+    /// looks like a hung one.
+    #[tokio::test]
+    async fn a_reused_chunk_still_reports_progress() {
+        let (temp, job_id, source_id) = store_with_job();
+        let specs = two_chunks();
+        bank(
+            &temp.store,
+            source_id,
+            &specs[0],
+            &serde_json::to_string(&vec![word("cached", 0.0)]).unwrap(),
+        );
+
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reported);
+        let mut source = FakeChunks::new();
+        run_chunk_plan(&specs, &temp.store, &job_id, &mut source, move |spec| {
+            seen.lock().unwrap().push(spec.index)
+        })
+        .await
+        .expect("the run completes");
+
+        assert_eq!(*reported.lock().unwrap(), vec![0]);
     }
 }

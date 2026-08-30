@@ -1340,6 +1340,23 @@ pub async fn export_transcript(request: ExportRequest) -> Result<(), String> {
     std::fs::write(&request.destination, request.content.as_bytes()).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn set_gemini_key(key: String) -> Result<(), String> {
+    crate::gemini::credentials::save(&key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_gemini_key() -> Result<(), String> {
+    crate::gemini::credentials::clear().map_err(|e| e.to_string())
+}
+
+/// Whether a key is stored. Deliberately a bool and not the key: nothing
+/// returns the key to the webview.
+#[tauri::command]
+pub fn gemini_key_status() -> bool {
+    crate::gemini::credentials::is_configured()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -35,6 +35,18 @@ chrono = { version = "0.4", features = ["serde"] }
 [dev-dependencies]
 tempfile = "3"
 
+# keyring 3 has no default backend; each platform selects its own. macOS
+# Keychain, Windows Credential Manager, Linux Secret Service (the sync variant,
+# because these calls happen on Tauri's blocking command threads).
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

@@ -4,6 +4,7 @@ use tauri::Manager;
 
 mod commands;
 mod events;
+mod gemini;
 mod paths;
 mod sidecar;
 mod store;
@@ -55,6 +56,9 @@ pub fn run() {
             commands::export_transcript,
             commands::set_speaker_name,
             commands::get_speaker_names,
+            commands::set_gemini_key,
+            commands::clear_gemini_key,
+            commands::gemini_key_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

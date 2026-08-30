@@ -47,12 +47,8 @@
     "externalBin": [
       "binaries/yt-dlp",
       "binaries/ffmpeg",
-      "binaries/ffprobe",
-      "binaries/diarize-sidecar"
+      "binaries/ffprobe"
     ],
-    "resources": {
-      "../models/diarization": "models/diarization"
-    },
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": "Developer ID Application: Quang Phung (7XU3QW326W)",

@@ -25,56 +25,21 @@ Why "local-first": YouTube blocks data-center IPs, so a self-hosted (VPS) versio
 ## Run from source
 
 ```bash
-# 1. Fetch the downloaded sidecars (yt-dlp / ffmpeg / ffprobe) into
-#    src-tauri/binaries/, plus the speaker-diarization models into models/.
+# 1. Fetch the yt-dlp / ffmpeg / ffprobe sidecars into src-tauri/binaries/.
 ./scripts/fetch-sidecars.sh
 
-# 2. Compile the diarization sidecar into src-tauri/binaries/.
-#    This one is ours, so it is compiled rather than downloaded.
-./scripts/build-diarize-sidecar.sh
-
-# 3. Install root and frontend JS deps from lockfiles.
+# 2. Install root and frontend JS deps from lockfiles.
 npm ci
 npm --prefix frontend ci
 
-# 4. Run the dev build (Vite + Tauri, hot reload).
+# 3. Run the dev build (Vite + Tauri, hot reload).
 npm run dev
 ```
-
-> **Step 2 is not optional, and it must come before any `cargo` command.**
-> `diarize-sidecar` is registered as a Tauri `externalBin`, and `tauri-build`
-> checks that every `externalBin` exists — so if it is missing, even a bare
-> `cargo check` fails, with an opaque error that never mentions diarization:
->
-> ```
-> error: failed to run custom build command for `remedy-transcription`
-> ```
->
-> If you see that, you skipped step 2.
->
-> **The models in step 1 are different: they are optional to BUILD, required to
-> get speaker labels.** `tauri-build` validates configured `bundle.resources` the
-> same way it validates `externalBin`, so listing the two `.onnx` files there
-> would make `cargo check` fail on any checkout without them — including CI, and
-> including a fresh clone. Instead the bundle takes the whole
-> `models/diarization` **directory**, and `src-tauri/build.rs` creates it if it is
-> absent. A build with no models therefore compiles, runs, and prints:
->
-> ```
-> warning: speaker diarization models are missing (...). This build compiles and
-> runs, but diarization will report itself DEGRADED and produce no speaker labels.
-> Fix with: ./scripts/fetch-sidecars.sh --models-only
-> ```
->
-> which is exactly what the app then does at runtime — `diarize_job` returns
-> `Degraded` and the transcript is untouched. That degradation is a real, reachable
-> path, not a theoretical one.
 
 ## Build an installer
 
 ```bash
 ./scripts/fetch-sidecars.sh
-./scripts/build-diarize-sidecar.sh
 npm ci
 npm --prefix frontend ci
 npm run build
@@ -93,27 +58,11 @@ npm run frontend:build
 npm --prefix frontend run lint
 npm --prefix frontend test
 
-# --skip-models: the diarization models are 34 MiB and only the #[ignore]d
-# real-model tests touch them, so CI would be downloading them for nothing.
-# This is safe ONLY because a missing models/ directory is a warning, not a
-# build failure — see build.rs. It did not used to be.
-./scripts/fetch-sidecars.sh --skip-models
+./scripts/fetch-sidecars.sh
 
-# --debug: CI never bundles, so it only needs the binary to exist (for
-# tauri-build) and to be spawnable (for the crash-isolation tests).
-./scripts/build-diarize-sidecar.sh --debug
-
-cargo check --workspace --manifest-path src-tauri/Cargo.toml
-cargo test  --workspace --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test  --manifest-path src-tauri/Cargo.toml
 ```
-
-Both sidecar steps run in CI, not only during release packaging, because Tauri validates the configured `externalBin` entries during `cargo check` and `cargo test` — a missing sidecar fails the build before a single test runs.
-
-The models are the one bundled asset that `cargo check` tolerates being absent, and that is a deliberate, load-bearing exception rather than an accident: `build.rs` creates an empty `models/diarization` so `tauri-build` has a resource path to walk. If you ever move the models back to a per-file `bundle.resources` map (or a glob — an empty glob is a `GlobPathNotFound` error), CI breaks on a fresh clone and so does every `cargo check` without a 34 MiB download.
-
-`--workspace` matters: `diarize-sidecar` is a separate workspace member, and the app's crash-isolation tests spawn the real binary. Without it, those tests have nothing to point at.
-
-Release jobs must run `./scripts/fetch-sidecars.sh` **without** `--skip-models`: an installer built without them is a signed app with no speaker labels, and it will not tell you so at build time — only at runtime, as a degradation. Windows ffmpeg/ffprobe setup remains manual, as the script notes.
 
 ## Where your data lives
 
@@ -149,103 +98,9 @@ React webview ←─Tauri IPC─→ Rust core ──spawn──> yt-dlp + ffmpeg
 |------|------|
 | `frontend/src/` | React app, services, worker, caption formatter, SRT generator |
 | `src-tauri/src/` | Rust commands, SQLite store, sidecar wrappers, event emitter |
-| `src-tauri/diarize-sidecar/` | Speaker diarization (sherpa-onnx). A separate binary on purpose — see below |
-| `src-tauri/binaries/` | Bundled `yt-dlp` / `ffmpeg` / `ffprobe` / `diarize-sidecar` per target triple |
-| `models/diarization/` | Diarization ONNX models — fetched by script, never committed |
+| `src-tauri/binaries/` | Bundled `yt-dlp` / `ffmpeg` / `ffprobe` per target triple |
 | `src-tauri/icons/` | Generated app icons |
 | `src-tauri/tauri.conf.json` | Bundle config, sidecar registration, permissions |
-
-Diarization runs in its own process because ONNX Runtime does not report a corrupt or truncated model as an error — it throws a C++ exception that nothing catches, and the C++ runtime aborts the process (`SIGABRT`). In-process, one bad byte in a model file would take transcription down with it. Out of process, it is a dead child and an error, and the transcript simply arrives without speaker labels.
-
-### Shipped-size cost of speaker diarization
-
-Because sherpa-onnx / ONNX Runtime is linked only into `diarize-sidecar`, not
-into the main app, the main app binary carries none of the cost. Measured on a
-release build, macOS arm64, 2026-07-14 (`lto = true`, `opt-level = "s"`,
-`strip = true`):
-
-| Artifact | Bytes | |
-|---|---|---|
-| `remedy-transcription` (main app) | 6,920,256 | unchanged by diarization — `strings … \| grep -ci onnxruntime` = 0, `cargo tree -p remedy-transcription \| grep sherpa` = nothing |
-| `diarize-sidecar` | 16,333,600 | ~15.6 MiB — links ONNX Runtime (`grep -ci onnxruntime` = 2004) |
-| `sherpa-onnx-pyannote-segmentation-3-0/model.onnx` | 5,992,913 | ~5.7 MiB, bundled as a Tauri resource |
-| `wespeaker_en_voxceleb_CAM++.onnx` | 29,292,684 | ~27.9 MiB, bundled as a Tauri resource |
-| **Total added to the shipped installer** | **51,619,197** | **≈ +49 MiB (+52 MB)** — sidecar binary + both models; not committed to the repo, but present in every built `.app`/`.msi` |
-
-Both models are bundled into the app as Tauri `resources` (a whole-directory
-resource, not a hand-picked file list — see `src-tauri/build.rs`), so they ship
-inside the installer even though `models/diarization/` is gitignored and never
-committed. `./scripts/fetch-sidecars.sh --models-only` re-fetches them from
-sherpa-onnx's own GitHub releases.
-
-### Speaker identification is disabled in this release (1.1.0)
-
-Speaker identification ("Identify speakers") ships **disabled** in 1.1.0 —
-the toggle, the speaker-count input, and the status banner are all hidden
-behind a feature flag (`DIARIZATION_UI_ENABLED` in
-`frontend/src/config/features.ts`), currently `false`.
-
-The reason is accuracy, not stability: further real-content testing, this
-time in the engine's own *count-required* mode — the one meant to be the
-reliable path, a speaker count supplied up front, no auto-detect guessing —
-still failed badly. A single-narrator documentary (music under narration,
-told there was exactly 1 speaker) came back with **4 distinct speaker
-labels**, flipping between them **19 times over a 10-minute sample**. That is
-consistent with the accuracy findings below (sherpa-onnx's speaker embeddings
-not holding up against real-world audio conditions), not a bug in this app's
-plumbing — there is no UI fix for an engine that can't tell one voice from
-itself under music. See the smoke-test findings below for the fuller picture,
-including the earlier 52-phantom-speaker auto-detect result that first made
-this experimental.
-
-**Nothing has been removed.** The diarization backend (sherpa-onnx sidecar),
-the `useTranscriber` hook's diarization wiring, speaker-alignment, rename, and
-export/persistence of `speaker` fields are all intact, tested, and green —
-see `cargo test --workspace` and the frontend test suite, including tests
-that mock the flag back to `true` to keep that plumbing exercised. Segments
-already carrying a persisted `speaker` field (from before this release, or
-from data migrated in) still render their speaker pills and support renaming
-in the transcript view; only the controls that would *start* a new diarized
-run are hidden. Flip `DIARIZATION_UI_ENABLED` to `true` to restore the UI once
-the engine (or a swappable one) clears this bar.
-
-Set expectations accordingly, for whenever the UI is re-enabled: this works
-best on **shorter recordings** (a few minutes, not hours) with a **small
-number of clear, distinct voices** and little overlap. Long recordings,
-background music, and crosstalk confuse it. Treat speaker labels as a
-best-effort aid to skim a transcript by, not as a verified record of who said
-what — spot-check against the audio before relying on it for anything.
-
-### Accuracy — smoke-tested, not benchmarked (why the UI is disabled)
-
-sherpa-onnx's ONNX port of pyannote/WeSpeaker is a different implementation
-from the upstream Python pipeline, and upstream issue #1708 reports it can
-diverge from it; nothing here quantifies that gap into a DER (diarization
-error rate) number, and the following is **not** a DER benchmark.
-
-What has been checked: the sidecar correctly finds 2 speakers with turn
-boundaries within ~50 ms of ground truth on 3 of 4 turns on the committed
-`two_speakers.wav` fixture (macOS `say`, two distinct voices), and separately
-recovers a 2-speaker count exactly on a denser 8-turn fixture when told
-`num_speakers = 2` (see `src-tauri/src/diarize.rs`'s `#[ignore]`d tests, run
-with `cargo test --workspace -- --ignored`). A follow-up spot check with two
-different `say` voices and different sentence content was inconsistent: on a
-32 s, 4-turn "interview" clip, both auto-detect (5 spurious speakers) and
-`num_speakers = 2` (which merged three real turns into one, then hallucinated
-alternation in the last 7 s) missed most of the true turn boundaries; on a
-15 s, 6-turn rapid exchange, auto-detect partially tracked alternation but
-reused inconsistent ids for the same speaker, and `num_speakers = 2` collapsed
-4 of 5 boundaries. In short: accuracy is real but inconsistent, and depends
-on voice pair, turn length, and content — consistent with the upstream issue,
-not a confirmation of any specific error rate.
-
-`say`-generated speech is also cleaner than real recordings (no overlap, no
-background noise, uniform prosody), so a real accuracy claim would need
-several minutes of genuinely recorded, multi-speaker audio with hand-labeled
-ground truth (ideally scored with a real DER tool, e.g. `pyannote.metrics`)
-across a representative sample — none of which exists in this repo. Until
-that exists, the UI should keep treating speaker labels as a best-effort aid,
-not an authoritative transcript feature.
 
 ## License
 

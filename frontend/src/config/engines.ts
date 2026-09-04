@@ -65,3 +65,32 @@ export function engineById(id: EngineId): EngineDescriptor {
     }
     return engine;
 }
+
+/**
+ * Whether a transcript persisted under `modelId` could have got its speaker
+ * labels from a diarizer this build would still stand behind.
+ *
+ * This is a question about PROVENANCE, not capability: it is asked of a row
+ * already in the database, to decide whether the `speaker` baked into it means
+ * anything. 1.1.0 shipped a local sherpa-onnx diarizer and 1.2.0 deleted it for
+ * mislabelling a single narrator as dozens of speakers — but deleting the code
+ * did not delete its OUTPUT, which is still sitting in every transcript it
+ * touched. Those labels have to be recognised on the way out.
+ *
+ * Derived from `ENGINES` rather than written as `modelId === GEMINI_MODEL_ID`:
+ * a cloud engine PINS its model id here, and the local engine's is `null`
+ * because it is chosen per run from `MODEL_PRESETS`. So "this id names an
+ * engine's pinned model" is exactly "a cloud engine wrote this", and a second
+ * cloud engine added to the array has its labels honoured with no change here.
+ *
+ * Deliberately NOT a lookup against `MODEL_PRESETS`. The local model ids have
+ * been renamed once already, so a transcript from before that rename names a
+ * preset that no longer exists — and matching on the preset list would call it
+ * "not local" and trust its labels, which is the exact case this exists to
+ * catch. Anything that is not a known cloud model is local.
+ */
+export function modelDiarizes(modelId: string): boolean {
+    return ENGINES.some(
+        (engine) => engine.modelId !== null && engine.modelId === modelId,
+    );
+}

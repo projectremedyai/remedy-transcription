@@ -110,6 +110,8 @@ Speaker labels are Gemini-only, and only for audio **under 28 minutes**. Gemini'
 
 Local speaker diarization (sherpa-onnx) was removed in 1.2.0. It shipped in 1.1.0 disabled behind a feature flag because its speaker embeddings mislabelled a single narrator as four different speakers. Gemini's diarization cleared that bar, so the local engine was deleted rather than fixed. If you were relying on the old local diarization, that removal — not a regression — is why it's gone.
 
+Deleting that diarizer did not delete the labels it had already written: `speaker` is stored on every persisted segment, so a transcript it touched kept rendering its speakers long after the code that produced them was gone. Those labels are now dropped when the transcript is read back — a stored transcript is trusted with speakers only if a cloud engine's pinned model produced it. Nothing else about the transcript changes, and Gemini's labels are unaffected.
+
 ## Where your data lives
 
 By default, everything stays on the local machine:

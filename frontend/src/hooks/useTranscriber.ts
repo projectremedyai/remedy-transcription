@@ -9,7 +9,7 @@ import {
     TaskMode,
     resolveModelConfig,
 } from "../config/transcription";
-import { EngineId, engineById } from "../config/engines";
+import { EngineId, engineById, modelDiarizes } from "../config/engines";
 import { createLocalEngine } from "./engines/localEngine";
 import { createGeminiEngine } from "./engines/geminiEngine";
 import {
@@ -38,6 +38,7 @@ import {
     ModelStatusResponse,
     PersistTranscriptRequest,
     SpeakerNames,
+    TranscriptionSegment,
 } from "../services/api";
 
 interface ProgressItem {
@@ -207,6 +208,41 @@ function mixToMono(audioBuffer: AudioBuffer): Float32Array {
     }
 
     return mono;
+}
+
+/**
+ * A stored job's segments, with speaker labels no engine in this build could
+ * have written stripped back off them.
+ *
+ * 1.1.0's local sherpa-onnx diarizer was deleted in 1.2.0 for mislabelling one
+ * narrator as dozens of speakers. Deleting the diarizer did not delete what it
+ * had already written: `speaker` is baked into every persisted segment row, and
+ * `applyCompletedJob` reads those labels straight off the rows — so reopening a
+ * pre-1.2.0 local transcript still paints SPEAKER_00 … SPEAKER_51 across it,
+ * offers to rename all fifty-two of them, and exports them into the SRT. The
+ * feature is gone; only its output is still on screen.
+ *
+ * This is the one read path those rows come back through (`consolidateSegments`
+ * has exactly one production caller), so it is the one place to catch them.
+ *
+ * DELETES THE KEY, rather than setting it to `undefined` or `""`. A segment
+ * without a speaker must render and serialize EXACTLY as it did before
+ * diarization existed — that is the documented contract on
+ * `TranscriptionSegment.speaker`, and `consolidateSegments` reads presence, not
+ * truthiness, when it decides where to break a cue.
+ *
+ * Returns the SAME ARRAY when nothing needs stripping, which is every transcript
+ * this build writes: a fresh local run has no labels to begin with and a Gemini
+ * run's are real. The copy is paid for only by the transcripts that are wrong.
+ */
+function segmentsWithTrustedSpeakers(job: Job): TranscriptionSegment[] {
+    if (modelDiarizes(job.model_id)) {
+        return job.segments;
+    }
+    if (!job.segments.some((segment) => segment.speaker !== undefined)) {
+        return job.segments;
+    }
+    return job.segments.map(({ speaker: _dropped, ...rest }) => rest);
 }
 
 export function useTranscriber(): Transcriber {
@@ -566,7 +602,16 @@ export function useTranscriber(): Transcriber {
                 // `undefined` here (the only value in this phase) is what lets
                 // `consolidateSegments` fall through to its no-turns path and
                 // read that embedded label straight off the rows, unchanged.
-                chunks: consolidateSegments(job.segments, undefined, turns),
+                //
+                // Unchanged is exactly the problem for a transcript the DELETED
+                // local diarizer labelled, which is why the rows are filtered on
+                // the way in rather than passed straight through. See
+                // `segmentsWithTrustedSpeakers`.
+                chunks: consolidateSegments(
+                    segmentsWithTrustedSpeakers(job),
+                    undefined,
+                    turns,
+                ),
                 filename: job.filename || undefined,
                 persisted: true,
                 modelLabel,

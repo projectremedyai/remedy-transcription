@@ -12,6 +12,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { MODEL_PRESETS } from "../config/transcription";
+import { GEMINI_MODEL_ID } from "../config/engines";
 import type { Job } from "../services/api";
 
 const mocks = vi.hoisted(() => ({
@@ -1638,5 +1639,105 @@ describe("useTranscriber's cost confirmation for a long Gemini run", () => {
         expect(mocks.transcribeWithGemini).not.toHaveBeenCalled();
         expect(result.current.status).toBe("idle");
         expect(result.current.error).toBeNull();
+    });
+});
+
+/**
+ * THE DELETED DIARIZER'S LEFTOVERS.
+ *
+ * 1.1.0 shipped a local sherpa-onnx diarizer; 1.2.0 deleted it because its
+ * speaker embeddings split one narrator across dozens of speakers. Deleting the
+ * code left every transcript it had already written untouched, with `speaker`
+ * baked into each persisted segment row — and `applyCompletedJob` reads those
+ * labels straight off the rows. So reopening one of those jobs still rendered
+ * SPEAKER_00 … SPEAKER_51 down the transcript, offered a rename box for each of
+ * them, and wrote them all into the exported SRT, for a feature that no longer
+ * exists in the build doing the rendering.
+ *
+ * A cache hit is the only way back into those rows, which is why both tests
+ * come in through one.
+ */
+describe("a transcript labelled by the deleted local diarizer", () => {
+    const LABELLED_SEGMENTS = [
+        {
+            start: 0,
+            end: 2.5,
+            text: "Good morning everyone, and welcome to the lecture.",
+            speaker: "SPEAKER_00",
+        },
+        {
+            start: 2.5,
+            end: 5,
+            text: "Today we are going to talk about room acoustics.",
+            speaker: "SPEAKER_37",
+        },
+    ];
+
+    it("comes back with no speakers at all when an on-device model wrote it", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({
+                id: "job-legacy",
+                status: "completed",
+                progress: 1,
+                cache_hit: true,
+                model_id: "onnx-community/whisper-base_timestamped",
+                full_text: "Good morning everyone.",
+                segments: LABELLED_SEGMENTS,
+            }),
+        );
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        expect(result.current.status).toBe("completed");
+        const chunks = result.current.output?.chunks ?? [];
+        expect(chunks.length).toBeGreaterThan(0);
+        // ABSENT, not undefined. `consolidateSegments` and the serializers read
+        // presence, so a cue carrying `speaker: undefined` is not the same
+        // thing as a cue from before diarization existed.
+        for (const chunk of chunks) {
+            expect(Object.prototype.hasOwnProperty.call(chunk, "speaker")).toBe(
+                false,
+            );
+        }
+        // The text itself is untouched — this drops labels, not words.
+        expect(chunks.map((chunk) => chunk.text).join(" ")).toContain(
+            "room acoustics",
+        );
+    });
+
+    /**
+     * The other half, and the reason this is a provenance check rather than a
+     * blanket strip: Gemini's labels are the ones the app actually stands
+     * behind, and they must survive the same read path unchanged.
+     */
+    it("keeps the labels when the cloud engine wrote them", async () => {
+        mocks.createFileJob.mockResolvedValue(
+            makeJob({
+                id: "job-gemini",
+                status: "completed",
+                progress: 1,
+                cache_hit: true,
+                model_id: GEMINI_MODEL_ID,
+                full_text: "Good morning everyone.",
+                segments: LABELLED_SEGMENTS,
+            }),
+        );
+
+        const { result } = await renderTranscriber();
+        await act(async () => {
+            result.current.start("/tmp/lecture.mp3");
+        });
+        await settle();
+
+        expect(result.current.status).toBe("completed");
+        const speakers = (result.current.output?.chunks ?? []).map(
+            (chunk) => chunk.speaker,
+        );
+        expect(speakers).toContain("SPEAKER_00");
+        expect(speakers).toContain("SPEAKER_37");
     });
 });
